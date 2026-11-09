@@ -14,8 +14,8 @@
   <PropertyGroup>
     <PackageId>UnionNarrowing</PackageId>
     <Authors>Ian Wold</Authors>
-    <Description>Narrowing for C# unions and closed hierarchies: suppresses CS8509 where earlier code already ruled the missing cases out, with analyzers and fixes for related pitfalls.</Description>
-    <PackageTags>roslyn;analyzer;diagnostic-suppressor;csharp;unions;closed-hierarchies;exhaustiveness;pattern-matching</PackageTags>
+    <Description>Narrowing for C# 15 unions (discriminated unions) and closed hierarchies: suppresses CS8509 "switch expression is not exhaustive" where earlier code already ruled the missing cases out, with analyzers and fixes for related pitfalls.</Description>
+    <PackageTags>roslyn;analyzer;diagnostic-suppressor;csharp;csharp15;unions;union-types;discriminated-unions;sum-types;closed-hierarchies;narrowing;exhaustiveness;pattern-matching;CS8509</PackageTags>
     <PackageProjectUrl>https://github.com/IanWold/UnionNarrowing</PackageProjectUrl>
     <RepositoryUrl>https://github.com/IanWold/UnionNarrowing.git</RepositoryUrl>
     <RepositoryType>git</RepositoryType>

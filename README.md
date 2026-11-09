@@ -12,18 +12,14 @@ Roslyn diagnostic fixes to enhance unions in C# 15+
 
 ---
 
-C# 15 checks that a switch over a union handles every case, but it only looks at the switch itself. If code before the switch has already ruled a case out, the compiler still asks for it. UnionNarrowing follows what earlier code proves about a union (or a closed hierarchy) and suppresses the exhaustiveness warnings that this narrowing shows to be wrong. It suppresses nothing else.
+C# 15 checks that a switch over a union (what other languages call a discriminated union, tagged union or sum type) handles every case, but it only looks at the switch itself. If code before the switch has already ruled a case out, the compiler still asks for it. UnionNarrowing follows what earlier code proves about a union (or a closed hierarchy), the way TypeScript narrows a type after a check or Kotlin smart-casts it, and suppresses the exhaustiveness warnings that this narrowing shows to be wrong. It suppresses nothing else.
 
 It also comes with analyzers and code fixes for the pitfalls that come with unions: throwing defaults that hide cases, default union values that hold no case at all, and boxed unions that never match their cases.
 
 - [Install](#install)
-- [Why](#why)
+- [Why does a switch over a union still warn?](#why-does-a-switch-over-a-union-still-warn)
 - [Quick tour](#quick-tour)
 - [Reference](#reference)
-  - [Diagnostics](#diagnostics)
-  - [Suppressions: CS8509, CS8846, CS8655, CS8847, IDE0072, IDE0010](#suppressions)
-  - [Analyzers](#analyzers)
-  - [Code fixes](#code-fixes)
 - [Building from source](#building-from-source)
 
 ## Install
@@ -44,7 +40,7 @@ The package contains only analyzers and is marked as a development dependency. I
 
 **Requirements:** C# 15, which means the .NET 11 SDK, RC 2 (`11.0.100-rc.2`) or later. The analyzers are built against that compiler's version of Roslyn, so older compilers can't load them. They run in `dotnet build`, Visual Studio and Rider.
 
-## Why
+## Why does a switch over a union still warn?
 
 Here's a union:
 
@@ -64,12 +60,18 @@ int Legs(Pet pet)
     if (pet is Bird)
         return 2;
 
-    return pet switch // warning CS8509: the switch expression is not exhaustive
+    return pet switch // warning CS8509
     {
         Cat => 4,
         Dog => 4,
     };
 }
+```
+
+The compiler reports:
+
+```
+warning CS8509: The switch expression does not handle all possible values of its input type (it is not exhaustive). For example, the pattern 'Bird' is not covered.
 ```
 
 No `pet` that reaches the switch can be a `Bird`, but the warning stays. The usual ways to silence it all give up the check that made the union worth using:
@@ -255,7 +257,16 @@ unionnarrowing.follow_mutable_state = true
 
 ## Reference
 
-This section lists exactly what the package does, for anyone who needs to check a specific behavior. Examples use the `Pet` union from [Why](#why), plus an `IFlier` interface that only `Bird` implements. For worked examples, see the tests in [UnionNarrowing.Tests](UnionNarrowing.Tests/), where every switch is marked `/*suppressed*/` or `/*warns*/`.
+The [wiki](https://github.com/IanWold/UnionNarrowing/wiki/Reference) lists exactly what the package does, for anyone who needs to check a specific behavior: the [diagnostics](https://github.com/IanWold/UnionNarrowing/wiki/Diagnostics), what the [suppressions](https://github.com/IanWold/UnionNarrowing/wiki/Suppressions) follow, and each of the [analyzers and code fixes](https://github.com/IanWold/UnionNarrowing/wiki/Analyzers). Examples there use the `Pet` union from [Why does a switch over a union still warn?](#why-does-a-switch-over-a-union-still-warn), plus an `IFlier` interface that only `Bird` implements. For worked examples, see the tests in [UnionNarrowing.Tests](UnionNarrowing.Tests/), where every switch is marked `/*suppressed*/` or `/*warns*/`.
+
+These are the compiler warnings it can remove, as the compiler words them:
+
+| Warning | Message |
+|---|---|
+| CS8509 | The switch expression does not handle all possible values of its input type (it is not exhaustive). For example, the pattern '...' is not covered. |
+| CS8846 | The switch expression does not handle all possible values of its input type (it is not exhaustive). For example, the pattern '...' is not covered. However, a pattern with a 'when' clause might successfully match this value. |
+| CS8655 | The switch expression does not handle some null inputs (it is not exhaustive). For example, the pattern '...' is not covered. |
+| CS8847 | The switch expression does not handle some null inputs (it is not exhaustive). For example, the pattern '...' is not covered. However, a pattern with a 'when' clause might successfully match this value. |
 
 ## Building from source
 
