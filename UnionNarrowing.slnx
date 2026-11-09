@@ -1,0 +1,7 @@
+<Solution>
+  <Project Path="UnionNarrowing.Suppressors/UnionNarrowing.Suppressors.csproj" />
+  <Project Path="UnionNarrowing.CodeFixes/UnionNarrowing.CodeFixes.csproj" />
+  <Project Path="UnionNarrowing/UnionNarrowing.csproj" />
+  <Project Path="UnionNarrowing.Sample/UnionNarrowing.Sample.csproj" />
+  <Project Path="UnionNarrowing.Tests/UnionNarrowing.Tests.csproj" />
+</Solution>

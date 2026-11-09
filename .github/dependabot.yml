@@ -1,0 +1,21 @@
+version: 2
+updates:
+  - package-ecosystem: "nuget"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+    open-pull-requests-limit: 10
+    assignees:
+      - "IanWold"
+    ignore:
+      # Roslyn has to match the compiler in the SDK pinned in global.json (see Directory.Packages.props), and the
+      # dotnet-tools feed in nuget.config publishes newer builds daily. Bump these by hand along with the SDK.
+      - dependency-name: "Microsoft.CodeAnalysis.*"
+
+  - package-ecosystem: "github-actions"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+    open-pull-requests-limit: 10
+    assignees:
+      - "IanWold"

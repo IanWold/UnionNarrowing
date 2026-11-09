@@ -1,0 +1,3 @@
+# Store text files with LF line endings in the repository, whatever the committer's platform, so diffs stay clean.
+# Checkouts get the platform's native line endings; the tests pass with either.
+* text=auto

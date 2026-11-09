@@ -1,0 +1,49 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <!-- Packs the suppressor, analyzers and code fixes as one analyzer-only, development-dependency package. -->
+
+  <PropertyGroup>
+    <TargetFramework>netstandard2.0</TargetFramework>
+    <IncludeBuildOutput>false</IncludeBuildOutput>
+    <DevelopmentDependency>true</DevelopmentDependency>
+    <SuppressDependenciesWhenPacking>true</SuppressDependenciesWhenPacking>
+    <NoWarn>$(NoWarn);NU5128</NoWarn>
+    <TargetsForTfmSpecificContentInPackage>$(TargetsForTfmSpecificContentInPackage);AddAnalyzersToPackage</TargetsForTfmSpecificContentInPackage>
+  </PropertyGroup>
+
+  <PropertyGroup>
+    <PackageId>UnionNarrowing</PackageId>
+    <Authors>Ian Wold</Authors>
+    <Description>Narrowing for C# unions and closed hierarchies: suppresses CS8509 where earlier code already ruled the missing cases out, with analyzers and fixes for related pitfalls.</Description>
+    <PackageTags>roslyn;analyzer;diagnostic-suppressor;csharp;unions;closed-hierarchies;exhaustiveness;pattern-matching</PackageTags>
+    <PackageProjectUrl>https://github.com/IanWold/UnionNarrowing</PackageProjectUrl>
+    <RepositoryUrl>https://github.com/IanWold/UnionNarrowing.git</RepositoryUrl>
+    <RepositoryType>git</RepositoryType>
+    <PackageLicenseExpression>MIT</PackageLicenseExpression>
+    <PackageReadmeFile>README.md</PackageReadmeFile>
+    <Copyright>Copyright (c) 2026 Ian Wold</Copyright>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="..\UnionNarrowing.Suppressors\UnionNarrowing.Suppressors.csproj" />
+    <ProjectReference Include="..\UnionNarrowing.CodeFixes\UnionNarrowing.CodeFixes.csproj" />
+  </ItemGroup>
+
+  <Target Name="AddAnalyzersToPackage">
+    <ItemGroup>
+      <TfmSpecificPackageFile Include="$(OutputPath)UnionNarrowing.Suppressors.dll" PackagePath="analyzers/dotnet/cs" />
+      <TfmSpecificPackageFile Include="$(OutputPath)UnionNarrowing.CodeFixes.dll" PackagePath="analyzers/dotnet/cs" />
+    </ItemGroup>
+  </Target>
+
+  <Target Name="GenerateNuGetReadme" BeforeTargets="_GetPackageFiles">
+    <PropertyGroup>
+      <_NuGetReadmePath>$(IntermediateOutputPath)README.md</_NuGetReadmePath>
+    </PropertyGroup>
+    <Exec Command="awk '/^---$/{f=1; next} f &amp;&amp; !/&gt; \[![A-Z]*\]/' &quot;$(MSBuildProjectDirectory)/../README.md&quot; &gt; &quot;$(_NuGetReadmePath)&quot;" />
+    <ItemGroup>
+      <None Include="$(_NuGetReadmePath)" Pack="true" PackagePath="README.md" Visible="false" />
+    </ItemGroup>
+  </Target>
+
+</Project>

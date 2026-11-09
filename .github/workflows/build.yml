@@ -1,0 +1,41 @@
+name: Build
+
+on:
+  push:
+    branches: [ "main" ]
+  pull_request:
+    branches: [ "main" ]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@v7
+    - name: Setup .NET
+      uses: actions/setup-dotnet@v6
+      with:
+        # The exact SDK in global.json: its compiler is the Roslyn build Directory.Packages.props pins, and the oldest
+        # one the package supports.
+        global-json-file: global.json
+    - name: Restore
+      run: dotnet restore
+    - name: Build
+      run: dotnet build --no-restore -c Release
+    - name: Test
+      run: dotnet test --no-build -c Release --verbosity normal
+    - name: Pack
+      run: dotnet pack --no-build -c Release -o artifacts
+    - name: Upload package
+      uses: actions/upload-artifact@v7
+      with:
+        name: package
+        path: artifacts/*.nupkg
+        if-no-files-found: error
