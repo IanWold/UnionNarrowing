@@ -9,7 +9,7 @@ using UnionNarrowing.Suppressors.Analysis;
 namespace UnionNarrowing.Suppressors.Analyzers;
 
 /// <summary>
-/// Reports a switch over a union or closed hierarchy whose default only throws, when some case reaches that default.
+/// Reports a switch over a union or closed hierarchy whose default only throws (with <c>throw</c>, or a call that never returns), when some case reaches that default.
 /// A throwing default says "this can't happen", which turns off the compiler's check that every case is handled:
 /// the switch compiles even when a case is missing, including one added to the type later.
 /// </summary>
@@ -40,7 +40,7 @@ public sealed class ThrowingDefaultAnalyzer : DiagnosticAnalyzer
             || !(last.Pattern is IDiscardPatternOperation or IDeclarationPatternOperation { MatchesNull: true }
                 || switchOp.Value is ITupleOperation && last.Pattern is IRecursivePatternOperation { PropertySubpatterns.IsEmpty: true } all && all.DeconstructionSubpatterns.All(Facts.MatchesAnything)
             )
-            || !IsThrowExpression(last.Value)
+            || !Facts.IsThrow(last.Value)
             || switchOp.SemanticModel is not { } model
         )
         {
@@ -107,18 +107,6 @@ public sealed class ThrowingDefaultAnalyzer : DiagnosticAnalyzer
     }
 
     /// <summary>
-    /// Whether the arm's value is a <c>throw</c> expression, through any conversions.
-    /// Unlike <see cref="Facts.IsThrow"/>, not a call to a method that never returns.
-    /// </summary>
-    private static bool IsThrowExpression(IOperation operation) =>
-        operation switch
-        {
-            IThrowOperation => true,
-            IConversionOperation { Operand: var operand } => IsThrowExpression(operand),
-            _ => false,
-        };
-
-    /// <summary>
     /// Reports the cases that reach the default, if any.
     /// Returns whether it did, with what earlier code rules out.
     /// </summary>
@@ -129,7 +117,7 @@ public sealed class ThrowingDefaultAnalyzer : DiagnosticAnalyzer
         excluded = handling.Excluded(model, context.CancellationToken);
 
         var caught = handling.Caught(excluded);
-        if (caught.Count == 0)
+        if (caught.Count == 0 || handling.HandledInside(model, context.CancellationToken))
         {
             return false;
         }

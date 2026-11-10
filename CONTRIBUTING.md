@@ -29,7 +29,7 @@ The solution is [UnionNarrowing.slnx](UnionNarrowing.slnx), with the following p
 The shared analysis in `UnionNarrowing.Suppressors/Analysis/` builds up in layers, each using only the ones before it:
 
 * `Symbols`, `Functions` and `Statements`: what's known about types and attributes, functions and calls, and statement lists and jumps.
-* `CaseSpace` and `CaseSet`: the cases a value can be in, and sets of them. `TrackedValue`: a value the analysis follows, as a path of `Step`s from a local, parameter, `this` or static member.
+* `CaseSpace` and `CaseSet`: the cases a value can be in, and sets of them. `TypeArguments`: what generic code's type parameters stand for where it's read for a call (a space carries them, so a type written in that code is read through them). `TrackedValue`: a value the analysis follows, as a path of `Step`s from a local, parameter, `this` or static member.
 * `WriteAnalysis` and `VariableUsage`: what can write a value, and how a local or parameter is used.
 * `Sequences`: what LINQ, and collection methods like it, do with a sequence's elements.
 * `Facts`: what a pattern or condition says about a value's cases.
@@ -54,8 +54,8 @@ Each test compiles a snippet against the shared `Pet` union (`Cat`, `Dog`, `Bird
 
 * `Verify.Suppressions` for the suppressor. Write `/*suppressed*/` or `/*warns*/` immediately before the `switch` keyword of every switch that gets CS8509. The test fails if a marker has no CS8509 or a CS8509 has no marker, so it can't pass just because the compiler was already happy.
 * `Verify.Diagnostics` for the analyzers. Write `/*!UN0002*/` immediately before where each diagnostic should start. Every marker needs its diagnostic, and every diagnostic its marker. It returns the diagnostics in the order they appear, for checking their messages.
-* `Verify.CodeFix` for the code fixes. Pass the source and the expected result, or `null` to check that the fix isn't offered. As well as comparing the result, it checks that the result compiles, and that what the fix was for is gone once the suppressor has run, so the fix and the suppressor have to agree.
-* `Verify.FixAll` for a code fix's Fix All, on a snippet with at least two diagnostics the fix is for.
+* `Verify.CodeFix` for the code fixes. Pass the source and the expected result, or `null` to check that the fix isn't offered. As well as comparing the result, it parses the fixed text again (as the IDE would) and checks that it compiles, that it has no warning the original didn't, and that what the fix was for is gone once the suppressor has run, so the fix and the suppressor have to agree. It optionally takes the fix's `title:` and `references:` to compile against.
+* `Verify.FixAll` for a code fix's Fix All, on a snippet with at least two diagnostics the fix is for (`usings:` as for `CodeFix`).
 
 A failure gives the line and the method in the snippet it's in, so give the snippet's methods names that say what each is about.
 

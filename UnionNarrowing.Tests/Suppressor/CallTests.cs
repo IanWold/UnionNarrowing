@@ -267,6 +267,97 @@ public class CallTests
             """
         );
 
+
+
+    [Fact]
+    public Task Methods_called_in_ways_that_name_them_nowhere() =>
+        Verify.Suppressions("""
+            using System.Collections;
+            using System.Runtime.CompilerServices;
+
+            public interface ILegCounter { int Legs(Pet pet); }
+
+            internal class LegBase
+            {
+                public int Legs(Pet pet) => pet /*warns*/switch { Cat => 4, Dog => 4 };
+                public int Safe(Pet pet) => pet is Bird ? 2 : Legs(pet);
+            }
+
+            // Implements ILegCounter.Legs with LegBase's method.
+            internal class LegDerived : LegBase, ILegCounter { }
+
+            internal class Flock : IEnumerable
+            {
+                internal void Add(Pet pet) => _ = pet /*warns*/switch { Cat => 1, Dog => 2 };
+                internal void Guarded(Pet pet) { if (pet is not Bird) Add(pet); }
+                public IEnumerator GetEnumerator() => throw new NotImplementedException();
+            }
+
+            [InterpolatedStringHandler]
+            internal ref struct PetHandler
+            {
+                public PetHandler(int literalLength, int formattedCount) { }
+                internal void AppendLiteral(string s) { }
+                internal void AppendFormatted(Pet pet) => _ = pet /*warns*/switch { Cat => 1, Dog => 2 };
+                internal void Guarded(Pet pet) { if (pet is not Bird) AppendFormatted(pet); }
+            }
+
+            internal class Kennel
+            {
+                private int Count(Pet pet) => pet /*warns*/switch { Cat => 1, Dog => 2 };
+                private int Guarded(Pet pet) => pet is Bird ? 0 : Count(pet);
+                public int Dynamic(Pet pet) => ((dynamic)this).Count((dynamic)pet);
+            }
+
+            internal class Accessed
+            {
+                private static int Count(Pet pet) => pet /*warns*/switch { Cat => 1, Dog => 2 };
+                public static int Guarded(Pet pet) => pet is Bird ? 0 : Count(pet);
+            }
+
+            internal static class Accessor
+            {
+                [UnsafeAccessor(UnsafeAccessorKind.StaticMethod, Name = "Count")]
+                public static extern int Count(Accessed accessed, Pet pet);
+            }
+
+            internal class Made
+            {
+                private readonly int _legs;
+                internal Made(Pet pet) => _legs = pet /*warns*/switch { Cat => 4, Dog => 4 };
+                public static Made Guarded(Pet pet) => pet is Bird ? throw new ArgumentException() : new Made(pet);
+                public static object Reflected(Pet pet) => Activator.CreateInstance(typeof(Made), pet)!;
+            }
+
+            class Use
+            {
+                int Flock(Bird bird) => new Flock { bird } is { } ? 0 : 1;
+                void Log(Bird bird) => Handle($"{bird}");
+                void Handle(PetHandler handler) { }
+            }
+            """
+        );
+
+    [Fact]
+    public Task Generic_private_method_called_with_a_constructed_case() =>
+        Verify.Suppressions("""
+            sealed record Some<T>(T Value);
+            sealed record None;
+            union Option<T>(Some<T>, None);
+
+            public class C
+            {
+                public int OnlySome() => Count<int>(new Some<int>(1));
+                public int OnlyNone() => CountNone<int>(new None());
+
+                // Every caller passes a Some<int>, which is a Some<T> here.
+                private static int Count<T>(Option<T> option) => option /*warns*/switch { None => 0 };
+
+                private static int CountNone<T>(Option<T> option) => option /*suppressed*/switch { None => 0 };
+            }
+            """
+        );
+
     [Fact]
     public Task Private_methods_that_call_each_other_from_a_do_loop() =>
         Verify.Suppressions("""

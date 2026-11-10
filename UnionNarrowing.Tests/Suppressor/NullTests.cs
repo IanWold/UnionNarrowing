@@ -99,4 +99,19 @@ public class NullTests
             }
             """ + Shapes, diagnosticId: "CS8847"
         );
+
+    [Fact]
+    public Task Value_pattern_on_a_nullable_union_does_not_rule_out_no_value() =>
+        Verify.Suppressions("""
+            class C
+            {
+                // `{ Value: null }` only matches a Pet? that has a union in it (one holding no case).
+                int M(Pet? maybe)
+                {
+                    if (maybe is { Value: null }) return 0;
+                    return maybe /*warns*/switch { Cat => 1, Dog => 2, Bird => 3 };
+                }
+            }
+            """, diagnosticId: "CS8655"
+        );
 }

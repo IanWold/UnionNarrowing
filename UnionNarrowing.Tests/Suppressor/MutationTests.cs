@@ -416,6 +416,176 @@ public class MutationTests
             """
         );
 
+
+    [Fact]
+    public Task Scoped_ref_extension_method_between() =>
+        Verify.Suppressions("""
+            static class PetExtensions
+            {
+                public static void MakeBird(this scoped ref Pet pet) => pet = new Bird("Polly");
+            }
+
+            class C
+            {
+                int Direct(Pet pet)
+                {
+                    if (pet is Bird) return 0;
+                    /*because*/pet.MakeBird();
+                    return pet /*warns*/switch { Cat => 1, Dog => 2 };
+                }
+
+                int Captured(Pet pet)
+                {
+                    if (pet is Bird) return 0;
+                    Func<int> legs = () => pet /*warns*/switch { Cat => 1, Dog => 2 };
+                    /*because*/pet.MakeBird();
+                    return legs();
+                }
+
+                static bool TryGet(out Pet pet)
+                {
+                    pet = new Cat("Tom");
+                    pet.MakeBird();
+                    return true;
+                }
+
+                int OutArgument()
+                {
+                    TryGet(out var pet);
+                    return pet /*warns*/switch { Cat => 1 };
+                }
+            }
+
+            class Owner
+            {
+                private readonly Pet _pet;
+
+                public Owner(Pet pet)
+                {
+                    if (pet is Bird) throw new ArgumentException();
+                    _pet = pet;
+                    _pet.MakeBird();
+                }
+
+                public int Legs() => _pet /*warns*/switch { Cat => 4, Dog => 4 };
+            }
+            """
+        );
+
+    [Fact]
+    public Task Members_of_a_struct_local_that_write_it() =>
+        Verify.Suppressions("""
+            struct Slot
+            {
+                public Pet State;
+                public int Version;
+                public int Prop { get => 0; set => State = new Bird("Polly"); }
+                public int Getter { get { State = new Bird("Polly"); return 5; } }
+                public void Deconstruct(out int a, out int b) { State = new Bird("Polly"); a = 1; b = 1; }
+                public void MakeBird() => State = new Bird("Polly");
+            }
+
+            struct Outer
+            {
+                public Slot Inner;
+                public void BirdInner() => Inner.MakeBird();
+            }
+
+            class C
+            {
+                int Increment(Slot s)
+                {
+                    if (s.State is Bird) return 0;
+                    /*because*/s.Prop++;
+                    return s.State /*warns*/switch { Cat => 1, Dog => 2 };
+                }
+
+                int Decrement(Slot s)
+                {
+                    if (s.State is Bird) return 0;
+                    /*because*/--s.Prop;
+                    return s.State /*warns*/switch { Cat => 1, Dog => 2 };
+                }
+
+                int DeconstructionTarget(Slot s)
+                {
+                    if (s.State is Bird) return 0;
+                    /*because*/(s.Prop, var other) = (1, 2);
+                    return s.State /*warns*/switch { Cat => 1, Dog => 2 };
+                }
+
+                int PositionalPattern(Slot s)
+                {
+                    if (s.State is Bird) return 0;
+                    /*because*/var matched = s is (1, 1);
+                    return s.State /*warns*/switch { Cat => 1, Dog => 2 };
+                }
+
+                int PropertyPattern(Slot s)
+                {
+                    if (s.State is Bird) return 0;
+                    /*because*/var matched = s is { Getter: 5 };
+                    return s.State /*warns*/switch { Cat => 1, Dog => 2 };
+                }
+
+                int FieldPattern(Slot s)
+                {
+                    if (s.State is Bird) return 0;
+                    var matched = s is { Version: 5 };
+                    return s.State /*suppressed*/switch { Cat => 1, Dog => 2 };
+                }
+
+                int MethodThatWritesAField(Outer o)
+                {
+                    if (o.Inner.State is Bird) return 0;
+                    /*because*/o.BirdInner();
+                    return o.Inner.State /*warns*/switch { Cat => 1, Dog => 2 };
+                }
+            }
+            """
+        );
+
+    [Fact]
+    public Task Reference_handed_back_by_a_call() =>
+        Verify.Suppressions("""
+            using System.Runtime.CompilerServices;
+
+            class C
+            {
+                int AssignedThroughIt(Pet pet)
+                {
+                    if (pet is Bird) return 0;
+                    /*because*/Unsafe.AsRef(in pet) = new Bird("Polly");
+                    return pet /*warns*/switch { Cat => 1, Dog => 2 };
+                }
+
+                int AliasTakenBeforeTheGuard(Pet pet)
+                {
+                    ref var alias = ref Unsafe.AsRef(in pet);
+                    if (pet is Bird) return 0;
+                    alias = new Bird("Polly");
+                    return pet /*warns*/switch { Cat => 1, Dog => 2 };
+                }
+
+                int ReinterpretedBeforeTheGuard(Pet pet)
+                {
+                    ref var alias = ref Unsafe.As<Pet, Pet>(ref pet);
+                    if (pet is Bird) return 0;
+                    alias = new Bird("Polly");
+                    return pet /*warns*/switch { Cat => 1, Dog => 2 };
+                }
+
+                int SpanBeforeTheGuard(Pet pet)
+                {
+                    var span = System.Runtime.InteropServices.MemoryMarshal.CreateSpan(ref pet, 1);
+                    if (pet is Bird) return 0;
+                    span[0] = new Bird("Polly");
+                    return pet /*warns*/switch { Cat => 1, Dog => 2 };
+                }
+            }
+            """
+        );
+
     [Fact]
     public Task Ref_extension_block_property_before_the_guard() =>
         Verify.Suppressions("""

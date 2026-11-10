@@ -200,6 +200,11 @@ internal static partial class Narrowing
                     ? KnownExcluded(initial, value.Steps, context.Space, model, value.Session, ct, context.Copies + 1)
                     : CaseSet.Empty;
 
+            // What holds at a labeled statement's end comes from its own branches, and from what holds on the way in,
+            // which takes the label into account.
+            case LabeledStatementSyntax labeled:
+                return FactsAtEndOfAssignment(labeled.Statement, context);
+
             case BlockSyntax block:
                 var atEnd = CaseSet.Empty;
                 for (var i = block.Statements.Count - 1; i >= 0; i--)
@@ -352,7 +357,7 @@ internal static partial class Narrowing
         SyntaxNode pattern = designation.Parent!;
         while (true)
         {
-            while (pattern.Parent is ParenthesizedPatternSyntax || pattern.Parent is BinaryPatternSyntax { RawKind: (int)SyntaxKind.AndPattern })
+            while (pattern.Parent is ParenthesizedPatternSyntax || pattern.Parent is BinaryPatternSyntax { RawKind: (int)SyntaxKind.AndPattern } || pattern.Parent is UnaryPatternSyntax { RawKind: (int)SyntaxKind.NotPattern })
             {
                 pattern = pattern.Parent;
             }
@@ -401,9 +406,9 @@ internal static partial class Narrowing
             steps.RemoveAt(0);
         }
 
-        if (input is null || region is null || !region.Span.Contains(context.Start.Span)
+        if (input is null || region is null || UpTo(region, context.Start) is not { } parts
             || TrackedValue.From(inputOperation, context.Value.Session) is not { } whole
-            || WritesIn(region, whole)
+            || parts.Any(part => WritesIn(part, whole))
             || whole.Through(steps, model.Compilation, followsMutableState: false) is not { } source
             || !IsTrackable(source, context.Start, model, ct)
         )
@@ -411,7 +416,40 @@ internal static partial class Narrowing
             return CaseSet.Empty;
         }
 
-        return Excluded(context.Start, context.Value.WithRoot(source), context.Space, model, ct, onEntry: false, context.Copies + 1);
+        var excluded = Excluded(context.Start, context.Value.WithRoot(source), context.Space, model, ct, onEntry: false, context.Copies + 1);
+
+        // `owner is not Shelter shelter` makes shelter owner as a Shelter: what's known about owner's members holds for
+        // shelter's, and so does what's known about them when owner is a Shelter (`owner is Shelter { Pet: Bird }`).
+        if (steps.Count == 0 && !context.Value.Steps.IsEmpty
+            && model.GetDeclaredSymbol(designation, ct) is ILocalSymbol { Type: var bound } && inputOperation?.Type is { } inputType && !SymbolEqualityComparer.Default.Equals(bound, inputType)
+            && context.Value.WithRoot(source.Through([new CaseStep(bound)], model.Compilation, followsMutableState: false)!) is var asBound && IsTrackable(asBound, context.Start, model, ct)
+        )
+        {
+            excluded |= Excluded(context.Start, asBound, context.Space, model, ct, onEntry: false, context.Copies + 1);
+        }
+
+        return excluded;
+
+        // Where the variable has its value, up to where the walk started: the statement (or arm, or section) that binds it,
+        // and for a statement that doesn't hold the start (`if (o is not Shelter shelter) return;`), the statements after
+        // it in its list up to the one that does.
+        static IReadOnlyList<SyntaxNode>? UpTo(SyntaxNode region, SyntaxNode start)
+        {
+            if (region.Span.Contains(start.Span))
+            {
+                return [region];
+            }
+
+            if (region is not StatementSyntax statement || Statements.StatementsAround(region.Parent!) is not { } statements)
+            {
+                return null;
+            }
+
+            var from = Statements.IndexOf(statements, statement);
+            var to = statements.ToList().FindIndex(s => s.Span.Contains(start.Span));
+
+            return from >= 0 && to > from ? [.. statements.Skip(from).Take(to - from + 1)] : null;
+        }
 
         // The pattern's input isn't a union (whose patterns bind its case), and the variable is the input itself, or a
         // reference to the same object.
@@ -440,6 +478,55 @@ internal static partial class Narrowing
     }
 
     /// <summary>
+    /// For a local that's written after its declaration (in a loop, say, where what held before the loop doesn't hold in it):
+    /// what every value it's ever given is known not to be, which it can't be anywhere.
+    /// Only for a local whose every write is its declaration's initializer or a plain assignment (<see cref="VariableUsage"/> has already made sure they're all in plain sight).
+    /// </summary>
+    private static CaseSet FactsFromEveryWrite(VariableUsage usage, Context context)
+    {
+        if (usage.Writes.Count == 0 || context.Value.Variable is not ILocalSymbol || context.Value.IsExternallyMutable)
+        {
+            return CaseSet.Empty;
+        }
+
+        var model = context.Model;
+        var ct = context.CancellationToken;
+        var given = new List<IOperation?>();
+
+        foreach (var declaration in usage.Declarations)
+        {
+            if (declaration is not VariableDeclaratorSyntax declarator)
+            {
+                return CaseSet.Empty; // a designation or foreach variable, which gets a value of its own kind
+            }
+
+            if (declarator.Initializer is not null)
+            {
+                given.Add((model.GetOperation(declarator, ct) as IVariableDeclaratorOperation)?.Initializer?.Value);
+            }
+        }
+
+        given.AddRange(usage.Writes.Select(write =>
+            write.Parent is AssignmentExpressionSyntax { RawKind: (int)SyntaxKind.SimpleAssignmentExpression } assignment && assignment.Left == write
+                ? (model.GetOperation(assignment, ct) as ISimpleAssignmentOperation)?.Value
+                : null
+        ));
+
+        CaseSet? everywhere = null;
+        foreach (var value in given)
+        {
+            if (value is null)
+            {
+                return CaseSet.Empty;
+            }
+
+            everywhere = Meet(everywhere, KnownExcluded(value, context.Value.Steps, context.Space, model, context.Value.Session, ct, context.Copies + 1));
+        }
+
+        return everywhere ?? CaseSet.Empty;
+    }
+
+    /// <summary>
     /// For a value read through a readonly field or get-only auto-property that only its initializer ever sets (nothing in its type assigns it, not even a constructor):
     /// what's known about the initializer's value, followed by the rest of the path.
     /// <c>static readonly Pet Favourite = new Cat("Tom");</c> is a Cat wherever it's read.
@@ -455,9 +542,10 @@ internal static partial class Narrowing
             }
 
             var rest = value.Steps.Skip(i + 1).ToList();
+            var declaringSpace = space.Reading(member, model.Compilation);
             if (OnlyInitializer(member, model.Compilation, ct) is var (initializer, initializerModel))
             {
-                excluded |= KnownExcluded(initializer, rest, space, initializerModel, value.Session, ct, copies + 1);
+                excluded |= KnownExcluded(initializer, rest, declaringSpace, initializerModel, value.Session, ct, copies + 1);
             }
             else if (ConstructorAssignments(member, model.Compilation, ct) is { Count: > 0 } assignments)
             {
@@ -466,7 +554,7 @@ internal static partial class Narrowing
                 CaseSet? set = null;
                 foreach (var (assigned, assignedModel) in assignments)
                 {
-                    set = Meet(set, KnownExcluded(assigned, rest, space, assignedModel, value.Session, ct, copies + 1));
+                    set = Meet(set, KnownExcluded(assigned, rest, declaringSpace, assignedModel, value.Session, ct, copies + 1));
                 }
 
                 excluded |= CaseSet.Of((set ?? CaseSet.Empty).Cases);
@@ -520,6 +608,7 @@ internal static partial class Narrowing
             return CaseSet.Empty;
         }
 
+        var calleeSpace = context.Space.Reading(method, model.Compilation);
         method = method.OriginalDefinition;
         if (Functions.OwnDeclaration(method, model.Compilation, ct) is not { } declaration)
         {
@@ -534,7 +623,7 @@ internal static partial class Narrowing
             // Every use is either a read or a plain assignment; anything else could set it to anything.
             if (calleeModel.GetOperation(name, ct) is { Parent: ISimpleAssignmentOperation assignment } reference && assignment.Target == reference)
             {
-                assigned = Meet(assigned, KnownExcluded(assignment.Value, value.Steps, context.Space, calleeModel, value.Session, ct, context.Copies + 1));
+                assigned = Meet(assigned, KnownExcluded(assignment.Value, value.Steps, calleeSpace, calleeModel, value.Session, ct, context.Copies + 1));
             }
             else if (WriteAnalysis.IsWrite(name, calleeModel, ct) || WriteAnalysis.TakesReference(name, calleeModel, ct))
             {
@@ -739,7 +828,8 @@ internal static partial class Narrowing
             case IObjectCreationOperation or IWithOperation when steps.Count > 0 && steps[0] is MemberStep { Member: var member }:
                 return OfNewMember(expression, member) is { } set
                     ? KnownExcluded(set, [.. steps.Skip(1)], space, model, session, ct, copies)
-                    : expression is IWithOperation { Operand: var original } && TrackedValue.From(original, session)?.WithMember(member, model.Compilation) is { } unchanged
+                    : expression is IWithOperation { Operand: var original } with && Functions.CopiesAsIs(with) && OnlyStores(with.Initializer.Initializers)
+                        && TrackedValue.From(original, session)?.WithMember(member, model.Compilation) is { } unchanged
                         && Extended(unchanged, steps.Skip(1)) is { } rest && IsTrackable(rest, expression.Syntax, model, ct)
                         ? Excluded(expression.Syntax, rest, space, model, ct, onEntry: false, copies + 1)
                         : CaseSet.Empty;
@@ -771,6 +861,7 @@ internal static partial class Narrowing
         // returns give what the await does; any other is to one that isn't.
         CaseSet FromReturns(IMethodSymbol method, bool awaited)
         {
+            var calleeSpace = space.Reading(method, model.Compilation);
             method = method.OriginalDefinition;
             if (method.IsAsync != awaited || Functions.OwnDeclaration(method, model.Compilation, ct) is not { } declaration)
             {
@@ -779,7 +870,7 @@ internal static partial class Narrowing
 
             var calleeModel = Functions.SemanticModelFor(declaration, model);
             CaseSet FromCallee(IOperation returned) =>
-                KnownExcluded(returned, steps, space, calleeModel, session, ct, copies + 1);
+                KnownExcluded(returned, steps, calleeSpace, calleeModel, session, ct, copies + 1);
 
             var (arrow, body) = declaration switch
             {
@@ -813,28 +904,30 @@ internal static partial class Narrowing
         }
 
         // What a new object's member was set to: by its initializer (`new Owner { Pet = cat }`, `with { Pet = cat }`),
-        // or, for a record's positional property, by the primary constructor's argument for it.
+        // or, for a record's positional property, by the primary constructor's argument for it. Only if what the
+        // initializer does after that just stores values, rather than running a setter or init accessor of its own,
+        // which could set the member again.
         static IOperation? OfNewMember(IOperation creation, ISymbol member)
         {
-            var initializer = creation switch
+            var initializers = creation switch
             {
-                IObjectCreationOperation c => c.Initializer,
-                IWithOperation w => w.Initializer,
-                _ => null,
+                IObjectCreationOperation c => c.Initializer?.Initializers ?? [],
+                IWithOperation w => w.Initializer.Initializers,
+                _ => [],
             };
 
-            foreach (var assignment in initializer?.Initializers.OfType<ISimpleAssignmentOperation>() ?? [])
+            for (var i = 0; i < initializers.Length; i++)
             {
-                if (assignment.Target is IMemberReferenceOperation { Instance: IInstanceReferenceOperation { ReferenceKind: InstanceReferenceKind.ImplicitReceiver } } target
+                if (initializers[i] is ISimpleAssignmentOperation { Target: IMemberReferenceOperation { Instance: IInstanceReferenceOperation { ReferenceKind: InstanceReferenceKind.ImplicitReceiver } } target } assignment
                     && SymbolEqualityComparer.Default.Equals(target.Member, member)
                 )
                 {
-                    return assignment.Value;
+                    return OnlyStores(initializers.Skip(i + 1)) ? assignment.Value : null;
                 }
             }
 
-            // Set later by the initializer? Then the constructor's value isn't the one that stays.
-            if (initializer is not null && initializer.Initializers.Any(i => i is ISimpleAssignmentOperation { Target: IMemberReferenceOperation t } && SymbolEqualityComparer.Default.Equals(t.Member, member)))
+            // Set later by the initializer, or maybe by code it runs? Then the constructor's value isn't the one that stays.
+            if (initializers.Any(i => i is ISimpleAssignmentOperation { Target: IMemberReferenceOperation t } && SymbolEqualityComparer.Default.Equals(t.Member, member)) || !OnlyStores(initializers))
             {
                 return null;
             }
@@ -847,6 +940,14 @@ internal static partial class Narrowing
                 ? argument.Value
                 : null;
         }
+
+        // Each of the initializers sets a field or an auto-property, which runs no code of the type's own.
+        static bool OnlyStores(IEnumerable<IOperation> initializers) => initializers.All(initializer => initializer is ISimpleAssignmentOperation { Target: var target } && target switch
+        {
+            IFieldReferenceOperation => true,
+            IPropertyReferenceOperation { Property: { IsIndexer: false } property } => Symbols.IsAutoProperty(property),
+            _ => false,
+        });
 
         // Only through members: the steps have come apart from the value they were read from, which knew whether it
         // was externally mutable.

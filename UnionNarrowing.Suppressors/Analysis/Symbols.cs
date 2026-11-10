@@ -47,18 +47,21 @@ internal static class Symbols
 
     /// <summary>
     /// Whether the property's getter just reads its backing field:
-    /// in source, it's declared as an auto-property (or is a record's positional property);
+    /// in source, it's declared as an auto-property (or is a record's positional property), going by the part with the accessors' bodies for a partial one;
     /// from another assembly, the compiler generated its getter.
     /// </summary>
-    public static bool IsAutoProperty(IPropertySymbol property) =>
-        property.DeclaringSyntaxReferences.IsEmpty
-            ? property.GetMethod is { } getter && IsCompilerGenerated(getter)
-            : property.DeclaringSyntaxReferences.All(reference => reference.GetSyntax() switch
+    public static bool IsAutoProperty(IPropertySymbol property)
+    {
+        var implementation = property.PartialImplementationPart ?? property;
+        return implementation.DeclaringSyntaxReferences.IsEmpty
+            ? implementation.GetMethod is { } getter && IsCompilerGenerated(getter)
+            : implementation.DeclaringSyntaxReferences.All(reference => reference.GetSyntax() switch
             {
                 PropertyDeclarationSyntax declaration => IsAutoPropertyDeclaration(declaration),
-                ParameterSyntax => property.ContainingType.IsRecord,
+                ParameterSyntax => implementation.ContainingType.IsRecord,
                 _ => false,
             });
+    }
 
     /// <summary>
     /// Whether the declaration is of an auto-property:

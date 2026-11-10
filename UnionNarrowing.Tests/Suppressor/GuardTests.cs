@@ -156,6 +156,27 @@ public class GuardTests
             """
         );
 
+
+    [Fact]
+    public Task Bools_matched_with_true_or_false() =>
+        Verify.Suppressions("""
+            class C
+            {
+                int M(Pet pet)
+                {
+                    if ((pet is Bird) is true) return 0;
+                    return pet /*suppressed*/switch { Cat => 1, Dog => 2 };
+                }
+
+                int N(Pet pet)
+                {
+                    if ((pet is Bird or Dog) is not false) return 0;
+                    return pet /*suppressed*/switch { Cat => 1 };
+                }
+            }
+            """
+        );
+
     [Fact]
     public Task Case_split_over_a_bool() =>
         Verify.Suppressions("""
@@ -363,6 +384,32 @@ public class GuardTests
                 {
                     if (option is not None) return 0;
                     return option /*warns*/switch { None => 1 };
+                }
+            }
+            """
+        );
+
+
+    [Fact]
+    public Task Guard_in_generic_code_on_a_constructed_case_type() =>
+        Verify.Suppressions("""
+            sealed record Some<T>(T Value);
+            sealed record None;
+            union Option<T>(Some<T>, None);
+
+            class C
+            {
+                // With T = int, a Some<int> gets past the guard.
+                int M<T>(Option<T> option)
+                {
+                    if (option is not Some<int>) return -1;
+                    return option /*warns*/switch { None => 0 };
+                }
+
+                int Matching<T>(Option<T> option)
+                {
+                    if (option is not Some<T>) return -1;
+                    return option /*suppressed*/switch { Some<T> => 0 };
                 }
             }
             """
@@ -578,6 +625,46 @@ public class GuardTests
                 {
                     if (maybe is not { Value: _ }) return 0;
                     return maybe /*warns*/switch { Cat => 1, Dog => 2 };
+                }
+            }
+            """
+        );
+
+
+    [Fact]
+    public Task Patterns_that_check_more_than_they_seem_to() =>
+        Verify.Suppressions("""
+            union TupleOrText(Tuple<int, int>, string);
+
+            sealed record Fish
+            {
+                public bool Equals(Fish? other) => true;
+                public override int GetHashCode() => 0;
+            }
+
+            union Pond(Fish, Dog);
+
+            class C
+            {
+                // `()` on an object also checks that it's an ITuple of length 0.
+                int EmptyPositional(TupleOrText t)
+                {
+                    if (t.Value is ()) return 0;
+                    return t /*warns*/switch { string => 1 };
+                }
+
+                // On a Pet?, `{ Value: ... }` is the union's Value, inside a Pet? that has one.
+                int ValueOfANullableUnion(Pet? maybe)
+                {
+                    if (maybe is { Value: null } or { Value: Bird }) return 0;
+                    return maybe /*warns*/switch { Cat => 1, Dog => 2 };
+                }
+
+                // A record's `==` calls its Equals, which can be one of its own.
+                int RecordWithItsOwnEquals(Pond pond)
+                {
+                    if (pond.Value as Fish != null) return 0;
+                    return pond /*warns*/switch { Dog => 1 };
                 }
             }
             """

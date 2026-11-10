@@ -127,6 +127,101 @@ public class NestedTests
             """
         );
 
+
+    [Fact]
+    public Task Closed_hierarchy_member_of_a_case() =>
+        Verify.Suppressions("""
+            public closed record Expr;
+            public sealed record Lit(int Value) : Expr;
+            public sealed record Var(string Name) : Expr;
+            public sealed record Bin(Expr Left, Expr Right) : Expr;
+
+            public closed record DomainError;
+            public sealed record Invalid : DomainError;
+            public sealed record Missing : DomainError;
+            public sealed record Forbidden : DomainError;
+            public sealed record Ok<T>(T Value);
+            public sealed record Err<E>(E Error);
+            public union Result<T, E>(Ok<T>, Err<E>);
+
+            class C
+            {
+                int Guarded(Expr e)
+                {
+                    if (e is Bin { Left: Lit }) return 0;
+                    return e /*suppressed*/switch { Bin { Left: Var or Bin } => 1, Lit => 2, Var => 3 };
+                }
+
+                int GuardOnTheMember(Bin b)
+                {
+                    if (b.Left is Lit) return 0;
+                    return b /*suppressed*/switch { { Left: Var } => 1, { Left: Bin } => 2 };
+                }
+
+                int EveryLeaf(Result<int, DomainError> r)
+                {
+                    if (r is Ok<int>) return 0;
+                    return r /*suppressed*/switch { Err<DomainError> { Error: Invalid } => 1, Err<DomainError> { Error: Missing } => 2, Err<DomainError> { Error: Forbidden } => 3 };
+                }
+
+                int MissesALeaf(Result<int, DomainError> r)
+                {
+                    if (r is Ok<int>) return 0;
+                    return r /*warns*/switch { Err<DomainError> { Error: Invalid } => 1, Err<DomainError> { Error: Missing } => 2 };
+                }
+
+                int GuardsTogether(Result<int, DomainError> r)
+                {
+                    if (r is Err<DomainError> { Error: Invalid }) return 0;
+                    if (r is Err<DomainError> { Error: Missing }) return 0;
+                    if (r is Err<DomainError> { Error: Forbidden }) return 0;
+                    return r /*suppressed*/switch { Ok<int> ok => ok.Value };
+                }
+
+                int TwoPlacesOfOneValue(Bin b)
+                {
+                    if (b is { Left: Lit, Right: Lit }) return 0;
+                    return b /*suppressed*/switch { { Left: Var or Bin } => 1, { Right: Var or Bin } => 2 };
+                }
+
+                int GuardsTogetherMissOne(Result<int, DomainError> r)
+                {
+                    if (r is Err<DomainError> { Error: Invalid }) return 0;
+                    if (r is Err<DomainError> { Error: Missing }) return 0;
+                    return r /*warns*/switch { Ok<int> ok => ok.Value };
+                }
+
+                int GuardsTogetherThenAWrite(Result<int, DomainError> r, Result<int, DomainError> other)
+                {
+                    if (r is Err<DomainError> { Error: Invalid }) return 0;
+                    if (r is Err<DomainError> { Error: Missing }) return 0;
+                    if (r is Err<DomainError> { Error: Forbidden }) return 0;
+                    /*because*/r = other;
+                    return r /*warns*/switch { Ok<int> ok => ok.Value };
+                }
+
+                int TwoPlacesOneHandled(Bin b)
+                {
+                    if (b is { Left: Lit, Right: Lit }) return 0;
+                    return b /*warns*/switch { { Left: Var or Bin } => 1 };
+                }
+
+                int TwoPlacesThenAWrite(Bin b, Bin other)
+                {
+                    if (b is { Left: Lit, Right: Lit }) return 0;
+                    /*because*/b = other;
+                    return b /*warns*/switch { { Left: Var or Bin } => 1, { Right: Var or Bin } => 2 };
+                }
+
+                int EitherPlace(Bin b)
+                {
+                    if (b is { Left: Lit } or { Right: Lit }) return 0;
+                    return b /*suppressed*/switch { { Left: Var or Bin, Right: Var or Bin } => 1 };
+                }
+            }
+            """
+        );
+
     [Fact]
     public Task Union_member_of_the_object_switched_on() =>
         Verify.Suppressions("""

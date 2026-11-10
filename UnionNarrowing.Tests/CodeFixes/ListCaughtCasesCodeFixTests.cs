@@ -270,6 +270,47 @@ public class ListCaughtCasesCodeFixTests
         );
 
     [Fact]
+    public Task Name_what_a_throwing_arm_catches_inside_a_case() =>
+        Verify.CodeFix(new ListCaughtCasesCodeFix(), """
+            class C
+            {
+                int M(Young young) => young switch { Dog => 1, Kitten { Toy: Ball } => 2, _ => throw new InvalidOperationException() };
+            }
+            """ + Snippets.Toys, """
+            class C
+            {
+                int M(Young young) => young switch { Dog => 1, Kitten { Toy: Ball } => 2, Kitten { Toy: Mouse } => throw new InvalidOperationException() };
+            }
+            """ + Snippets.Toys, new ThrowingDefaultAnalyzer()
+        );
+
+    [Fact]
+    public Task Name_what_a_throwing_else_catches_inside_a_case() =>
+        Verify.CodeFix(new ListCaughtCasesCodeFix(), """
+            class C
+            {
+                int M(Young young)
+                {
+                    if (young is Dog dog) return dog.Name.Length;
+                    else if (young is Kitten { Toy: Ball }) return 2;
+                    else throw new InvalidOperationException();
+                }
+            }
+            """ + Snippets.Toys, """
+            class C
+            {
+                int M(Young young)
+                {
+                    if (young is Dog dog) return dog.Name.Length;
+                    else if (young is Kitten { Toy: Ball }) return 2;
+                    else if (young is Kitten { Toy: Mouse }) throw new InvalidOperationException();
+                    else throw new InvalidOperationException();
+                }
+            }
+            """ + Snippets.Toys, new ThrowingDefaultAnalyzer()
+        );
+
+    [Fact]
     public Task Name_the_combinations_a_throwing_arm_catches() =>
         Verify.CodeFix(new ListCaughtCasesCodeFix(), """
             class C
@@ -279,7 +320,7 @@ public class ListCaughtCasesCodeFixTests
             """, """
             class C
             {
-                int M(Pet a, Pet b) => (a, b) switch { (Cat, _) => 1, (Dog, _) or (Bird, _) => throw new InvalidOperationException() };
+                int M(Pet a, Pet b) => (a, b) switch { (Cat, _) => 1, (Dog or Bird, _) => throw new InvalidOperationException() };
             }
             """, new ThrowingDefaultAnalyzer()
         );

@@ -15,8 +15,8 @@ internal static class Descriptors
         defaultSeverity: DiagnosticSeverity.Warning,
         isEnabledByDefault: true,
         description: "A union is a struct, and boxing it (to object, or a generic T) boxes the union itself, not what it holds. A boxed Pet is a Pet "
-            + "at run time, so a type test against one of its cases is never true, a cast to one throws, and Equals with one of its cases is false. "
-            + "Test the union itself, which tests what it holds, or its Value."
+            + "at run time, so a type test against one of its cases (or any other type) is never true, a cast to one throws, and comparing it with one "
+            + "for equality is false. Test the union itself, which tests what it holds, or its Value."
     );
 
     public static readonly DiagnosticDescriptor DeadArm = new(
@@ -86,12 +86,13 @@ internal static class Descriptors
         id: "UN0019",
         title: "Record's ToString shows a union member's type name",
         helpLinkUri: Reference + "un0019-records-tostring-shows-a-union-members-type-name",
-        messageFormat: "'{0}' prints its {1} as '{2}', the union's type name, in ToString: declare PrintMembers to print its Value",
+        messageFormat: "'{0}' prints its {1} as '{2}', the union's type name, in ToString: {3}",
         category: "Usage",
         defaultSeverity: DiagnosticSeverity.Info,
         isEnabledByDefault: true,
-        description: "A record's generated ToString prints each public member with its own ToString, and a union doesn't override ToString, so "
-            + "it prints the union's type name rather than what the member holds. Declare PrintMembers (or ToString) to print its Value."
+        description: "A record's generated ToString prints each public member with its own ToString, and a union doesn't override ToString unless it "
+            + "declares one, so it prints the union's type name rather than what the member holds. Override ToString in the union to print its Value, "
+            + "which fixes every record (and anything else) that prints it, or declare PrintMembers (or ToString) in the record."
     );
 
     public static readonly DiagnosticDescriptor SwitchOnValue = new(
@@ -113,7 +114,7 @@ internal static class Descriptors
         helpLinkUri: Reference + "un0002-cases-fall-through-to-a-throwing-default",
         messageFormat: "The throwing {0} catches {1}, which the {2} doesn't otherwise handle",
         category: "Reliability",
-        defaultSeverity: DiagnosticSeverity.Info,
+        defaultSeverity: DiagnosticSeverity.Warning,
         isEnabledByDefault: true,
         description: "A switch over a union or closed hierarchy that ends in a default that only throws is meant to handle every case. "
             + "Cases that reach the default instead fail at run time, and so will any case added to the type later, with no warning. "
@@ -128,7 +129,7 @@ internal static class Descriptors
         messageFormat: "This throwing {0} only catches cases added to {1} later, which the compiler would otherwise report as missing",
         category: "Reliability",
         defaultSeverity: DiagnosticSeverity.Info,
-        isEnabledByDefault: false,
+        isEnabledByDefault: true,
         description: "A switch expression over a union or closed hierarchy that already handles every case doesn't need a throwing default arm. "
             + "All the arm does is catch any case added to the type later, at run time, instead of the compiler reporting the switch as not "
             + "exhaustive. Without it, a default union throws SwitchExpressionException instead of the arm's exception."
@@ -138,24 +139,26 @@ internal static class Descriptors
         id: "UN0007",
         title: "Union member can be left holding no case",
         helpLinkUri: Reference + "un0007-union-member-can-be-left-holding-no-case",
-        messageFormat: "'{0}' isn't assigned by every constructor, so it can be left as default({1}), which holds none of its cases",
+        messageFormat: "'{0}' isn't assigned by {1}, so it can be left as {2}, which holds none of its cases",
         category: "Reliability",
         defaultSeverity: DiagnosticSeverity.Info,
         isEnabledByDefault: true,
-        description: "A readonly field or get-only auto-property can only be assigned while the object is constructed. One a constructor doesn't "
-            + "assign keeps the union's default value, whose Value is null and matches none of the case types, and a switch over it throws. "
-            + "Give it an initializer, or assign it in every constructor."
+        description: "A field or auto-property of a struct union type (or of a struct with a union inside) that has no initializer, and that a constructor "
+            + "doesn't assign, starts out as the union's default value, whose Value is null and matches none of the case types, so a switch over it throws. "
+            + "As CS8618 does for a reference that isn't nullable, this goes for one that can be set later, too. Give it an initializer, assign it in every "
+            + "constructor (or in a [MemberNotNull] method they call), or make it required."
     );
 
     public static readonly DiagnosticDescriptor UnionAsText = new(
         id: "UN0015",
         title: "Union formatted as text shows its type name",
         helpLinkUri: Reference + "un0015-union-formatted-as-text-shows-its-type-name",
-        messageFormat: "'{0}' shows the union's type name, '{1}', not what it holds: format {2} instead",
+        messageFormat: "'{0}' shows the union's type name, '{1}', not what it holds: {2}",
         category: "Usage",
         defaultSeverity: DiagnosticSeverity.Info,
         isEnabledByDefault: true,
-        description: "A union doesn't override ToString, so formatting one (with ToString, string interpolation, concatenation, Console.WriteLine, "
-            + "StringBuilder.Append, string.Join or a logger) gives its type name rather than the value it holds. Format its Value instead."
+        description: "A union doesn't override ToString unless it declares one, so formatting one (with ToString, string interpolation, concatenation, "
+            + "Console.WriteLine, StringBuilder.Append, string.Join or a logger) gives its type name rather than the value it holds. Format its Value "
+            + "instead, or override ToString in the union to format its Value, which fixes every place it's formatted."
     );
 }

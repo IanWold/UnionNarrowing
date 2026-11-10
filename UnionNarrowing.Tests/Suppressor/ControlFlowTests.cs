@@ -472,6 +472,78 @@ public class ControlFlowTests
             """
         );
 
+
+    [Fact]
+    public Task Condition_that_declares_the_variable_then_tests_it() =>
+        Verify.Suppressions("""
+            class C
+            {
+                static bool TryGet(out Pet pet)
+                {
+                    pet = new Cat("Tom");
+                    return true;
+                }
+
+                static Pet Next() => new Cat("Tom");
+
+                int OutVariable()
+                {
+                    if (TryGet(out var pet) && pet is not Bird) return pet /*suppressed*/switch { Cat => 1, Dog => 2 };
+                    return 0;
+                }
+
+                int TryGetValue(Dictionary<string, Pet> pets)
+                {
+                    if (pets.TryGetValue("tom", out var pet) && pet is not Bird) return pet /*suppressed*/switch { Cat => 1, Dog => 2 };
+                    return 0;
+                }
+
+                int DeclaredEarlier()
+                {
+                    Pet pet;
+                    if (TryGet(out pet) && pet is not Bird) return pet /*suppressed*/switch { Cat => 1, Dog => 2 };
+                    return 0;
+                }
+
+                int Pattern(object value)
+                {
+                    if (value is Pet pet && pet is not Bird) return pet /*suppressed*/switch { Cat => 1, Dog => 2 };
+                    return 0;
+                }
+
+                int VarPattern() =>
+                    Next() is var pet && pet is not Bird ? pet /*suppressed*/switch { Cat => 1, Dog => 2 } : 0;
+
+                int SamePattern() =>
+                    Next() is not Bird and var pet ? pet /*suppressed*/switch { Cat => 1, Dog => 2 } : 0;
+
+                int Loop(Queue<Pet> queue)
+                {
+                    var total = 0;
+                    while (queue.TryDequeue(out var pet) && pet is not Bird)
+                    {
+                        total += pet /*suppressed*/switch { Cat => 1, Dog => 2 };
+                    }
+
+                    return total;
+                }
+
+                int TestBeforeTheDeclaration(Pet other)
+                {
+                    if (other is not Bird && TryGet(out var pet)) return pet /*warns*/switch { Cat => 1, Dog => 2 };
+                    return 0;
+                }
+
+                int FalseBranch()
+                {
+                    if (!TryGet(out var pet) || pet is Bird) { }
+                    else return pet /*suppressed*/switch { Cat => 1, Dog => 2 };
+                    return 0;
+                }
+            }
+            """
+        );
+
     [Fact]
     public Task Guard_that_does_not_exit() =>
         Verify.Suppressions("""
@@ -638,6 +710,42 @@ public class ControlFlowTests
             """
         );
 
+
+    [Fact]
+    public Task Label_reached_only_by_gotos_out_of_a_loop() =>
+        Verify.Suppressions("""
+            class C
+            {
+                int Found(Pet[] pets)
+                {
+                    Pet found = new Cat("Tom");
+                    foreach (var pet in pets)
+                    {
+                        found = pet;
+                        if (found is Bird) goto Done;
+                    }
+
+                    return 0;
+                Done:
+                    return found /*suppressed*/switch { Bird b => b.Name.Length };
+                }
+
+                int FallsInToo(Pet[] pets)
+                {
+                    Pet found = new Cat("Tom");
+                    foreach (var pet in pets)
+                    {
+                        found = pet;
+                        if (found is Bird) goto Done;
+                    }
+
+                Done:
+                    return found /*warns*/switch { Bird b => b.Name.Length };
+                }
+            }
+            """
+        );
+
     [Fact]
     public Task Labeled_guard() =>
         Verify.Suppressions("""
@@ -651,6 +759,69 @@ public class ControlFlowTests
                     total += pet /*suppressed*/switch { Cat => 1, Dog => 2 };
                     if (total < 10) goto Again;
                     return total;
+                }
+            }
+            """
+        );
+
+
+    [Fact]
+    public Task Labeled_guard_that_writes_the_variable() =>
+        Verify.Suppressions("""
+            class C
+            {
+                static Pet Next() => new Cat("Tom");
+
+                int Retry(Pet pet)
+                {
+                    var tries = 0;
+                Retry:
+                    if (pet is Bird)
+                    {
+                        if (++tries > 3) return 0;
+                        pet = Next();
+                        goto Retry;
+                    }
+
+                    return pet /*suppressed*/switch { Cat => 1, Dog => 2 };
+                }
+
+                int Unused(Pet pet)
+                {
+                Unused:
+                    if (pet is Bird)
+                    {
+                        pet = Next();
+                        return 0;
+                    }
+
+                    return pet /*suppressed*/switch { Cat => 1, Dog => 2 };
+                }
+
+                int JumpedBackTo(Pet pet, bool again)
+                {
+                Top:
+                    if (pet is Bird)
+                    {
+                        pet = Next();
+                        return 0;
+                    }
+
+                    var legs = pet /*suppressed*/switch { Cat => 1, Dog => 2 };
+                    pet = new Bird("Polly");
+                    if (again) goto Top;
+                    return legs;
+                }
+
+                int FallsThroughAfterWriting(Pet pet, Pet other)
+                {
+                Top:
+                    if (pet is Bird)
+                    {
+                        pet = other;
+                    }
+
+                    return pet /*warns*/switch { Cat => 1, Dog => 2 };
                 }
             }
             """

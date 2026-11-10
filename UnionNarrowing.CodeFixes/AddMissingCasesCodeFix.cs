@@ -10,7 +10,6 @@ using Microsoft.CodeAnalysis.CodeFixes;
 using Microsoft.CodeAnalysis.CSharp;
 using Microsoft.CodeAnalysis.CSharp.Syntax;
 using Microsoft.CodeAnalysis.Formatting;
-using Microsoft.CodeAnalysis.Simplification;
 using UnionNarrowing.Suppressors.Analysis;
 using static Microsoft.CodeAnalysis.CSharp.SyntaxFactory;
 
@@ -22,16 +21,59 @@ namespace UnionNarrowing.CodeFixes;
 /// Each new section throws <see cref="System.NotImplementedException"/> until it's filled in.
 /// (The IDE's own fix adds a throwing default, which would catch cases added later too.)
 /// </summary>
+/// <remarks>
+/// Fix All adds the sections to every switch in one pass, and a using for the exception, where the file needs one, once:
+/// merged, what each fix does on its own would add the using once per fix, and the copies collide.
+/// </remarks>
 [ExportCodeFixProvider(LanguageNames.CSharp, Name = nameof(AddMissingCasesCodeFix)), Shared]
 public sealed class AddMissingCasesCodeFix : CodeFixProvider
 {
     public override ImmutableArray<string> FixableDiagnosticIds =>
         ["IDE0010"];
 
-    private static async Task<Document> AddCasesAsync(Document document, SwitchStatementSyntax switchStatement, IReadOnlyList<PatternSyntax> patterns, CancellationToken ct)
+    private static async Task<Document> AddCasesAsync(Document document, IReadOnlyDictionary<SwitchStatementSyntax, List<PatternSyntax>> missing, CancellationToken ct)
     {
         var root = await document.GetSyntaxRootAsync(ct).ConfigureAwait(false);
-        var sections = patterns.Select(pattern => SwitchSection(
+        var newRoot = root!.ReplaceNodes(missing.Keys, (original, current) => WithSections(current, missing[original]));
+        var newDocument = await CodeFixSyntax.ShortenNamesAsync(document.WithSyntaxRoot(newRoot), ct).ConfigureAwait(false);
+        return await Formatter.FormatAsync(newDocument, Formatter.Annotation, cancellationToken: ct).ConfigureAwait(false);
+    }
+
+    /// <summary>
+    /// For each switch statement the diagnostics are on, and the fix is offered for, patterns for what it misses.
+    /// </summary>
+    private static async Task<Dictionary<SwitchStatementSyntax, List<PatternSyntax>>> MissingAsync(Document document, IEnumerable<Diagnostic> diagnostics, CancellationToken ct)
+    {
+        var missing = new Dictionary<SwitchStatementSyntax, List<PatternSyntax>>();
+        var root = await document.GetSyntaxRootAsync(ct).ConfigureAwait(false);
+        var model = await document.GetSemanticModelAsync(ct).ConfigureAwait(false);
+        
+        if (root is null || model is null)
+        {
+            return missing;
+        }
+
+        var session = new Session(document.Project.AnalyzerOptions.AnalyzerConfigOptionsProvider);
+        foreach (var diagnostic in diagnostics)
+        {
+            if (root.FindToken(diagnostic.Location.SourceSpan.Start).Parent?.AncestorsAndSelf().OfType<SwitchStatementSyntax>().FirstOrDefault() is { } switchStatement
+                && !missing.ContainsKey(switchStatement)
+                && SwitchCoverage.Of(switchStatement, model, session, ct, countGuarded: false) is { OverCases: true, Missing.Count: > 0 } coverage
+            )
+            {
+                missing[switchStatement] = MissingPatterns.Of(coverage, model, switchStatement.SpanStart);
+            }
+        }
+
+        return missing;
+    }
+
+    /// <summary>
+    /// The switch statement with a section for each case, before its default section if it has one.
+    /// </summary>
+    private static SwitchStatementSyntax WithSections(SwitchStatementSyntax switchStatement, IReadOnlyList<PatternSyntax> cases)
+    {
+        var sections = cases.Select(pattern => SwitchSection(
             SingletonList<SwitchLabelSyntax>(CasePatternSwitchLabel(pattern, Token(SyntaxKind.ColonToken))),
             SingletonList<StatementSyntax>(ThrowStatement(CodeFixSyntax.NewException("System.NotImplementedException")))
         )
@@ -40,43 +82,26 @@ public sealed class AddMissingCasesCodeFix : CodeFixProvider
 
         var existing = switchStatement.Sections;
         var defaultIndex = existing.IndexOf(section => section.Labels.Any(label => label is DefaultSwitchLabelSyntax));
-        var updated = defaultIndex >= 0 ? existing.InsertRange(defaultIndex, sections) : existing.AddRange(sections);
-
-        var newDocument = document.WithSyntaxRoot(root!.ReplaceNode(switchStatement, switchStatement.WithSections(updated)));
-        newDocument = await Simplifier.ReduceAsync(newDocument, Simplifier.Annotation, cancellationToken: ct).ConfigureAwait(false);
-        return await Formatter.FormatAsync(newDocument, Formatter.Annotation, cancellationToken: ct).ConfigureAwait(false);
+        return switchStatement.WithSections(defaultIndex >= 0 ? existing.InsertRange(defaultIndex, sections) : existing.AddRange(sections));
     }
 
     public override FixAllProvider GetFixAllProvider() =>
-        WellKnownFixAllProviders.BatchFixer;
+        FixAllProvider.Create(async (context, document, diagnostics) =>
+            await AddCasesAsync(document, await MissingAsync(document, diagnostics, context.CancellationToken).ConfigureAwait(false), context.CancellationToken).ConfigureAwait(false)
+        );
 
     public override async Task RegisterCodeFixesAsync(CodeFixContext context)
     {
-        var ct = context.CancellationToken;
-        var root = await context.Document.GetSyntaxRootAsync(ct).ConfigureAwait(false);
-        var model = await context.Document.GetSemanticModelAsync(ct).ConfigureAwait(false);
-        if (root is null || model is null)
+        var missing = await MissingAsync(context.Document, context.Diagnostics, context.CancellationToken).ConfigureAwait(false);
+        if (missing.Count == 0)
         {
             return;
         }
 
-        var session = new Session(context.Document.Project.AnalyzerOptions.AnalyzerConfigOptionsProvider);
-        if (root.FindToken(context.Span.Start).Parent?.AncestorsAndSelf().OfType<SwitchStatementSyntax>().FirstOrDefault() is not { } switchStatement)
-        {
-            return;
-        }
-
-        var coverage = SwitchCoverage.Of(switchStatement, model, session, ct, countGuarded: false);
-        if (!coverage.OverCases || coverage.Missing.Count == 0)
-        {
-            return;
-        }
-
-        var patterns = MissingPatterns.Of(coverage, model, switchStatement.SpanStart);
         context.RegisterCodeFix(
             CodeAction.Create(
-                $"Add cases for {string.Join(", ", patterns.Select(p => p.ToString()))}",
-                ct => AddCasesAsync(context.Document, switchStatement, patterns, ct),
+                $"Add cases for {string.Join(", ", missing.Values.SelectMany(patterns => patterns))}",
+                ct => AddCasesAsync(context.Document, missing, ct),
                 equivalenceKey: nameof(AddMissingCasesCodeFix)
             ),
             context.Diagnostics

@@ -1,7 +1,10 @@
 using System;
 using System.Collections.Concurrent;
+using System.Collections.Immutable;
+using System.Linq;
 using System.Threading;
 using Microsoft.CodeAnalysis;
+using Microsoft.CodeAnalysis.CSharp.Syntax;
 using Microsoft.CodeAnalysis.Diagnostics;
 
 namespace UnionNarrowing.Suppressors.Analysis;
@@ -11,7 +14,9 @@ namespace UnionNarrowing.Suppressors.Analysis;
 /// the options from .editorconfig it runs with, and what it has worked out that can't change while it runs.
 /// Every <see cref="TrackedValue"/> belongs to one.
 /// </summary>
-internal class Session(AnalyzerConfigOptionsProvider options)
+/// <param name="followsCallers">Whether what a method's or constructor's callers pass it counts as known about its parameters (see Narrowing).
+/// Local functions and lambdas get what their callers pass either way: those are in plain sight, in the function they're written in.</param>
+internal class Session(AnalyzerConfigOptionsProvider options, bool followsCallers = true)
 {
     /// <summary>
     /// What <see cref="VariableUsage.Analyze"/> depends on:
@@ -44,6 +49,14 @@ internal class Session(AnalyzerConfigOptionsProvider options)
 
     private readonly ConcurrentDictionary<SyntaxTree, bool> _followsMutableState = new();
 
+    private ImmutableHashSet<string>? _unsafeAccessorTargets;
+
+    /// <summary>
+    /// Whether what a method's or constructor's callers pass it counts as known about its parameters.
+    /// </summary>
+    public bool FollowsCallers =>
+        followsCallers;
+
     private readonly ConcurrentDictionary<UsageKey, VariableUsage?> _usages = new();
 
     private bool ReadFollowsMutableState(SyntaxTree tree) =>
@@ -55,6 +68,28 @@ internal class Session(AnalyzerConfigOptionsProvider options)
     /// </summary>
     public bool FollowsMutableState(SyntaxTree tree) =>
         _followsMutableState.GetOrAdd(tree, ReadFollowsMutableState);
+
+    /// <summary>
+    /// The names of the methods <c>[UnsafeAccessor]</c> declarations in the compilation call, whatever their types (an empty name for one that can't be told).
+    /// </summary>
+    private static ImmutableHashSet<string> UnsafeAccessorTargets(Compilation compilation, CancellationToken ct) => [..
+        compilation.SyntaxTrees
+        .SelectMany(tree => tree.GetRoot(ct).DescendantNodes(n => n is not (BlockSyntax or ArrowExpressionClauseSyntax)).OfType<AttributeSyntax>())
+        .Where(attribute => attribute.Name.ToString() is "UnsafeAccessor" or "UnsafeAccessorAttribute" || attribute.Name.ToString().EndsWith(".UnsafeAccessor", StringComparison.Ordinal))
+        .Select(attribute => attribute.ArgumentList?.Arguments.FirstOrDefault(a => a.NameEquals?.Name.Identifier.ValueText == "Name") is { } named
+            ? (named.Expression as LiteralExpressionSyntax)?.Token.ValueText ?? ""
+            : (attribute.Parent?.Parent as MethodDeclarationSyntax)?.Identifier.ValueText ?? ""
+        )
+    ];
+
+    /// <summary>
+    /// Whether an <c>[UnsafeAccessor]</c> in the compilation could call a method named <paramref name="name"/>, in whatever type, worked out once.
+    /// </summary>
+    public bool IsUnsafeAccessorTarget(string name, Compilation compilation, CancellationToken ct)
+    {
+        var targets = _unsafeAccessorTargets ??= UnsafeAccessorTargets(compilation, ct);
+        return targets.Contains(name) || targets.Contains("");
+    }
 
     /// <summary>
     /// How <paramref name="variable"/> is used, as far as following it to <paramref name="node"/> goes (see <see cref="VariableUsage.Analyze"/>), worked out once for every node in the same place.

@@ -51,6 +51,11 @@ internal static partial class Narrowing
                 {
                     steps = before;
                 }
+                else if (method.Name == "SelectMany" && Regrouped(invocation, first) is { } grouped)
+                {
+                    current = grouped;
+                    continue;
+                }
                 else if (method.Name is "Cast" or "OfType" && first is not null && SymbolEqualityComparer.Default.Equals(Sequences.ElementType(first), Sequences.ElementType(invocation))) { } // a cast to what the elements already are
                 else if (method.Name is "Concat" or "Union" or "UnionBy" && first is not null && invocation.ArgumentFor("second") is { } second && SymbolEqualityComparer.Default.Equals(Sequences.ElementType(first), Sequences.ElementType(second)))
                 {
@@ -96,6 +101,23 @@ internal static partial class Narrowing
 
         return excluded;
     }
+
+    /// <summary>
+    /// For <c>groups.SelectMany(g =&gt; g)</c>, where the groups come from <c>GroupBy</c> (by a key alone) or <c>Chunk</c>, which hands back the very elements that went in:
+    /// the sequence they went in from.
+    /// </summary>
+    private static IOperation? Regrouped(IInvocationOperation flatten, IOperation? groups) =>
+        flatten.ArgumentFor("selector") is { } selector
+        && Sequences.Unconverted(selector) is IAnonymousFunctionOperation { Symbol.Parameters.Length: 1, Body.Operations.Length: 1 } identity
+        && identity.Body.Operations[0] is IReturnOperation { ReturnedValue: { } flattened }
+        && Sequences.Unconverted(flattened) is IParameterReferenceOperation returned
+        && SymbolEqualityComparer.Default.Equals(returned.Parameter, identity.Symbol.Parameters[0])
+        && groups is IInvocationOperation { TargetMethod: { Name: "GroupBy" or "Chunk" } grouping } grouped
+        && Sequences.IsEnumerableMethod(grouping)
+        && grouped.ArgumentFor("elementSelector") is null && grouped.ArgumentFor("resultSelector") is null
+        && grouped.Arguments.FirstOrDefault()?.Value is { } source
+            ? Sequences.Unconverted(source)
+            : null;
 
     /// <summary>
     /// For a lambda's parameter, where the lambda is given each element of a LINQ chain (<c>pets.Where(p =&gt; p is not Bird).Select(p =&gt; ...)</c>, the same in query syntax, <c>list.ForEach(p =&gt; ...)</c>):

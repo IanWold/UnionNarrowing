@@ -176,6 +176,177 @@ public class MutableStateTests
             """, editorConfig: FollowMutableState
         );
 
+
+    [Fact]
+    public Task Code_that_runs_without_a_call_in_between() =>
+        Verify.Suppressions("""
+            using System.Runtime.CompilerServices;
+
+            static class Zoo
+            {
+                public static Pet Current = new Cat("Tom");
+            }
+
+            class Trigger
+            {
+                public static int Value = 1;
+                static Trigger() => Zoo.Current = new Bird("Polly");
+            }
+
+            class Pair
+            {
+                public void Deconstruct(out int a, out int b) { Zoo.Current = new Bird("Polly"); a = 1; b = 1; }
+                public override string ToString() { Zoo.Current = new Bird("Polly"); return ""; }
+                public static bool operator ==(Pair a, Pair b) { Zoo.Current = new Bird("Polly"); return true; }
+                public static bool operator !=(Pair a, Pair b) => !(a == b);
+                public override bool Equals(object? obj) => false;
+                public override int GetHashCode() => 0;
+            }
+
+            class Listed
+            {
+                public int Count { get { Zoo.Current = new Bird("Polly"); return 1; } }
+                public int this[int i] => i;
+            }
+
+            record Copied(int N)
+            {
+                protected Copied(Copied original) { Zoo.Current = new Bird("Polly"); N = original.N; }
+            }
+
+            [CollectionBuilder(typeof(BagBuilder), nameof(BagBuilder.Create))]
+            class Bag : IEnumerable<int>
+            {
+                public IEnumerator<int> GetEnumerator() { Zoo.Current = new Bird("Polly"); yield break; }
+                System.Collections.IEnumerator System.Collections.IEnumerable.GetEnumerator() => GetEnumerator();
+            }
+
+            static class BagBuilder
+            {
+                public static Bag Create(ReadOnlySpan<int> items) { Zoo.Current = new Bird("Polly"); return new Bag(); }
+            }
+
+            class Made
+            {
+                public Made() => Zoo.Current = new Bird("Polly");
+            }
+
+            class C
+            {
+                int StaticConstructor()
+                {
+                    if (Zoo.Current is Bird) return 0;
+                    /*because*/var value = Trigger.Value;
+                    return Zoo.Current /*warns*/switch { Cat => 1, Dog => 2 };
+                }
+
+                int Concatenation(Pair pair)
+                {
+                    if (Zoo.Current is Bird) return 0;
+                    /*because*/var text = "pair: " + pair;
+                    return Zoo.Current /*warns*/switch { Cat => 1, Dog => 2 };
+                }
+
+                int Deconstruction(Pair pair)
+                {
+                    if (Zoo.Current is Bird) return 0;
+                    /*because*/var (a, b) = pair;
+                    return Zoo.Current /*warns*/switch { Cat => 1, Dog => 2 };
+                }
+
+                int PositionalPattern(Pair pair)
+                {
+                    if (Zoo.Current is Bird) return 0;
+                    /*because*/var matched = pair is (1, 1);
+                    return Zoo.Current /*warns*/switch { Cat => 1, Dog => 2 };
+                }
+
+                int ListPattern(Listed listed)
+                {
+                    if (Zoo.Current is Bird) return 0;
+                    /*because*/var matched = listed is [_];
+                    return Zoo.Current /*warns*/switch { Cat => 1, Dog => 2 };
+                }
+
+                int TupleEquality(Pair pair)
+                {
+                    if (Zoo.Current is Bird) return 0;
+                    /*because*/var same = (pair, 1) == (pair, 1);
+                    return Zoo.Current /*warns*/switch { Cat => 1, Dog => 2 };
+                }
+
+                int With(Copied copied)
+                {
+                    if (Zoo.Current is Bird) return 0;
+                    /*because*/var next = copied with { N = 2 };
+                    return Zoo.Current /*warns*/switch { Cat => 1, Dog => 2 };
+                }
+
+                int CollectionExpression()
+                {
+                    if (Zoo.Current is Bird) return 0;
+                    /*because*/Bag bag = [1, 2];
+                    return Zoo.Current /*warns*/switch { Cat => 1, Dog => 2 };
+                }
+
+                int Spread(Bag bag)
+                {
+                    if (Zoo.Current is Bird) return 0;
+                    /*because*/int[] numbers = [.. bag];
+                    return Zoo.Current /*warns*/switch { Cat => 1, Dog => 2 };
+                }
+
+                int NewOfATypeParameter<T>() where T : new()
+                {
+                    if (Zoo.Current is Bird) return 0;
+                    /*because*/var made = new T();
+                    return Zoo.Current /*warns*/switch { Cat => 1, Dog => 2 };
+                }
+
+                int PlainTuple(int n)
+                {
+                    if (Zoo.Current is Bird) return 0;
+                    var same = (n, 1) == (n, 1);
+                    return Zoo.Current /*suppressed*/switch { Cat => 1, Dog => 2 };
+                }
+            }
+            """, editorConfig: FollowMutableState
+        );
+
+
+    [Fact]
+    public Task Mutable_members_of_a_local_whose_every_write_is_known() =>
+        Verify.Suppressions("""
+            class Owner { public Pet Pet { get; set; } = new Cat("Tom"); }
+
+            class Listed
+            {
+                public int Count => 1;
+                public int this[int i] { get { Zoo.Current = new Bird("Polly"); return i; } }
+            }
+
+            static class Zoo { public static Pet Current = new Cat("Tom"); }
+
+            class C
+            {
+                int MemberWritten(bool flag)
+                {
+                    Owner owner = new Owner { Pet = new Cat("Tom") };
+                    if (flag) owner = new Owner { Pet = new Dog("Rex") };
+                    owner.Pet = new Bird("Polly");
+                    return owner.Pet /*warns*/switch { Cat => 1, Dog => 2 };
+                }
+
+                int ImplicitIndexer(Listed listed)
+                {
+                    if (Zoo.Current is Bird) return 0;
+                    /*because*/var last = listed[^1];
+                    return Zoo.Current /*warns*/switch { Cat => 1, Dog => 2 };
+                }
+            }
+            """, editorConfig: FollowMutableState
+        );
+
     [Fact]
     public Task Array_elements_and_references() =>
         Verify.Suppressions("""

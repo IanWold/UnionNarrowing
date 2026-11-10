@@ -143,6 +143,32 @@ public class CopyTests
             """
         );
 
+
+    [Fact]
+    public Task Copies_made_by_a_guard_that_exits() =>
+        Verify.Suppressions("""
+            record Owner(Pet Pet);
+            record Shelter(Pet Pet) : Owner(Pet);
+
+            class C
+            {
+                int Negated(Owner owner)
+                {
+                    if (owner is Shelter { Pet: Bird }) return 0;
+                    if (owner is not Shelter shelter) return 1;
+                    return shelter.Pet /*suppressed*/switch { Cat => 2, Dog => 3 };
+                }
+
+                int GuardOnAnotherOwner(Owner owner, Owner other)
+                {
+                    if (other is Shelter { Pet: Bird }) return 0;
+                    if (owner is not Shelter shelter) return 1;
+                    return shelter.Pet /*warns*/switch { Cat => 2, Dog => 3 };
+                }
+            }
+            """
+        );
+
     [Fact]
     public Task Copies_made_by_var_patterns() =>
         Verify.Suppressions("""

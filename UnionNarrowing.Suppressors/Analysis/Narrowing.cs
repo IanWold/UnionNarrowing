@@ -124,6 +124,47 @@ internal static partial class Narrowing
                 : CaseSet.Empty;
 
         /// <summary>
+        /// For a condition that writes the value, what's known about it where the condition was true (or false), from the tests it makes after its last write:
+        /// in <c>TryGet(out var pet) &amp;&amp; pet is not Bird</c>, the test is of what TryGet set, and holds wherever the whole condition does
+        /// (and <c>a || b</c> is only false where both are).
+        /// A pattern that binds the whole of what it tests to the variable (<c>Next() is not Bird and var pet</c>) says the same about it.
+        /// </summary>
+        public CaseSet AfterLastWrite(ExpressionSyntax condition, bool whenTrue)
+        {
+            condition = WriteAnalysis.WithoutParentheses(condition);
+            if (condition is BinaryExpressionSyntax binary && binary.IsKind(whenTrue ? SyntaxKind.LogicalAndExpression : SyntaxKind.LogicalOrExpression))
+            {
+                if (Writes(binary.Right))
+                {
+                    return AfterLastWrite(binary.Right, whenTrue);
+                }
+
+                var tested = Condition(binary.Right);
+                return (whenTrue ? tested.AlwaysFalse : tested.AlwaysTrue) | AfterLastWrite(binary.Left, whenTrue);
+            }
+
+            if (condition is IsPatternExpressionSyntax isPattern && BindsWholeInput(isPattern.Pattern) && model.GetOperation(isPattern, ct) is IIsPatternOperation { Pattern: var pattern })
+            {
+                var outcome = Pattern(pattern);
+                return whenTrue ? outcome.AlwaysFalse : outcome.AlwaysTrue;
+            }
+
+            return CaseSet.Empty;
+
+            bool BindsWholeInput(PatternSyntax pattern) => pattern switch
+            {
+                VarPatternSyntax { Designation: SingleVariableDesignationSyntax designation } => Declares(designation),
+                DeclarationPatternSyntax { Type.IsVar: true, Designation: SingleVariableDesignationSyntax designation } => Declares(designation),
+                ParenthesizedPatternSyntax parenthesized => BindsWholeInput(parenthesized.Pattern),
+                BinaryPatternSyntax both when both.IsKind(SyntaxKind.AndPattern) => BindsWholeInput(both.Left) || BindsWholeInput(both.Right),
+                _ => false,
+            };
+
+            bool Declares(SingleVariableDesignationSyntax designation) =>
+                SymbolEqualityComparer.Default.Equals(model.GetDeclaredSymbol(designation, ct), value.Variable);
+        }
+
+        /// <summary>
         /// Whether the only write to the value in the condition is a plain assignment to its variable, <c>(x = e)</c>, and nothing in the condition reads it before that:
         /// what the condition tests about x is then about what it was assigned, which it still holds once the condition is worked out.
         /// (Reads in <c>e</c> are of what x held before, but they aren't tests the condition makes.)
@@ -154,8 +195,9 @@ internal static partial class Narrowing
             function is AnonymousFunctionExpressionSyntax or QueryExpressionSyntax
             && !value.IsExternallyMutable
             && !value.IndexVariables.Any()
-            && !(value.Variable is null && !value.Steps.IsEmpty && Functions.IsInConstruction(function)) // a constructor can assign it later
-            && (value.Variable is null || (usage is { NeverChanges: true } && function != usage.DeclaringFunction));
+            && !(value.Variable is null && !value.Steps.IsEmpty && (Functions.IsInConstruction(function) || Functions.MayBeCreatedDuringConstruction(function, model, ct))) // a constructor can assign it later
+            && !value.MembersReadThrough.Any(member => member is { IsStatic: false, ContainingType: { IsReferenceType: true } owner } && Functions.ThisEscapesDuringConstruction(owner, model, ct))
+            && (value.Variable is null || (usage is { NeverChanges: true } or { SetForGoodWhereCaptured: true } && function != usage.DeclaringFunction));
 
         /// <summary>
         /// What a switch statement's case label on <paramref name="input"/> says about the value.
@@ -164,6 +206,7 @@ internal static partial class Narrowing
         {
             IPatternCaseClauseOperation patternClause => PatternOn(input, patternClause.Pattern),
             _ when value.IsReadBy(input) => Facts.Of(clause, space, model.Compilation),
+            ISingleValueCaseClauseOperation single => Facts.OfConstantOnDiscriminant(input, single, value, space, model.Compilation) ?? Outcome.Unknown,
             _ => Outcome.Unknown, // a `default:` label is tried last, wherever it is
         };
 
@@ -204,7 +247,8 @@ internal static partial class Narrowing
         public bool Follows(IOperation input) =>
             value.IsReadBy(input)
             || (TrackedValue.From(input, value.Session) is { } owner && owner.IsPrefixOf(value))
-            || (input is ITupleOperation tuple && tuple.Elements.Any(Follows));
+            || (input is ITupleOperation tuple && tuple.Elements.Any(Follows))
+            || Facts.ReadsDiscriminant(input, value, space, model.Compilation);
 
         /// <summary>
         /// What an arm's (or label's) <c>when</c> clause says about the value, also through what its pattern binds the input to (see <see cref="Facts.OfGuard"/>).
@@ -263,9 +307,18 @@ internal static partial class Narrowing
             }
 
             var expression = child is ExpressionStatementSyntax statement ? statement.Expression : child as ExpressionSyntax;
-            if (expression is AssignmentExpressionSyntax assignment && assignment.Right.Span.Contains(start.Span))
+            if (expression is AssignmentExpressionSyntax assignment && assignment.Right.Span.Contains(start.Span)
+                && !start.Ancestors().TakeWhile(a => a != assignment).Any(Functions.IsFunction)
+            )
             {
                 return WritesWhileLocating(assignment.Left) || Writes(assignment.Right);
+            }
+
+            // A switch statement's sections only run once it has matched, and control never comes back around to it
+            // from them (a loop or goto around it is a level further out).
+            if (child == start && start is SwitchStatementSyntax switchStatement)
+            {
+                return Writes(switchStatement.Expression);
             }
 
             // For a value something else could change, what runs after it's read doesn't matter, unless control can come
@@ -365,6 +418,10 @@ internal static partial class Narrowing
                 var assigning = context.Condition(condition);
                 excluded |= (whenTrue ? assigning.AlwaysFalse : assigning.AlwaysTrue) | context.AssignedInCondition(condition);
             }
+            else
+            {
+                excluded |= context.AfterLastWrite(condition, whenTrue);
+            }
 
             return false;
         }
@@ -407,10 +464,9 @@ internal static partial class Narrowing
         // `while ((pet = Next()) is not Bird) { ... }`: what's tested is what it was just assigned.
         if (context.Writes(condition))
         {
-            if (context.AssignsBeforeTesting(condition))
-            {
-                excluded |= context.Condition(condition).AlwaysFalse | context.AssignedInCondition(condition);
-            }
+            excluded |= context.AssignsBeforeTesting(condition)
+                ? context.Condition(condition).AlwaysFalse | context.AssignedInCondition(condition)
+                : context.AfterLastWrite(condition, whenTrue: true);
 
             return false;
         }
@@ -580,8 +636,13 @@ internal static partial class Narrowing
             return null;
         }
 
+        // Control can only fall into the label if the statement before it can complete (`return 0; done: ...` can't).
         var (value, space, model, ct) = (context.Value, context.Space, context.Model, context.CancellationToken);
-        CaseSet? atLabel = Excluded(label, value, space, model, ct, onEntry: true, context.Copies + 1, joinedLabel: label);
+        var statements = Statements.StatementsAround(label.Parent!);
+        var index = statements is null ? -1 : Statements.IndexOf(statements, label);
+        CaseSet? atLabel = index > 0 && context.Exits(statements![index - 1])
+            ? null
+            : Excluded(label, value, space, model, ct, onEntry: true, context.Copies + 1, joinedLabel: label);
 
         foreach (var jump in jumps)
         {
@@ -627,7 +688,7 @@ internal static partial class Narrowing
 
             if (usage is not null)
             {
-                excluded |= FactsFromDesignation(usage, context);
+                excluded |= FactsFromDesignation(usage, context) | FactsFromEveryWrite(usage, context);
             }
 
             // Made it all the way to the start of the function the parameter belongs to: what's known about the
@@ -1019,9 +1080,9 @@ internal static partial class Narrowing
                 return CaseSet.Null;
 
             // `Guard.IsTrue(x is not Bird)`, with `[DoesNotReturnIf(false)] bool condition`: it doesn't return when the
-            // condition is false.
+            // condition is false. And `AssertSettled(x)`, a helper of one's own that throws for some cases.
             case IInvocationOperation { TargetMethod: var method } invocation when !Symbols.HasAttribute(method, "ConditionalAttribute", "System", "Diagnostics"):
-                var throwing = CaseSet.Empty;
+                var throwing = Facts.ThrowsWhenCalled(invocation, context.Value, context.Space, context.Model.Compilation);
                 foreach (var argument in invocation.Arguments)
                 {
                     if (argument.Parameter?.GetAttributes().FirstOrDefault(a => Symbols.IsAttribute(a, "DoesNotReturnIfAttribute", "System", "Diagnostics", "CodeAnalysis")) is { ConstructorArguments.Length: 1 } doesNotReturnIf

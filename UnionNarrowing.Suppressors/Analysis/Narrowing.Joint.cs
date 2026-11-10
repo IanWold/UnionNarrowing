@@ -52,6 +52,43 @@ file class Joint(IReadOnlyList<TrackedValue> values, IReadOnlyList<CaseSpace> sp
         box.Any(set => set.IsEmpty);
 
     /// <summary>
+    /// A property pattern on what some of the values are members of (<c>b is { Left: Lit, Right: Lit }</c>, <c>e is Bin { Left: Lit, Right: Lit }</c>):
+    /// true where every subpattern is, as long as the others match anything; false where any one subpattern is.
+    /// Null if no subpattern is on one of the values.
+    /// </summary>
+    private (List<CaseSet[]> AlwaysTrue, List<CaseSet[]> AlwaysFalse)? OfMemberPatterns(IOperation input, IPatternOperation pattern)
+    {
+        if (pattern is not IRecursivePatternOperation { DeconstructionSubpatterns.IsEmpty: true } recursive || TrackedValue.From(input, values[0].Session) is not { } owner)
+        {
+            return null;
+        }
+
+        IReadOnlyList<Step> into = SymbolEqualityComparer.Default.Equals(recursive.MatchedType, recursive.InputType) ? [] : [new CaseStep(recursive.MatchedType)];
+        var alwaysTrue = Everything;
+        var sureToMatch = true;
+        var alwaysFalse = new List<CaseSet[]>();
+
+        foreach (var property in recursive.PropertySubpatterns)
+        {
+            IReadOnlyList<Step> path = [.. into, .. Facts.MemberChain(property.Member)];
+            var k = values.ToList().FindIndex(value => owner.IsPrefixOf(value) && value.Steps.Skip(owner.Steps.Length).SequenceEqual(path));
+
+            if (k < 0)
+            {
+                sureToMatch &= Facts.MatchesAnything(property.Pattern);
+                continue;
+            }
+
+            var outcome = Facts.Of(property.Pattern, spaces[k], model.Compilation);
+            
+            alwaysTrue[k] &= outcome.AlwaysTrue;
+            alwaysFalse.Add(At(k, outcome.AlwaysFalse));
+        }
+
+        return alwaysFalse.Count == 0 ? null : (sureToMatch && !IsEmpty(alwaysTrue) ? [alwaysTrue] : [], alwaysFalse);
+    }
+
+    /// <summary>
     /// A tuple pattern over the values (in the places <paramref name="positions"/> gives, or -1 for an element that isn't one):
     /// true where every element's subpattern is, false where any one's is.
     /// </summary>
@@ -122,6 +159,9 @@ file class Joint(IReadOnlyList<TrackedValue> values, IReadOnlyList<CaseSpace> sp
 
             case IIsPatternOperation { Value: ITupleOperation tuple } isPattern:
                 return OfTuplePattern(isPattern.Pattern, [.. tuple.Elements.Select(IndexOf)]);
+
+            case IIsPatternOperation isPattern when OfMemberPatterns(isPattern.Value, isPattern.Pattern) is { } onMembers:
+                return onMembers;
 
             default:
                 // A test of one value: a box with what it says at that value's place.

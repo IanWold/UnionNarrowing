@@ -7,8 +7,6 @@ using Microsoft.CodeAnalysis.CSharp;
 using Microsoft.CodeAnalysis.CSharp.Syntax;
 using Microsoft.CodeAnalysis.Operations;
 
-using TypeMap = System.Collections.Generic.IReadOnlyDictionary<Microsoft.CodeAnalysis.ITypeSymbol, Microsoft.CodeAnalysis.ITypeSymbol>;
-
 namespace UnionNarrowing.Suppressors.Analysis;
 
 /// <summary>
@@ -31,10 +29,18 @@ internal static class Facts
         return conversion.IsIdentity || (conversion.IsImplicit && (conversion.IsReference || conversion.IsBoxing));
     }
 
-    private static bool AppliesToAnotherUnion(ITypeSymbol input, ITypeSymbol union)
+    /// <summary>
+    /// Whether a pattern's input is a union other than the one the space is of:
+    /// one a case holds.
+    /// (In generic code read without knowing what its type parameters stand for, the same union with other type arguments might be this one.)
+    /// </summary>
+    private static bool AppliesToAnotherUnion(ITypeSymbol input, CaseSpace space, Compilation compilation)
     {
-        var inner = Symbols.UnderlyingOfNullable(input) ?? input;
-        return inner.IsUnion && !SymbolEqualityComparer.Default.Equals(inner, union);
+        var inner = space.Interpret(Symbols.UnderlyingOfNullable(input) ?? input, compilation);
+
+        return inner.IsUnion
+            && !SymbolEqualityComparer.Default.Equals(inner, space.UnionType)
+            && !(TypeArguments.Mentioned(inner) && SymbolEqualityComparer.Default.Equals(inner.OriginalDefinition, space.UnionType?.OriginalDefinition));
     }
 
     /// <summary>
@@ -78,8 +84,16 @@ internal static class Facts
         }
 
         // A struct, enum or sealed class value is exactly that type at run time, so the static relationship decides.
-        // (Not delegates or arrays: variance lets a Func<Cat> hold a Func<Kitten>, and an Animal[] a Dog[].)
-        if (caseType.TypeKind is TypeKind.Struct or TypeKind.Enum || (caseType.TypeKind == TypeKind.Class && caseType.IsSealed))
+        // (Not delegates or arrays: variance lets a Func<Cat> hold a Func<Kitten>, and an Animal[] a Dog[].) Where
+        // either type is made from type parameters, some type arguments could make them the same type, or one a base
+        // type or interface of the other.
+        var exactly = caseType.TypeKind is TypeKind.Struct or TypeKind.Enum || (caseType.TypeKind == TypeKind.Class && caseType.IsSealed);
+        if (TypeArguments.Mentioned(caseType) || TypeArguments.Mentioned(type))
+        {
+            return !exactly || SelfAndBaseTypes(caseType).Any(t => CouldBeSameType(t, type) || IsVariantOfSameDefinition(t, type));
+        }
+
+        if (exactly)
         {
             return AlwaysInstanceOf(caseType, type, compilation);
         }
@@ -87,6 +101,177 @@ internal static class Facts
         // Otherwise a derived type might be one. C# allows at least an explicit conversion between any two types a
         // value could be both of, so no conversion at all means no value can be both.
         return compilation.ClassifyConversion(caseType, type).Exists;
+    }
+
+    /// <summary>
+    /// Whether <c>value op bound</c> holds, for the relational operators.
+    /// </summary>
+    private static bool? Compares(BinaryOperatorKind kind, decimal value, decimal bound) => kind switch
+    {
+        BinaryOperatorKind.LessThan => value < bound,
+        BinaryOperatorKind.LessThanOrEqual => value <= bound,
+        BinaryOperatorKind.GreaterThan => value > bound,
+        BinaryOperatorKind.GreaterThanOrEqual => value >= bound,
+        _ => null,
+    };
+
+    /// <summary>
+    /// The constant a sealed type's implementation of the property returns, if its getter does nothing else:
+    /// <c>public override ShapeKind Kind =&gt; ShapeKind.Circle;</c>.
+    /// </summary>
+    private static Optional<object?> ConstantOf(IPropertySymbol property, ITypeSymbol type, Compilation compilation)
+    {
+        static bool Implements(IPropertySymbol candidate, IPropertySymbol property)
+        {
+            for (var overridden = candidate; overridden is not null; overridden = overridden.OverriddenProperty)
+            {
+                if (SymbolEqualityComparer.Default.Equals(overridden.OriginalDefinition, property.OriginalDefinition))
+                {
+                    return true;
+                }
+            }
+
+            return false;
+        }
+
+        if (!type.IsSealed && !type.IsValueType)
+        {
+            return default;
+        }
+
+        for (var declaring = type; declaring is not null; declaring = declaring.BaseType)
+        {
+            var implementation = declaring.GetMembers(property.Name).OfType<IPropertySymbol>().FirstOrDefault(p => Implements(p, property));
+            if (implementation is null)
+            {
+                continue;
+            }
+
+            return implementation.DeclaringSyntaxReferences.Length == 1
+                && HelperBody(implementation.DeclaringSyntaxReferences[0].GetSyntax()) is var body
+                && (body as ExpressionSyntax ?? (body is BlockSyntax { Statements.Count: 1 } block && block.Statements[0] is ReturnStatementSyntax { Expression: { } returned } ? returned : null)) is { } constant
+                && compilation.SyntaxTrees.Contains(constant.SyntaxTree)
+                && compilation.GetSemanticModel(constant.SyntaxTree) is var model
+                && SymbolEqualityComparer.Default.Equals(model.GetTypeInfo(constant).Type, property.Type)
+                    ? model.GetConstantValue(constant)
+                    : default;
+        }
+
+        return default;
+    }
+
+    /// <summary>
+    /// For a property every case of a closed hierarchy gives a constant for (a discriminant: <c>Kind</c>, with each sealed leaf overriding <c>Kind =&gt; ShapeKind.Circle</c>):
+    /// what a test of it says about the value, true for the cases whose constant <paramref name="passes"/>, false for those whose constant fails it.
+    /// Null if no case gives one.
+    /// </summary>
+    private static Outcome? OfDiscriminant(IPropertySymbol property, Func<object?, bool?> passes, CaseSpace space, Compilation compilation)
+    {
+        // Only types whose constants compare exactly: not floating point (NaN), decimal (1.0m is 1m), or object (boxed).
+        if (space.Kind != SpaceKind.Closed
+            || property.Type is not ({ TypeKind: TypeKind.Enum } or { SpecialType: SpecialType.System_Boolean or SpecialType.System_Char or SpecialType.System_String
+                or SpecialType.System_SByte or SpecialType.System_Byte or SpecialType.System_Int16 or SpecialType.System_UInt16
+                or SpecialType.System_Int32 or SpecialType.System_UInt32 or SpecialType.System_Int64 or SpecialType.System_UInt64
+            })
+        )
+        {
+            return null;
+        }
+
+        var (alwaysTrue, alwaysFalse, known) = (new List<object>(), new List<object>(), false);
+        foreach (var candidate in space.Cases.OfType<ITypeSymbol>())
+        {
+            if (ConstantOf(property, candidate, compilation) is { HasValue: true } constant)
+            {
+                known = true;
+                if (passes(constant.Value) is bool holds)
+                {
+                    (holds ? alwaysTrue : alwaysFalse).Add(candidate);
+                }
+            }
+        }
+
+        return known ? new Outcome(CaseSet.Of(alwaysTrue), CaseSet.Of(alwaysFalse)) : null;
+    }
+
+    /// <summary>
+    /// <see cref="OfDiscriminant(IPropertySymbol, Func{object?, bool?}, CaseSpace, Compilation)"/> for a read of a discriminant of the value (<c>shape.Kind</c>), as it is: one converted first (<c>shape.Sides == 4.0</c>) is compared as something else.
+    /// </summary>
+    private static Outcome? OfDiscriminant(IOperation read, Func<object?, bool?> passes, TrackedValue value, CaseSpace space, Compilation compilation) =>
+        read is IPropertyReferenceOperation { Instance: { } instance, Property: var property, Arguments.IsEmpty: true } && Tests(instance, value, space)
+            ? OfDiscriminant(property, passes, space, compilation)
+            : null;
+
+    /// <summary>
+    /// Whether a pattern matches a constant:
+    /// null where that can't be told.
+    /// </summary>
+    private static bool? PatternHolds(IPatternOperation pattern, object? constant) => pattern switch
+    {
+        IDiscardPatternOperation or IDeclarationPatternOperation { MatchesNull: true } => true,
+        IConstantPatternOperation { Value.ConstantValue: { HasValue: true } matched } => Equals(CaseSpace.ConstantKey(matched.Value), CaseSpace.ConstantKey(constant)),
+        IRelationalPatternOperation { Value.ConstantValue: { HasValue: true } bound } relational => CaseSpace.ConstantKey(constant) is decimal value && CaseSpace.ConstantKey(bound.Value) is decimal limit ? Compares(relational.OperatorKind, value, limit) : null,
+        INegatedPatternOperation not => !PatternHolds(not.Pattern, constant),
+        IBinaryPatternOperation { OperatorKind: BinaryOperatorKind.Or } or => PatternHolds(or.LeftPattern, constant) is var left && left == true ? true : left == false ? PatternHolds(or.RightPattern, constant) : PatternHolds(or.RightPattern, constant) == true ? true : null,
+        IBinaryPatternOperation { OperatorKind: BinaryOperatorKind.And } and => PatternHolds(and.LeftPattern, constant) is var left && left == false ? false : left == true ? PatternHolds(and.RightPattern, constant) : PatternHolds(and.RightPattern, constant) == false ? false : null,
+        _ => null,
+    };
+
+    /// <summary>
+    /// Whether the operator is a record's generated <c>==</c> or <c>!=</c>, over Equals methods (its own and its base records') that are all generated too:
+    /// comparing one with null then says only whether it is null.
+    /// </summary>
+    private static bool IsGeneratedRecordEquality(IMethodSymbol operatorMethod)
+    {
+        if (operatorMethod is not { IsImplicitlyDeclared: true, ContainingType.IsRecord: true })
+        {
+            return false;
+        }
+
+        for (var record = operatorMethod.ContainingType; record is { IsRecord: true }; record = record.BaseType)
+        {
+            if (record.GetMembers("Equals").Any(equals => !equals.IsImplicitlyDeclared))
+            {
+                return false;
+            }
+        }
+
+        return true;
+    }
+
+    /// <summary>
+    /// Whether some type arguments for the type parameters the types are made from could make them the same type:
+    /// <c>Some&lt;T&gt;</c> and <c>Some&lt;int&gt;</c> could be, <c>Some&lt;T&gt;</c> and <c>None</c> can't.
+    /// </summary>
+    private static bool CouldBeSameType(ITypeSymbol left, ITypeSymbol right) => (left, right) switch
+    {
+        (ITypeParameterSymbol, _) or (_, ITypeParameterSymbol) => true,
+        (IArrayTypeSymbol leftArray, IArrayTypeSymbol rightArray) => leftArray.Rank == rightArray.Rank && CouldBeSameType(leftArray.ElementType, rightArray.ElementType),
+        (INamedTypeSymbol leftNamed, INamedTypeSymbol rightNamed) when SymbolEqualityComparer.Default.Equals(leftNamed.OriginalDefinition, rightNamed.OriginalDefinition) =>
+            leftNamed.TypeArguments.Zip(rightNamed.TypeArguments, CouldBeSameType).All(could => could)
+            && (leftNamed.ContainingType is null || CouldBeSameType(leftNamed.ContainingType, rightNamed.ContainingType!)),
+        _ => SymbolEqualityComparer.Default.Equals(left, right),
+    };
+
+    /// <summary>
+    /// Whether both are the same variant interface or delegate (<c>IEnumerable&lt;out T&gt;</c>), whatever their type arguments, which variance can convert between.
+    /// </summary>
+    private static bool IsVariantOfSameDefinition(ITypeSymbol left, ITypeSymbol right) =>
+        left is INamedTypeSymbol { OriginalDefinition: var definition }
+        && SymbolEqualityComparer.Default.Equals(definition, right.OriginalDefinition)
+        && definition.TypeParameters.Any(parameter => parameter.Variance != VarianceKind.None);
+
+    private static IEnumerable<ITypeSymbol> SelfAndBaseTypes(ITypeSymbol type)
+    {
+        for (var current = type; current is not null; current = current.BaseType)
+        {
+            yield return current;
+        }
+
+        foreach (var implemented in type.AllInterfaces)
+        {
+            yield return implemented;
+        }
     }
 
     /// <summary>
@@ -164,9 +349,10 @@ internal static class Facts
     };
 
     /// <summary>
-    /// The single expression a method, local function or property getter returns, if that's its whole body.
+    /// The body of a method, local function or property getter:
+    /// the expression it returns, or its block.
     /// </summary>
-    private static ExpressionSyntax? HelperBody(SyntaxNode declaration)
+    private static SyntaxNode? HelperBody(SyntaxNode declaration)
     {
         var (arrow, block) = declaration switch
         {
@@ -179,7 +365,74 @@ internal static class Facts
             _ => (null, null),
         };
 
-        return arrow?.Expression ?? (block is { Statements.Count: 1 } && block.Statements[0] is ReturnStatementSyntax { Expression: { } returned } ? returned : null);
+        return (SyntaxNode?)arrow?.Expression ?? block;
+    }
+
+    /// <summary>
+    /// The ways out of a helper's block that return normally, each with what's ruled out for the value there and what it returns (null for none), read statement by statement:
+    /// through statements that don't return, and guards whose branches end in a <c>return</c> or a <c>throw</c> (<c>if (x is T) return ...;</c>, <c>if (x is T) throw ...;</c>), which rule out for what follows what their condition says.
+    /// Null for a block that does anything else.
+    /// (Nothing in it may write the value, which the caller makes sure of.)
+    /// </summary>
+    private static List<(CaseSet Excluded, ExpressionSyntax? Returned)>? Exits(BlockSyntax block, TrackedValue value, CaseSpace space, SemanticModel model, int depth)
+    {
+        var exits = new List<(CaseSet, ExpressionSyntax?)>();
+        var excluded = CaseSet.Empty;
+
+        // A branch's statements, the last of which leaves: what it returns, if it returns.
+        bool Leaves(StatementSyntax branch, CaseSet excludedThere)
+        {
+            var statements = branch is BlockSyntax inner ? [.. inner.Statements] : new List<StatementSyntax> { branch };
+            if (statements.Count == 0 || !statements.Take(statements.Count - 1).All(s => s is ExpressionStatementSyntax or LocalDeclarationStatementSyntax))
+            {
+                return false;
+            }
+
+            switch (statements[statements.Count - 1])
+            {
+                case ReturnStatementSyntax leaving:
+                    exits.Add((excludedThere, leaving.Expression));
+                    return true;
+                case ThrowStatementSyntax:
+                    return true;
+                default:
+                    return false;
+            }
+        }
+
+        foreach (var statement in block.Statements)
+        {
+            switch (statement)
+            {
+                case ExpressionStatementSyntax or LocalDeclarationStatementSyntax:
+                    continue;
+
+                case ReturnStatementSyntax or ThrowStatementSyntax:
+                    Leaves(statement, excluded);
+                    return exits;
+
+                case IfStatementSyntax guard when model.GetOperation(guard.Condition) is { } condition:
+                    var outcome = Of(condition, value, space, model.Compilation, flag: null, depth);
+                    if (!Leaves(guard.Statement, excluded | outcome.AlwaysFalse))
+                    {
+                        return null;
+                    }
+
+                    if (guard.Else is { } otherwise)
+                    {
+                        return Leaves(otherwise.Statement, excluded | outcome.AlwaysTrue) ? exits : null;
+                    }
+
+                    excluded |= outcome.AlwaysTrue;
+                    continue;
+
+                default:
+                    return null;
+            }
+        }
+
+        exits.Add((excluded, null));
+        return exits;
     }
 
     /// <summary>
@@ -189,7 +442,7 @@ internal static class Facts
     {
         IConstantPatternOperation { Value.ConstantValue: { HasValue: true, Value: null } } => true,
         INegatedPatternOperation { Pattern: IConstantPatternOperation { Value.ConstantValue: { HasValue: true, Value: null } } } => false,
-        IRecursivePatternOperation { DeconstructionSubpatterns.IsEmpty: true, PropertySubpatterns.IsEmpty: true, Syntax: RecursivePatternSyntax { Type: null } } => false,
+        IRecursivePatternOperation { DeconstructionSubpatterns.IsEmpty: true, PropertySubpatterns.IsEmpty: true, Syntax: RecursivePatternSyntax { Type: null, PositionalPatternClause: null } } => false,
         _ => null,
     };
 
@@ -204,10 +457,10 @@ internal static class Facts
                 ? TryCastOf(equality.RightOperand, value, space, flag)
                 : null;
 
-    private static Outcome Of(IOperation condition, TrackedValue value, CaseSpace space, Compilation compilation, Func<ILocalSymbol, IOperation?>? flag, int depth, TypeMap? types)
+    private static Outcome Of(IOperation condition, TrackedValue value, CaseSpace space, Compilation compilation, Func<ILocalSymbol, IOperation?>? flag, int depth)
     {
         Outcome OfOperand(IOperation operand) =>
-            Of(operand, value, space, compilation, flag, depth, types);
+            Of(operand, value, space, compilation, flag, depth);
 
         switch (condition)
         {
@@ -225,11 +478,17 @@ internal static class Facts
                 var compared = OfConstant(constant.Value, space, byEquality: true);
                 return equality.OperatorKind == BinaryOperatorKind.Equals ? compared : compared.Not();
 
+            // `shape.Kind == ShapeKind.Circle`, where each case's Kind is a constant.
+            case IBinaryOperation { OperatorKind: BinaryOperatorKind.Equals or BinaryOperatorKind.NotEquals, OperatorMethod: null } discriminantEquality
+                when (discriminantEquality.RightOperand.ConstantValue.HasValue ? (discriminantEquality.LeftOperand, discriminantEquality.RightOperand.ConstantValue) : (discriminantEquality.RightOperand, discriminantEquality.LeftOperand.ConstantValue)) is ({ } read, { HasValue: true } constant)
+                    && OfDiscriminant(read, candidate => Equals(CaseSpace.ConstantKey(candidate), CaseSpace.ConstantKey(constant.Value)), value, space, compilation) is { } discriminant:
+                return discriminantEquality.OperatorKind == BinaryOperatorKind.Equals ? discriminant : discriminant.Not();
+
             // `x as Circle != null`, which is `x is Circle` (also through a local set to `x as Circle`). A record's own
-            // `==` compares with null the same way.
-            case IBinaryOperation { OperatorKind: BinaryOperatorKind.Equals or BinaryOperatorKind.NotEquals, OperatorMethod: null or { IsImplicitlyDeclared: true, ContainingType.IsRecord: true } } nullCheck
-                when NullComparedTryCast(nullCheck, value, space, flag) is { } castTo:
-                var isCastTo = OfType(castTo, space, compilation, types);
+            // `==` compares with null the same way, if its Equals is the generated one.
+            case IBinaryOperation { OperatorKind: BinaryOperatorKind.Equals or BinaryOperatorKind.NotEquals } nullCheck
+                when (nullCheck.OperatorMethod is null || IsGeneratedRecordEquality(nullCheck.OperatorMethod)) && NullComparedTryCast(nullCheck, value, space, flag) is { } castTo:
+                var isCastTo = OfType(castTo, space, compilation);
                 return nullCheck.OperatorKind == BinaryOperatorKind.NotEquals ? isCastTo : isCastTo.Not();
 
             // `(x is Bird) == false`, `isBird != true`: the bool compared, or its opposite.
@@ -237,6 +496,12 @@ internal static class Facts
                 when BoolComparedWithConstant(boolEquality) is var (other, constant):
                 var ofOther = OfOperand(other);
                 return constant == (boolEquality.OperatorKind == BinaryOperatorKind.Equals) ? ofOther : ofOther.Not();
+
+            // `(x is Bird) is true`, `isBird is not false`: the bool tested, or its opposite.
+            case IIsPatternOperation { Value: { Type.SpecialType: SpecialType.System_Boolean } tested, Pattern: var boolPattern }
+                when PatternHolds(boolPattern, true) is bool matchesTrue && PatternHolds(boolPattern, false) is bool matchesFalse && matchesTrue != matchesFalse:
+                var ofTested = OfOperand(tested);
+                return matchesTrue ? ofTested : ofTested.Not();
 
             // `maybe.HasValue`, which is `maybe != null`.
             case IPropertyReferenceOperation { Property: { Name: "HasValue", ContainingType.OriginalDefinition.SpecialType: SpecialType.System_Nullable_T }, Instance: { } nullable }
@@ -248,7 +513,7 @@ internal static class Facts
             case IInvocationOperation { TargetMethod: { Name: "TryGetValue", IsStatic: false, ReturnType.SpecialType: SpecialType.System_Boolean, Parameters.Length: 1 } tryGet, Instance: { } union }
                 when space.IsUnion && tryGet.ContainingType.IsUnion && tryGet.Parameters[0].RefKind == RefKind.Out && Tests(union, value, space):
                 var gotType = tryGet.Parameters[0].Type;
-                return OfType(Symbols.UnderlyingOfNullable(gotType) ?? gotType.WithNullableAnnotation(NullableAnnotation.NotAnnotated), space, compilation, types);
+                return OfType(Symbols.UnderlyingOfNullable(gotType) ?? gotType.WithNullableAnnotation(NullableAnnotation.NotAnnotated), space, compilation);
 
             // `x > Size.Small`, on an enum.
             case IBinaryOperation { OperatorKind: BinaryOperatorKind.LessThan or BinaryOperatorKind.LessThanOrEqual or BinaryOperatorKind.GreaterThan or BinaryOperatorKind.GreaterThanOrEqual, OperatorMethod: null, IsLifted: false } comparison when space.Kind == SpaceKind.Enum:
@@ -269,34 +534,35 @@ internal static class Facts
                 return OfOperand(setTo);
 
             // `x is A` (may bind as an is-type operator rather than a pattern), or `owner?.Pet is A` for owner.Pet
-            case IIsTypeOperation isType when Tests(isType.ValueOperand, value, space) || value.Equals(TrackedValue.FromNullConditional(isType.ValueOperand, value.Session)):
-                var outcome = OfType(isType.TypeOperand, space, compilation, types);
+            case IIsTypeOperation isType when (Tests(isType.ValueOperand, value, space) || value.Equals(TrackedValue.FromNullConditional(isType.ValueOperand, value.Session)))
+                && !(space.IsUnion && isType.ValueOperand.Type is ITypeParameterSymbol):
+                var outcome = OfType(isType.TypeOperand, space, compilation);
                 return isType.IsNegated ? outcome.Not() : outcome;
 
             // `x is A a`, `x is not (A or B)`, `x is null`, ...
             case IIsPatternOperation isPattern when Tests(isPattern.Value, value, space):
-                return Of(isPattern.Pattern, space, compilation, types);
+                return Of(isPattern.Pattern, space, compilation);
 
             // `x as Circle is null`, `(x as Circle) is { } c`: whether x is a Circle.
             case IIsPatternOperation isPattern when TryCastOf(isPattern.Value, value, space, flag) is { } castTo && IsNullTest(isPattern.Pattern) is bool isNull:
-                var isCast = OfType(castTo, space, compilation, types);
+                var isCast = OfType(castTo, space, compilation);
                 return isNull ? isCast.Not() : isCast;
 
             // `owner is { Pet: Bird }`, `owner is (Bird, _)`: what the pattern says about a member of what it tests.
-            case IIsPatternOperation isPattern when OfPatternOn(isPattern.Value, isPattern.Pattern, value, space, compilation, types) is { } onMember:
+            case IIsPatternOperation isPattern when OfPatternOn(isPattern.Value, isPattern.Pattern, value, space, compilation) is { } onMember:
                 return onMember;
 
             // `(x, y) is (A, _)`: what the tuple pattern says about the element that's the value.
             case IIsPatternOperation { Value: ITupleOperation tuple } isPattern
                 when tuple.Elements.Select((element, i) => (element, i)).FirstOrDefault(e => value.IsReadBy(e.element)) is (not null, var index):
-                return OfTuplePattern(isPattern.Pattern, index, tuple.Elements.Length, space, compilation, types);
+                return OfTuplePattern(isPattern.Pattern, index, tuple.Elements.Length, space, compilation);
 
             case IUnaryOperation { OperatorKind: UnaryOperatorKind.Not, OperatorMethod: null } not:
                 return OfOperand(not.Operand).Not();
 
             // `x switch { Bird => true, _ => false }`, or the same over what x is a member of.
-            case ISwitchExpressionOperation booleanSwitch when OfPatternOn(booleanSwitch.Value, booleanSwitch.Arms[0].Pattern, value, space, compilation, types) is not null:
-                return OfBooleanSwitch(booleanSwitch, space, pattern => OfPatternOn(booleanSwitch.Value, pattern, value, space, compilation, types)!);
+            case ISwitchExpressionOperation booleanSwitch when OfPatternOn(booleanSwitch.Value, booleanSwitch.Arms[0].Pattern, value, space, compilation) is not null:
+                return OfBooleanSwitch(booleanSwitch, space, pattern => OfPatternOn(booleanSwitch.Value, pattern, value, space, compilation)!);
 
             // `a || b`, and `a | b` on bools, which evaluates both but is true in the same cases.
             case IBinaryOperation { OperatorKind: BinaryOperatorKind.ConditionalOr or BinaryOperatorKind.Or, OperatorMethod: null } either when IsLogical(either):
@@ -325,7 +591,7 @@ internal static class Facts
                 return quantifier.Name == "All" ? new Outcome(CaseSet.Empty, predicate.AlwaysFalse) : new Outcome(predicate.AlwaysTrue, CaseSet.Empty);
 
             // `pet.IsBird()`, `Flies(pet)`, `pet.IsBird` (in the union, or an extension): what the helper's body says.
-            case IInvocationOperation or IPropertyReferenceOperation when depth < Limits.HelperDepth && OfHelper(condition, value, space, compilation, depth, types) is { } helper:
+            case IInvocationOperation or IPropertyReferenceOperation when depth < Limits.HelperDepth && OfHelper(condition, value, space, compilation, depth) is { } helper:
                 return helper;
 
             // `u.HasValue` on a custom union whose HasValue can't be read: the compiler matches `u is null` by calling
@@ -369,16 +635,7 @@ internal static class Facts
         }
 
         bool? Holds(object candidate) =>
-            candidate is decimal value
-                ? kind switch
-                {
-                    BinaryOperatorKind.LessThan => value < bound,
-                    BinaryOperatorKind.LessThanOrEqual => value <= bound,
-                    BinaryOperatorKind.GreaterThan => value > bound,
-                    BinaryOperatorKind.GreaterThanOrEqual => value >= bound,
-                    _ => null,
-                }
-                : null;
+            candidate is decimal value ? Compares(kind, value, bound) : null;
 
         if (space.IsUnion)
         {
@@ -459,47 +716,52 @@ internal static class Facts
     }
 
     /// <summary>
+    /// What a helper's body says about the value where it returns true, read as though written in place of the call, with the value as <paramref name="inBody"/>:
+    /// the expression it returns, or for a block, what every way out returns, given what's ruled out there (see <see cref="Exits"/>).
+    /// </summary>
+    private static Outcome? OfBody(SyntaxNode body, TrackedValue inBody, CaseSpace space, SemanticModel model, int depth)
+    {
+        if (body is ExpressionSyntax expression)
+        {
+            return model.GetOperation(expression) is { Type.SpecialType: SpecialType.System_Boolean } operation ? Of(operation, inBody, space, model.Compilation, flag: null, depth) : null;
+        }
+
+        if (Exits((BlockSyntax)body, inBody, space, model, depth) is not { Count: > 0 } exits)
+        {
+            return null;
+        }
+
+        var (alwaysTrue, alwaysFalse) = (space.All, space.All);
+        foreach (var (excluded, returned) in exits)
+        {
+            if (returned is null || model.GetOperation(returned) is not { Type.SpecialType: SpecialType.System_Boolean } operation)
+            {
+                return null;
+            }
+
+            var outcome = Of(operation, inBody, space, model.Compilation, flag: null, depth);
+
+            alwaysTrue &= excluded | outcome.AlwaysTrue;
+            alwaysFalse &= excluded | outcome.AlwaysFalse;
+        }
+
+        return new Outcome(alwaysTrue, alwaysFalse);
+    }
+
+    /// <summary>
     /// For a call to a helper that tests its argument (<c>static bool IsBird(Pet p) =&gt; p is Bird;</c>, an extension, or a union's own <c>bool IsBird =&gt; this is Bird;</c>):
     /// what its body says about the value, read as though it were written in place of the call, with the value passed for the parameter (or <c>this</c>).
     /// </summary>
-    /// <remarks>Only for a helper declared in this compilation whose body is a single bool expression, and that can't be overridden or dispatched elsewhere.</remarks>
-    private static Outcome? OfHelper(IOperation call, TrackedValue value, CaseSpace space, Compilation compilation, int depth, TypeMap? types)
+    private static Outcome? OfHelper(IOperation call, TrackedValue value, CaseSpace space, Compilation compilation, int depth) =>
+        InPlace(call, value, space, compilation) is var (body, inBody, bodySpace, model) ? OfBody(body, inBody, bodySpace, model, depth + 1) : null;
+
+    /// <summary>
+    /// For a call to a helper the value is passed to (as an argument, an extension's receiver, or <c>this</c>), or a member of it:
+    /// the helper's body (see <see cref="HelperBody"/>), the value as it's reached there, the space to read the body in (with the call's type arguments), and the body's semantic model.
+    /// </summary>
+    /// <remarks>Only for a helper declared in this compilation, that can't be overridden or dispatched elsewhere, isn't async, and doesn't write the parameter it gets the value as.</remarks>
+    private static (SyntaxNode Body, TrackedValue InBody, CaseSpace Space, SemanticModel Model)? InPlace(IOperation call, TrackedValue value, CaseSpace space, Compilation compilation)
     {
-        // For a generic helper, what its type parameters stand for at this call (`T` is Bird in `pet.Is<Bird>()`), in
-        // terms of what the caller's own stand for.
-        static TypeMap? TypeArguments(ISymbol member, TypeMap? outer)
-        {
-            var map = new Dictionary<ITypeSymbol, ITypeSymbol>(SymbolEqualityComparer.Default);
-            void Add(ImmutableArray<ITypeParameterSymbol> parameters, ImmutableArray<ITypeSymbol> arguments)
-            {
-                for (var i = 0; i < parameters.Length && i < arguments.Length; i++)
-                {
-                    var argument = arguments[i];
-                    if (outer is not null && argument is ITypeParameterSymbol && outer.TryGetValue(argument.OriginalDefinition, out var known))
-                    {
-                        argument = known;
-                    }
-
-                    if (!SymbolEqualityComparer.Default.Equals(parameters[i], argument))
-                    {
-                        map[parameters[i].OriginalDefinition] = argument;
-                    }
-                }
-            }
-
-            if (member is IMethodSymbol { IsGenericMethod: true } method)
-            {
-                Add(method.OriginalDefinition.TypeParameters, method.TypeArguments);
-            }
-
-            if (member.ContainingType is { IsGenericType: true } type)
-            {
-                Add(type.OriginalDefinition.TypeParameters, type.TypeArguments);
-            }
-
-            return map.Count > 0 ? map : null;
-        }
-
         // What the receiver stands for in the body: `this` (as its type), or an extension's parameter.
         static ISymbol? Receiver(ISymbol member) => member switch
         {
@@ -548,24 +810,29 @@ internal static class Facts
                 continue;
             }
 
-            var inBody = parameter is ITypeSymbol self ? TrackedValue.ThisOf(self, value.Session) : TrackedValue.OfVariable(parameter.OriginalDefinition, value.Session);
+            var inBody = parameter is ITypeSymbol self ? TrackedValue.ThisOf(self.OriginalDefinition, value.Session) : TrackedValue.OfVariable(parameter.OriginalDefinition, value.Session);
             var model = compilation.GetSemanticModel(body.SyntaxTree);
 
-            if (model.GetOperation(body) is not { Type.SpecialType: SpecialType.System_Boolean } operation)
-            {
-                return null;
-            }
-
-            var inner = value.Rebased(passed, inBody);
-            if (parameter is IParameterSymbol && WriteAnalysis.Writes(body, inBody, model))
-            {
-                return null;
-            }
-
-            return Of(operation, inner, space, compilation, flag: null, depth + 1, TypeArguments(member, types));
+            return parameter is IParameterSymbol && WriteAnalysis.Writes(body, inBody, model)
+                ? null
+                : (body, value.Rebased(passed, inBody), space.Reading(member, compilation), model);
         }
 
         return null;
+    }
+
+    /// <summary>
+    /// The cases of the value for which a call to a helper it's passed to never returns:
+    /// those ruled out at every way out of the helper's block (<c>static void Settled(Data d) { if (d is Loading) throw ...; }</c>, an assertion).
+    /// </summary>
+    public static CaseSet ThrowsWhenCalled(IInvocationOperation call, TrackedValue value, CaseSpace space, Compilation compilation)
+    {
+        if (InPlace(call, value, space, compilation) is not (BlockSyntax block, var inBody, var bodySpace, var model) || Exits(block, inBody, bodySpace, model, depth: 1) is not { } exits)
+        {
+            return CaseSet.Empty;
+        }
+
+        return exits.Aggregate(space.All, (throwing, exit) => throwing & exit.Excluded);
     }
 
     /// <summary>
@@ -573,20 +840,23 @@ internal static class Facts
     /// </summary>
     /// <remarks>A <see cref="CaseStep"/> in the path is a step into what a union holds, as that case:
     /// it's there only when the union holds that case.</remarks>
-    private static Outcome OfMemberPattern(IPatternOperation pattern, IReadOnlyList<Step> path, CaseSpace space, Compilation compilation, TypeMap? types)
+    private static Outcome OfMemberPattern(IPatternOperation pattern, IReadOnlyList<Step> path, CaseSpace space, Compilation compilation)
     {
         if (path.Count == 0)
         {
-            return Of(pattern, space, compilation, types);
+            return Of(pattern, space, compilation);
         }
 
         var csharp = (CSharpCompilation)compilation;
-        var step = (path[0] as CaseStep)?.Type;
+        ITypeSymbol Read(ITypeSymbol type) =>
+            space.Interpret(type, compilation);
+
+        var step = path[0] is CaseStep { Type: var stepType } ? Read(stepType) : null;
 
         // The pattern's input is already what the step goes into (`Bird` in `Pet and Bird`).
-        if (step is not null && SymbolEqualityComparer.Default.Equals(Symbols.UnderlyingOfNullable(pattern.InputType) ?? pattern.InputType, step))
+        if (step is not null && SymbolEqualityComparer.Default.Equals(Read(Symbols.UnderlyingOfNullable(pattern.InputType) ?? pattern.InputType), step))
         {
-            return OfMemberPattern(pattern, [.. path.Skip(1)], space, compilation, types);
+            return OfMemberPattern(pattern, [.. path.Skip(1)], space, compilation);
         }
 
         var everything = new Outcome(space.All, CaseSet.Empty);
@@ -601,19 +871,19 @@ internal static class Facts
             // the path steps into a case, the member is there only when the union holds that case, so a test for it
             // is true, and one for a case it can't be is false.
             case ITypePatternOperation or IDeclarationPatternOperation when step is not null:
-                return AlwaysInstanceOf(step, pattern.NarrowedType, csharp) ? everything
-                    : !CanBeInstanceOf(step, pattern.NarrowedType, csharp) ? nothing
+                return AlwaysInstanceOf(step, Read(pattern.NarrowedType), csharp) ? everything
+                    : !CanBeInstanceOf(step, Read(pattern.NarrowedType), csharp) ? nothing
                     : Outcome.Unknown;
             case ITypePatternOperation or IDeclarationPatternOperation:
-                return AlwaysInstanceOf(pattern.InputType, pattern.NarrowedType, csharp) ? everything : Outcome.Unknown;
+                return AlwaysInstanceOf(Read(pattern.InputType), Read(pattern.NarrowedType), csharp) ? everything : Outcome.Unknown;
 
             case IRecursivePatternOperation stepping when step is not null:
-                if (!CanBeInstanceOf(step, stepping.MatchedType, csharp))
+                if (!CanBeInstanceOf(step, Read(stepping.MatchedType), csharp))
                 {
                     return nothing;
                 }
 
-                if (!AlwaysInstanceOf(step, stepping.MatchedType, csharp))
+                if (!AlwaysInstanceOf(step, Read(stepping.MatchedType), csharp))
                 {
                     return Outcome.Unknown;
                 }
@@ -626,16 +896,16 @@ internal static class Facts
                     : OfSubpatterns(stepping, rest, typeHolds: true);
 
             case IRecursivePatternOperation recursive:
-                return OfSubpatterns(recursive, path, typeHolds: AlwaysInstanceOf(recursive.InputType, recursive.MatchedType, csharp));
+                return OfSubpatterns(recursive, path, typeHolds: AlwaysInstanceOf(Read(recursive.InputType), Read(recursive.MatchedType), csharp));
 
             case INegatedPatternOperation not:
-                return OfMemberPattern(not.Pattern, path, space, compilation, types).Not();
+                return OfMemberPattern(not.Pattern, path, space, compilation).Not();
 
             case IBinaryPatternOperation { OperatorKind: BinaryOperatorKind.Or } or:
-                return Outcome.Or(OfMemberPattern(or.LeftPattern, path, space, compilation, types), OfMemberPattern(or.RightPattern, path, space, compilation, types));
+                return Outcome.Or(OfMemberPattern(or.LeftPattern, path, space, compilation), OfMemberPattern(or.RightPattern, path, space, compilation));
 
             case IBinaryPatternOperation { OperatorKind: BinaryOperatorKind.And } and:
-                return Outcome.And(OfMemberPattern(and.LeftPattern, path, space, compilation, types), OfMemberPattern(and.RightPattern, path, space, compilation, types));
+                return Outcome.And(OfMemberPattern(and.LeftPattern, path, space, compilation), OfMemberPattern(and.RightPattern, path, space, compilation));
 
             default:
                 return Outcome.Unknown;
@@ -662,7 +932,7 @@ internal static class Facts
                 return Outcome.Unknown;
             }
 
-            var outcome = OfMemberPattern(on.Pattern, [.. steps.Skip(on.Steps.Count)], space, compilation, types);
+            var outcome = OfMemberPattern(on.Pattern, [.. steps.Skip(on.Steps.Count)], space, compilation);
             var restMatches = typeHolds && parts.Where(part => part.Pattern != on.Pattern).All(part => MatchesAnything(part.Pattern));
             return restMatches ? outcome : new Outcome(CaseSet.Empty, outcome.AlwaysFalse);
         }
@@ -672,19 +942,16 @@ internal static class Facts
     /// What a pattern on a tuple says about its element at <paramref name="index"/>:
     /// false wherever the element's subpattern is, and true wherever it is, if the other subpatterns match anything.
     /// </summary>
-    private static Outcome OfTuplePattern(IPatternOperation pattern, int index, int length, CaseSpace space, Compilation compilation, TypeMap? types) =>
-        OfTuplePattern(pattern, index, length, space, element => Of(element, space, compilation, types));
+    private static Outcome OfTuplePattern(IPatternOperation pattern, int index, int length, CaseSpace space, Compilation compilation) =>
+        OfTuplePattern(pattern, index, length, space, element => Of(element, space, compilation));
 
     /// <summary>
     /// A type test, which on a union tests the union's <c>Value</c>:
     /// true for every case type whose every non-null value is a <paramref name="type"/>, false for null and for every case type none of whose values can be one.
     /// </summary>
-    private static Outcome OfType(ITypeSymbol type, CaseSpace space, Compilation compilation, TypeMap? types = null)
+    private static Outcome OfType(ITypeSymbol type, CaseSpace space, Compilation compilation)
     {
-        if (types is not null && type is ITypeParameterSymbol && types.TryGetValue(type.OriginalDefinition, out var argument))
-        {
-            type = argument;
-        }
+        type = space.Interpret(type, compilation);
 
         // What a test against a union type means (the union itself, or its Value?) isn't something to guess at, unless
         // the union is one of this union's case types: then it's a test of the Value, like any other case.
@@ -755,10 +1022,10 @@ internal static class Facts
     /// <summary>
     /// Whether every subpattern of a recursive pattern matches whatever it's given, like <c>Cat { Name: _ }</c> or <c>Dog(var name)</c>.
     /// </summary>
-    /// <remarks>Only for a property named directly (<c>{ A.B: _ }</c> also requires <c>A</c> not to be null), and for positional patterns that call a Deconstruct method or take a tuple apart (on an <c>ITuple</c>, they check its Length too).</remarks>
+    /// <remarks>Only for a property named directly (<c>{ A.B: _ }</c> also requires <c>A</c> not to be null), and for positional patterns that call a Deconstruct method or take a tuple apart (on an <c>ITuple</c>, even <c>()</c> checks its Length).</remarks>
     private static bool SubpatternsAlwaysMatch(IRecursivePatternOperation recursive)
     {
-        if (!recursive.DeconstructionSubpatterns.IsEmpty && !(recursive.DeconstructSymbol is IMethodSymbol || recursive.MatchedType.IsTupleType))
+        if (recursive.Syntax is RecursivePatternSyntax { PositionalPatternClause: not null } && !(recursive.DeconstructSymbol is IMethodSymbol || recursive.MatchedType.IsTupleType))
         {
             return false;
         }
@@ -920,12 +1187,12 @@ internal static class Facts
     /// <summary>
     /// What a pattern matched against a value in <paramref name="space"/> says about its case.
     /// </summary>
-    /// <param name="types">For a helper's body read in place of a call to it, the call's type arguments for the helper's type parameters (<c>pet.Is&lt;Bird&gt;()</c>).</param>
-    public static Outcome Of(IPatternOperation pattern, CaseSpace space, Compilation compilation, TypeMap? types = null)
+    public static Outcome Of(IPatternOperation pattern, CaseSpace space, Compilation compilation)
     {
         // A pattern on another union, the one a case holds (`Bird` in `Pet and Bird` on a union of Pets and Rocks),
-        // says nothing about this one's cases.
-        if (space.UnionType is { } unionType && AppliesToAnotherUnion(pattern.InputType, unionType))
+        // says nothing about this one's cases. Nor does one on a type parameter: generic code tests a union it's given
+        // boxed, which is never one of its cases.
+        if (space.IsUnion && (pattern.InputType is ITypeParameterSymbol || AppliesToAnotherUnion(pattern.InputType, space, compilation)))
         {
             return Outcome.Unknown;
         }
@@ -938,10 +1205,10 @@ internal static class Facts
                 return new Outcome(space.All, CaseSet.Empty);
 
             case ITypePatternOperation typePattern:
-                return OfType(typePattern.MatchedType, space, compilation, types);
+                return OfType(typePattern.MatchedType, space, compilation);
 
             case IDeclarationPatternOperation { MatchedType: { } matchedType }:
-                return OfType(matchedType, space, compilation, types);
+                return OfType(matchedType, space, compilation);
 
             // `{ Value: P }` on a union is P (patterns on a union test its Value anyway), and on a `Pet?` (or a class
             // union), P on the union, which only matches if there is one.
@@ -950,16 +1217,32 @@ internal static class Facts
                     && recursive.Syntax is RecursivePatternSyntax { Type: null }
                     && recursive.PropertySubpatterns[0] is { Member: IPropertyReferenceOperation { Property.Name: "Value" } member } valuePattern
                     && (member.Property.ContainingType.IsUnion || member.Property.ContainingType.OriginalDefinition.SpecialType == SpecialType.System_Nullable_T):
-                var ofValue = Of(valuePattern.Pattern, space, compilation, types);
-                return member.Property.ContainingType is { IsUnion: true, IsValueType: true }
+                var ofValue = Of(valuePattern.Pattern, space, compilation);
+                return recursive.InputType is { IsUnion: true, IsValueType: true }
                     ? ofValue
                     : new Outcome(CaseSet.Of(ofValue.AlwaysTrue.Cases), ofValue.AlwaysFalse); // `{ }` also checks there's a union
 
             // `T { ... }` and `T(...)`: false wherever the type test is false; true wherever it's true, if every
-            // subpattern matches anything.
+            // subpattern matches anything. A subpattern on a discriminant (`{ Kind: ShapeKind.Circle }`) says what it
+            // says about the cases.
             case IRecursivePatternOperation recursive:
-                var typeTest = OfType(recursive.MatchedType, space, compilation, types);
-                return SubpatternsAlwaysMatch(recursive) ? typeTest : new Outcome(CaseSet.Empty, typeTest.AlwaysFalse);
+                var typeTest = OfType(recursive.MatchedType, space, compilation);
+                if (SubpatternsAlwaysMatch(recursive))
+                {
+                    return typeTest;
+                }
+
+                var onDiscriminants = recursive.PropertySubpatterns
+                    .Select(subpattern => subpattern is { Member: IPropertyReferenceOperation { Property: var property, Instance: IInstanceReferenceOperation } }
+                        ? OfDiscriminant(property, constant => PatternHolds(subpattern.Pattern, constant), space, compilation)
+                        : null
+                    )
+                    .ToList();
+                var together = onDiscriminants.Aggregate(typeTest, (outcome, discriminant) => Outcome.And(outcome, discriminant ?? Outcome.Unknown));
+                
+                return recursive.Syntax is RecursivePatternSyntax { PositionalPatternClause: null } && onDiscriminants.All(discriminant => discriminant is not null)
+                    ? together
+                    : new Outcome(CaseSet.Empty, together.AlwaysFalse);
 
             case IConstantPatternOperation { Value.ConstantValue: { HasValue: true, Value: var constant } } constantPattern:
                 return OfConstant(constant, space, constantType: ConstantType(constantPattern.Value), compilation: compilation);
@@ -968,18 +1251,32 @@ internal static class Facts
                 return OfComparison(relational.OperatorKind, relational.Value.ConstantValue is { HasValue: true } c ? c.Value : null, space, ConstantType(relational.Value), compilation);
 
             case INegatedPatternOperation not:
-                return Of(not.Pattern, space, compilation, types).Not();
+                return Of(not.Pattern, space, compilation).Not();
 
             case IBinaryPatternOperation { OperatorKind: BinaryOperatorKind.Or } or:
-                return Outcome.Or(Of(or.LeftPattern, space, compilation, types), Of(or.RightPattern, space, compilation, types));
+                return Outcome.Or(Of(or.LeftPattern, space, compilation), Of(or.RightPattern, space, compilation));
 
             case IBinaryPatternOperation { OperatorKind: BinaryOperatorKind.And } and:
-                return Outcome.And(Of(and.LeftPattern, space, compilation, types), Of(and.RightPattern, space, compilation, types));
+                return Outcome.And(Of(and.LeftPattern, space, compilation), Of(and.RightPattern, space, compilation));
 
             default:
                 return Outcome.Unknown;
         }
     }
+
+    /// <summary>
+    /// What a constant case label on a switch over a discriminant of the value (<c>switch (shape.Kind)</c>) says about it, or null if that's not what the switch is over.
+    /// </summary>
+    public static Outcome? OfConstantOnDiscriminant(IOperation input, ISingleValueCaseClauseOperation clause, TrackedValue value, CaseSpace space, Compilation compilation) =>
+        clause.Value.ConstantValue is { HasValue: true } constant
+            ? OfDiscriminant(input, candidate => Equals(CaseSpace.ConstantKey(candidate), CaseSpace.ConstantKey(constant.Value)), value, space, compilation)
+            : null;
+
+    /// <summary>
+    /// Whether the operation reads a discriminant of the value (see <see cref="OfDiscriminant(IPropertySymbol, Func{object?, bool?}, CaseSpace, Compilation)"/>), whose tests say something about it.
+    /// </summary>
+    public static bool ReadsDiscriminant(IOperation operation, TrackedValue value, CaseSpace space, Compilation compilation) =>
+        OfDiscriminant(operation, _ => null, value, space, compilation) is not null;
 
     /// <summary>
     /// What a switch statement's case label says about the case of the value switched on.
@@ -996,7 +1293,7 @@ internal static class Facts
     /// </summary>
     /// <param name="flag">For a local in the condition, the value it was set to, where testing the local still means testing that (see Narrowing), or null.</param>
     public static Outcome Of(IOperation condition, TrackedValue value, CaseSpace space, Compilation compilation, Func<ILocalSymbol, IOperation?>? flag = null) =>
-        Of(condition, value, space, compilation, flag, depth: 0, types: null);
+        Of(condition, value, space, compilation, flag, depth: 0);
 
     /// <summary>
     /// What a <c>when</c> clause says about the value:
@@ -1056,6 +1353,7 @@ internal static class Facts
     /// </summary>
     public static Outcome? OfMethodBody(IMethodSymbol method, int ordinal, IReadOnlyList<Step> steps, CaseSpace space, Compilation compilation, Session session)
     {
+        space = space.Reading(method, compilation);
         method = method.ReducedFrom ?? method.OriginalDefinition;
 
         if (ordinal >= method.Parameters.Length
@@ -1069,12 +1367,7 @@ internal static class Facts
         var model = compilation.GetSemanticModel(body.SyntaxTree);
         var parameter = TrackedValue.Path(method.Parameters[ordinal], steps, session);
 
-        if (model.GetOperation(body) is not { Type.SpecialType: SpecialType.System_Boolean } operation || WriteAnalysis.Writes(body, parameter, model))
-        {
-            return null;
-        }
-
-        return Of(operation, parameter, space, compilation, flag: null, depth: 1, types: null);
+        return WriteAnalysis.Writes(body, parameter, model) ? null : OfBody(body, parameter, space, model, depth: 1);
     }
 
     /// <summary>
@@ -1087,11 +1380,16 @@ internal static class Facts
     /// <c>owner is { Pet: Bird }</c> is false for a null owner, but then owner.Pet isn't read either.
     /// A subpattern is followed through a named property or field (<c>{ Pet: ... }</c>, <c>{ Owner.Pet: ... }</c>), a tuple element, or a record's generated Deconstruct (<c>(Bird, _)</c>).
     /// </remarks>
-    public static Outcome? OfPatternOn(IOperation input, IPatternOperation pattern, TrackedValue value, CaseSpace space, Compilation compilation, TypeMap? types = null)
+    public static Outcome? OfPatternOn(IOperation input, IPatternOperation pattern, TrackedValue value, CaseSpace space, Compilation compilation)
     {
         if (Tests(input, value, space))
         {
-            return Of(pattern, space, compilation, types);
+            return Of(pattern, space, compilation);
+        }
+
+        if (OfDiscriminant(input, constant => PatternHolds(pattern, constant), value, space, compilation) is { } discriminant)
+        {
+            return discriminant;
         }
 
         // A `?.` chain says the same about what it reads, wherever that's read (see FromNullConditional).
@@ -1100,7 +1398,7 @@ internal static class Facts
             return null;
         }
 
-        return OfMemberPattern(pattern, [.. value.Steps.Skip(owner.Steps.Length)], space, compilation, types);
+        return OfMemberPattern(pattern, [.. value.Steps.Skip(owner.Steps.Length)], space, compilation);
     }
 
     /// <summary>

@@ -165,6 +165,75 @@ public class UnionShapeTests
             """
         );
 
+
+    [Fact]
+    public Task Custom_unions_whose_storage_can_change() =>
+        Verify.Suppressions("""
+            [System.Runtime.CompilerServices.Union]
+            sealed class Slot : System.Runtime.CompilerServices.IUnion
+            {
+                private readonly object?[] _slot;
+                public Slot(Cat cat) => _slot = [cat];
+                public Slot(Dog dog) => _slot = [dog];
+                public object? Value => _slot[0];
+                public void Swap(Dog dog) => _slot[0] = dog;
+            }
+
+            [System.Runtime.CompilerServices.Union]
+            readonly struct Boxed : System.Runtime.CompilerServices.IUnion
+            {
+                private readonly System.Runtime.CompilerServices.StrongBox<object?> _box;
+                public Boxed(Cat cat) => _box = new(cat);
+                public Boxed(Dog dog) => _box = new(dog);
+                public object? Value => _box.Value;
+                public void Swap(Dog dog) => _box.Value = dog;
+            }
+
+            class C
+            {
+                int Class(Slot slot)
+                {
+                    if (slot is Dog) return 0;
+                    slot.Swap(new Dog("Rex"));
+                    return slot /*warns*/switch { Cat => 1 };
+                }
+
+                int Struct(Boxed boxed)
+                {
+                    if (boxed is Dog) return 0;
+                    var copy = boxed;
+                    boxed.Swap(new Dog("Rex"));
+                    return copy /*warns*/switch { Cat => 1 };
+                }
+            }
+            """
+        );
+
+
+    [Fact]
+    public Task Custom_union_whose_value_is_static() =>
+        Verify.Suppressions("""
+            [System.Runtime.CompilerServices.Union]
+            readonly struct Shared : System.Runtime.CompilerServices.IUnion
+            {
+                private static object? s_value;
+                public Shared(Cat cat) => s_value = cat;
+                public Shared(Dog dog) => s_value = dog;
+                public object? Value => s_value;
+            }
+
+            class C
+            {
+                int M(Shared shared)
+                {
+                    if (shared is Dog) return 0;
+                    var other = new Shared(new Dog("Rex"));
+                    return shared /*warns*/switch { Cat => 1 };
+                }
+            }
+            """
+        );
+
     [Fact]
     public Task Closed_case_types_are_their_leaf_types() =>
         Verify.Suppressions("""

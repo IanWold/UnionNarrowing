@@ -3,6 +3,8 @@ using System.Collections.Immutable;
 using System.Linq;
 using System.Threading;
 using Microsoft.CodeAnalysis;
+using Microsoft.CodeAnalysis.CSharp;
+using Microsoft.CodeAnalysis.CSharp.Syntax;
 using Microsoft.CodeAnalysis.Diagnostics;
 using Microsoft.CodeAnalysis.Operations;
 using UnionNarrowing.Suppressors.Analysis;
@@ -162,6 +164,37 @@ public sealed class DeadArmAnalyzer : DiagnosticAnalyzer
     }
 
     /// <summary>
+    /// How to name what a pattern that can't match would have matched, in a message:
+    /// the pattern as written, without comments, or for one that matches anything, every case that's left.
+    /// </summary>
+    private static string RuledOut(IPatternOperation pattern) =>
+        Facts.MatchesAnything(pattern)
+            ? "every case that's left"
+            : pattern.Syntax.ReplaceTrivia(pattern.Syntax.DescendantTrivia().Where(t => t.IsKind(SyntaxKind.SingleLineCommentTrivia) || t.IsKind(SyntaxKind.MultiLineCommentTrivia)), (_, _) => default).NormalizeWhitespace().ToString();
+
+    /// <summary>
+    /// Whether the arm is a last resort that throws (<c>_ =&gt; throw ...</c>), which UN0016 reports instead when the switch handles everything else.
+    /// </summary>
+    private static bool IsThrowingCatchAll(SyntaxNode syntax, IPatternOperation pattern) =>
+        Facts.MatchesAnything(pattern) && syntax is SwitchExpressionArmSyntax { Expression: var value } && pattern.SemanticModel?.GetOperation(value) is { } operation && Facts.IsThrow(operation);
+
+    /// <summary>
+    /// Whether the operation is in an argument of a call that may be compiled out (<c>Debug.Assert(x is not Bird)</c>): an assertion is meant to be one that can't fail.
+    /// </summary>
+    private static bool IsAsserted(IOperation operation)
+    {
+        for (var outer = operation.Parent; outer is not null; outer = outer.Parent)
+        {
+            if (outer is IInvocationOperation call && Symbols.HasAttribute(call.TargetMethod, "ConditionalAttribute", "System", "Diagnostics"))
+            {
+                return true;
+            }
+        }
+
+        return false;
+    }
+
+    /// <summary>
     /// Reports the arms (or case labels) that can't match.
     /// A <c>default:</c> label is tried last and matches anything, so it's never dead, and constant labels aren't reported:
     /// a <c>goto case</c> might go to one.
@@ -186,9 +219,9 @@ public sealed class DeadArmAnalyzer : DiagnosticAnalyzer
 
         foreach (var label in dead.Select(index => labels[index]))
         {
-            if (!reported.Contains(label.Syntax) && label.Pattern is { } pattern)
+            if (!reported.Contains(label.Syntax) && label.Pattern is { } pattern && !IsThrowingCatchAll(label.Syntax, pattern))
             {
-                context.ReportDiagnostic(Diagnostic.Create(Descriptors.DeadArm, label.Syntax.GetLocation(), what, pattern.Syntax.ToString()));
+                context.ReportDiagnostic(Diagnostic.Create(Descriptors.DeadArm, label.Syntax.GetLocation(), what, RuledOut(pattern)));
             }
         }
     }
@@ -213,15 +246,16 @@ public sealed class DeadArmAnalyzer : DiagnosticAnalyzer
         )
         {
             var reachable = combinations.All.Where(c => combinations.CouldMatch(tuplePattern, c)).ToList();
-            if (reachable.Count > 0 && reachable.All(combinations.RuledOut))
+            if (reachable.Count > 0 && reachable.All(combinations.RuledOut) && !IsAsserted(context.Operation))
             {
-                context.ReportDiagnostic(Diagnostic.Create(Descriptors.DeadArm, context.Operation.Syntax.GetLocation(), "test", tuplePattern.Syntax.ToString()));
+                context.ReportDiagnostic(Diagnostic.Create(Descriptors.DeadArm, context.Operation.Syntax.GetLocation(), "test", RuledOut(tuplePattern)));
             }
 
             return;
         }
 
         if (operand is null
+            || IsAsserted(context.Operation)
             || context.Operation.SemanticModel is not { } model
             || TrackedValue.From(operand, session) is not { } value
             || CaseSpace.Of(operand, model, context.CancellationToken) is not { } space
@@ -267,9 +301,9 @@ public sealed class DeadArmAnalyzer : DiagnosticAnalyzer
         foreach (var (syntax, pattern, guarded) in candidates)
         {
             var reachable = combinations.All.Where(c => combinations.CouldMatch(pattern, c) && !earlier.Any(e => combinations.AlwaysMatches(e, c))).ToList();
-            if (reachable.Count > 0 && reachable.All(combinations.RuledOut))
+            if (reachable.Count > 0 && reachable.All(combinations.RuledOut) && !IsThrowingCatchAll(syntax, pattern))
             {
-                context.ReportDiagnostic(Diagnostic.Create(Descriptors.DeadArm, syntax.GetLocation(), what, pattern.Syntax.ToString()));
+                context.ReportDiagnostic(Diagnostic.Create(Descriptors.DeadArm, syntax.GetLocation(), what, RuledOut(pattern)));
                 reported.Add(syntax);
             }
 
@@ -286,7 +320,8 @@ public sealed class DeadArmAnalyzer : DiagnosticAnalyzer
         context.EnableConcurrentExecution();
         context.RegisterCompilationStartAction(start =>
         {
-            var session = new Session(start.Options.AnalyzerConfigOptionsProvider);
+            // A test that callers happen to make dead today is still a sensible guard in the method itself.
+            var session = new Session(start.Options.AnalyzerConfigOptionsProvider, followsCallers: false);
             start.RegisterOperationAction(c => AnalyzeLabels(c, ((ISwitchExpressionOperation)c.Operation).Value, "arm", session), OperationKind.SwitchExpression);
             start.RegisterOperationAction(c => AnalyzeLabels(c, ((ISwitchOperation)c.Operation).Value, "case", session), OperationKind.Switch);
             start.RegisterOperationAction(c => AnalyzeTest(c, session), OperationKind.IsPattern, OperationKind.IsType);

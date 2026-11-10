@@ -107,6 +107,8 @@ internal class TrackedValue : IEquatable<TrackedValue>
     /// a getter that reads mutable state can change either way.</param>
     private static bool CantChange(IPropertySymbol property, Compilation? compilation, int depth, Session session)
     {
+        property = property.PartialImplementationPart ?? property;
+
         // An anonymous type's properties (`new { p, q = p }`, and query `let`) are get-only.
         if (property.ContainingType.IsAnonymousType)
         {

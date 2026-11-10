@@ -3,6 +3,8 @@ using System.Collections.Immutable;
 using System.Linq;
 using System.Threading;
 using Microsoft.CodeAnalysis;
+using Microsoft.CodeAnalysis.CSharp.Syntax;
+using Microsoft.CodeAnalysis.Operations;
 
 namespace UnionNarrowing.Suppressors.Analysis;
 
@@ -86,6 +88,12 @@ internal class CaseSpace
     public ITypeSymbol? Type { get; }
 
     /// <summary>
+    /// What the type parameters of the generic code being read stand for (see <see cref="Reading"/>):
+    /// a type written there is read through these before it's compared with the cases.
+    /// </summary>
+    public TypeArguments TypeArguments { get; }
+
+    /// <summary>
     /// For a union, the union type (for a nullable union, the one inside).
     /// </summary>
     public ITypeSymbol? UnionType { get; }
@@ -99,7 +107,12 @@ internal class CaseSpace
         Type = type;
         NullOnlyAsNoValue = nullOnlyAsNoValue;
         _origins = origins ?? ImmutableDictionary<object, ITypeSymbol>.Empty;
+        TypeArguments = TypeArguments.None;
     }
+
+    private CaseSpace(CaseSpace space, TypeArguments typeArguments)
+        : this(space.Kind, space.Cases, space.NullMatters, space.Type, space.NullOnlyAsNoValue, space.UnionType, space._origins) =>
+        TypeArguments = typeArguments;
 
     private static CaseSpace? Create(ITypeSymbol? type, NullableFlowState flowState, bool warnings, Reach reach, SemanticModel model, CancellationToken ct)
     {
@@ -249,6 +262,41 @@ internal class CaseSpace
     }
 
     /// <summary>
+    /// Whether what a union holds can only change with the union itself:
+    /// declared with <c>union</c>, or written by hand (<c>[Union]</c> on a class or struct) with its Value, and the HasValue and TryGetValue patterns may call instead, reading only its own fields and auto-properties, never what one of them refers to (an array element, a box's contents), which another reference could change.
+    /// One from another assembly is taken at its word.
+    /// </summary>
+    private static bool ReadsOnlyItsOwnState(ITypeSymbol union, Compilation compilation, CancellationToken ct)
+    {
+        static bool ReadsOtherState(IOperation operation) => operation switch
+        {
+            IFieldReferenceOperation { Field.IsConst: true } or IFieldReferenceOperation { Field.IsStatic: false, Instance: IInstanceReferenceOperation } => false,
+            IPropertyReferenceOperation { Instance: IInstanceReferenceOperation, Property: var property } => property.IsIndexer || !Symbols.IsAutoProperty(property),
+            IMemberReferenceOperation or IArrayElementReferenceOperation or IInvocationOperation => true,
+            IDynamicInvocationOperation or IDynamicMemberReferenceOperation or IDynamicIndexerAccessOperation => true,
+            _ => false,
+        };
+
+        if (union.DeclaringSyntaxReferences.IsEmpty || union.DeclaringSyntaxReferences.Any(r => r.GetSyntax(ct) is UnionDeclarationSyntax))
+        {
+            return true;
+        }
+
+        var readers = union.GetMembers()
+            .Where(member => member is { IsStatic: false } and (IPropertySymbol { Name: "Value" or "HasValue" } or IMethodSymbol { Name: "TryGetValue" }))
+            .Where(member => member is not IPropertySymbol property || !Symbols.IsAutoProperty(property))
+            .Select(member => member as IMethodSymbol ?? ((IPropertySymbol)member).GetMethod)
+            .OfType<IMethodSymbol>();
+
+        return readers.SelectMany(reader => reader.DeclaringSyntaxReferences).All(reference =>
+            reference.GetSyntax(ct) is var body
+            && compilation.SyntaxTrees.Contains(body.SyntaxTree)
+            && compilation.GetSemanticModel(body.SyntaxTree).GetOperation(body, ct) is { } operation
+            && !operation.DescendantsAndSelf().Any(ReadsOtherState)
+        );
+    }
+
+    /// <summary>
     /// Whether a warning is turned off for the whole tree, by NoWarn or .editorconfig (not #pragma).
     /// </summary>
     private static bool IsTurnedOff(string id, SemanticModel model, CancellationToken ct)
@@ -326,7 +374,7 @@ internal class CaseSpace
             _ => (null, false),
         };
 
-        if (union is not { UnionCaseTypes: { IsEmpty: false } caseTypes })
+        if (union is not { UnionCaseTypes: { IsEmpty: false } caseTypes } || !ReadsOnlyItsOwnState(union, model.Compilation, ct))
         {
             return null;
         }
@@ -371,6 +419,19 @@ internal class CaseSpace
     }
 
     /// <summary>
+    /// A type written in the code being read, as it is there: with what its type parameters stand for (see <see cref="TypeArguments"/>).
+    /// </summary>
+    public ITypeSymbol Interpret(ITypeSymbol type, Compilation compilation) =>
+        TypeArguments.Apply(type, compilation);
+
+    /// <summary>
+    /// This space, for reading the code of <paramref name="member"/> in place of a use of it (a helper's body for a call to it, a method's returns for what a call gives):
+    /// its type parameters, and those of the types it's in, stand for the use's type arguments.
+    /// </summary>
+    public CaseSpace Reading(ISymbol member, Compilation compilation) =>
+        TypeArguments.For(member, compilation) is var typeArguments && typeArguments != TypeArguments ? new CaseSpace(this, typeArguments) : this;
+
+    /// <summary>
     /// A constant as a case:
     /// integral values (an enum's, whatever its underlying type) compare by value.
     /// </summary>
@@ -407,7 +468,7 @@ internal class CaseSpace
     /// The case space of an element of a tuple-typed variable, going by the element's declared type (its annotation stands in for a flow state, erring towards null mattering).
     /// </summary>
     public static CaseSpace? OfElement(ITypeSymbol type, int position, SemanticModel model, CancellationToken ct) =>
-        Create(type, type.NullableAnnotation == NullableAnnotation.NotAnnotated && !type.IsValueType ? NullableFlowState.NotNull : NullableFlowState.MaybeNull, Warnings(position, model), Reach.Anything, model, ct);
+        Create(type, (type.IsValueType ? Symbols.UnderlyingOfNullable(type) is null : type.NullableAnnotation == NullableAnnotation.NotAnnotated) ? NullableFlowState.NotNull : NullableFlowState.MaybeNull, Warnings(position, model), Reach.Anything, model, ct);
 
     /// <summary>
     /// The case space of a switch's whole input:

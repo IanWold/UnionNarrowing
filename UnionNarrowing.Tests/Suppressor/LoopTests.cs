@@ -198,6 +198,62 @@ public class LoopTests
             """ + Next
         );
 
+
+    [Fact]
+    public Task Local_whose_every_write_rules_a_case_out() =>
+        Verify.Suppressions("""
+            class C
+            {
+                int StateMachine(int steps)
+                {
+                    Pet pet = new Cat("Tom");
+                    var total = 0;
+                    for (var i = 0; i < steps; i++)
+                    {
+                        total += pet /*suppressed*/switch { Cat => 1, Dog => 2 };
+                        pet = pet switch { Cat => new Dog("Rex"), _ => new Cat("Tom") };
+                    }
+
+                    return total;
+                }
+
+                int Fold(IEnumerable<Pet> pets)
+                {
+                    Pet last = new Cat("Tom");
+                    foreach (var pet in pets)
+                    {
+                        if (pet is Bird) continue;
+                        last = pet;
+                    }
+
+                    return last /*suppressed*/switch { Cat => 1, Dog => 2 };
+                }
+
+                int OneWriteCouldBeABird(int steps, Pet other)
+                {
+                    Pet pet = new Cat("Tom");
+                    for (var i = 0; i < steps; i++)
+                    {
+                        pet = i % 2 == 0 ? new Dog("Rex") : other;
+                    }
+
+                    return pet /*warns*/switch { Cat => 1, Dog => 2 };
+                }
+
+                int WrittenByAnOutArgument(int steps)
+                {
+                    Pet pet = new Cat("Tom");
+                    for (var i = 0; i < steps; i++)
+                    {
+                        Pets.Reset(out pet);
+                    }
+
+                    return pet /*warns*/switch { Cat => 1, Dog => 2 };
+                }
+            }
+            """ + Next
+        );
+
     [Fact]
     public Task Foreach_iteration_variables() =>
         Verify.Suppressions("""

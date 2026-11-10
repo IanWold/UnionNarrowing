@@ -239,4 +239,96 @@ public class DeadArmTests
             }
             """
         );
+
+    [Fact]
+    public Task Guards_that_only_callers_make_dead() =>
+        Diagnostics("""
+            internal class Kennel
+            {
+                public int Visit(Pet pet) => pet is Bird ? 0 : Count(pet);
+
+                // Only ever called with a cat or a dog, but the test is still a sensible guard here.
+                private static int Count(Pet pet)
+                {
+                    if (pet is Bird) return 0;
+                    return pet switch { Cat => 1, Dog => 2 };
+                }
+
+                public int Local(Pet pet)
+                {
+                    if (pet is Bird) return 0;
+                    return Count(pet);
+
+                    int Count(Pet p) => p switch { Cat => 1, Dog => 2, /*!UN0004*/Bird => 3 };
+                }
+            }
+            """
+        );
+
+    [Fact]
+    public Task Tests_in_assertions() =>
+        Diagnostics("""
+            using System.Diagnostics;
+
+            class C
+            {
+                int M(Pet pet)
+                {
+                    if (pet is Bird) return 0;
+                    Debug.Assert(pet is not Bird);
+                    return /*!UN0004*/pet is Bird ? 1 : 2;
+                }
+            }
+            """
+        );
+
+    [Fact]
+    public async Task Patterns_named_in_messages()
+    {
+        var diagnostics = await Diagnostics("""
+            class C
+            {
+                int Tuple(Pet a, Pet b)
+                {
+                    if (a is Bird) return 0;
+                    return (a, b) switch
+                    {
+                        (Cat, _) => 1,
+                        (Dog, _) => 2,
+                        /*!UN0004*/(/* never */ Bird, _) => 3,
+                        _ => 4,
+                    };
+                }
+
+                int CatchAll(Pet a, Pet b)
+                {
+                    if (a is not (Cat or Dog) || b is not (Cat or Dog)) return 0;
+                    return (a, b) switch
+                    {
+                        (Cat, _) => 1,
+                        (Dog, _) => 2,
+                        /*!UN0004*/_ => 3,
+                    };
+                }
+
+                // UN0016's to report, when it's turned on.
+                int ThrowingCatchAll(Pet a, Pet b)
+                {
+                    if (a is not (Cat or Dog) || b is not (Cat or Dog)) return 0;
+                    return (a, b) switch
+                    {
+                        (Cat, _) => 1,
+                        (Dog, _) => 2,
+                        _ => throw new InvalidOperationException(),
+                    };
+                }
+            }
+            """
+        );
+
+        Assert.Equal(
+            ["This arm can't match: earlier code already ruled out (Bird, _)", "This arm can't match: earlier code already ruled out every case that's left"],
+            diagnostics.Select(d => d.GetMessage())
+        );
+    }
 }

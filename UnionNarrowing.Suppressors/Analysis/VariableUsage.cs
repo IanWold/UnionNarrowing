@@ -24,14 +24,22 @@ internal class VariableUsage
     public bool NeverChanges { get; }
 
     /// <summary>
+    /// For a node in a lambda (or query) inside the function the variable belongs to, whether the variable keeps the value it has where the lambda is made:
+    /// see <see cref="MadeAfterEveryWrite"/>.
+    /// Then, as for one that <see cref="NeverChanges"/>, what holds there holds whenever the lambda runs.
+    /// </summary>
+    public bool SetForGoodWhereCaptured { get; }
+
+    /// <summary>
     /// The uses of the variable that write it (assignments, <c>out</c> arguments, mutating calls).
     /// </summary>
     public IReadOnlyList<IdentifierNameSyntax> Writes { get; }
 
-    private VariableUsage(SyntaxNode declaringFunction, bool neverChanges, IReadOnlyList<SyntaxNode> declarations, IReadOnlyList<IdentifierNameSyntax> writes)
+    private VariableUsage(SyntaxNode declaringFunction, bool neverChanges, IReadOnlyList<SyntaxNode> declarations, IReadOnlyList<IdentifierNameSyntax> writes, bool setForGoodWhereCaptured = false)
     {
         DeclaringFunction = declaringFunction;
         NeverChanges = neverChanges;
+        SetForGoodWhereCaptured = setForGoodWhereCaptured;
         Declarations = declarations;
         Writes = writes;
     }
@@ -91,6 +99,40 @@ internal class VariableUsage
             _ => false,
         };
 
+    /// <summary>
+    /// Whether every write to the variable is done by the time the lambda (or query) <paramref name="function"/> is made, for good:
+    /// each one comes before it, no loop around it holds one (and could run it again), the function the variable belongs to has no goto, and every function from this one out to that one is a lambda or query (a local function could be called before the writes).
+    /// </summary>
+    private static bool MadeAfterEveryWrite(SyntaxNode? function, SyntaxNode declaringFunction, IReadOnlyList<IdentifierNameSyntax> writes)
+    {
+        if (function is null || declaringFunction.DescendantNodes(n => n == declaringFunction || !Functions.IsFunction(n)).Any(n => n is GotoStatementSyntax))
+        {
+            return false;
+        }
+
+        for (var outer = function; outer != declaringFunction; outer = Functions.EnclosingFunction(outer))
+        {
+            if (outer is not (AnonymousFunctionExpressionSyntax or QueryExpressionSyntax))
+            {
+                return false;
+            }
+
+            if (Functions.EnclosingFunction(outer) == declaringFunction)
+            {
+                var loops = outer.Ancestors().TakeWhile(a => a != declaringFunction).Where(a => a is WhileStatementSyntax or DoStatementSyntax or ForStatementSyntax or CommonForEachStatementSyntax);
+                return writes.All(write => StoredBy(write).Span.End <= outer.SpanStart) && !loops.Any(loop => writes.Any(write => loop.Span.Contains(write.Span)));
+            }
+        }
+
+        return false;
+    }
+
+    /// <summary>
+    /// What a write has done by the time it ends: the statement it's in (an assignment stores only once its right side, which a lambda can be in, is worked out).
+    /// </summary>
+    private static SyntaxNode StoredBy(IdentifierNameSyntax write) =>
+        (SyntaxNode?)write.FirstAncestorOrSelf<StatementSyntax>() ?? (SyntaxNode?)write.FirstAncestorOrSelf<ArrowExpressionClauseSyntax>() ?? write;
+
     private static List<SyntaxNode> DeclarationsIn(SyntaxTree tree, ISymbol variable, CancellationToken ct) =>
         [.. variable.DeclaringSyntaxReferences.Where(r => r.SyntaxTree == tree).Select(r => r.GetSyntax(ct))];
 
@@ -138,7 +180,17 @@ internal class VariableUsage
             // directly (and runs right then), from each of its calls.
             if (!neverChanges)
             {
-                if (writes.Any(write => Functions.EnclosingFunction(write) != declaringFunction) || !Functions.RunsWhenCalled(function, declaringFunction, model, ct))
+                if (writes.Any(write => Functions.EnclosingFunction(write) != declaringFunction))
+                {
+                    return null;
+                }
+
+                if (MadeAfterEveryWrite(function, declaringFunction, writes))
+                {
+                    return new VariableUsage(declaringFunction, neverChanges, declarations, writes, setForGoodWhereCaptured: true);
+                }
+
+                if (!Functions.RunsWhenCalled(function, declaringFunction, model, ct))
                 {
                     return null;
                 }

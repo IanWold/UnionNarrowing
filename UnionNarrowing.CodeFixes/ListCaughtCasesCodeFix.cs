@@ -24,24 +24,13 @@ namespace UnionNarrowing.CodeFixes;
 /// In a switch statement, the default section gets <c>case</c> labels for them, and keeps its <c>default:</c> (which definite return still needs), where this analyzer will report a case added later.
 /// For a throw after a switch statement, a section for them is added that throws the same way;
 /// for a throw after a chain of ifs, one more if, for them, before it.
+/// Where the arms or tests look inside the cases, what's caught is named the same way (<c>Kitten { Toy: Mouse }</c>).
 /// </summary>
 [ExportCodeFixProvider(LanguageNames.CSharp, Name = nameof(ListCaughtCasesCodeFix)), Shared]
 public sealed class ListCaughtCasesCodeFix : CodeFixProvider
 {
     public override ImmutableArray<string> FixableDiagnosticIds =>
         [Descriptors.ThrowingDefault.Id];
-
-    /// <summary>
-    /// The cases the default catches, as patterns:
-    /// not handled before it, nor ruled out by earlier code, with null where it matters.
-    /// </summary>
-    private static List<PatternSyntax> Caught(Handling handling, SemanticModel model, CancellationToken ct)
-    {
-        var excluded = handling.Excluded(model, ct);
-        var caught = handling.Caught(excluded);
-        var withNull = handling.Space.NullMatters && !handling.Handled.IncludesNull && !excluded.IncludesNull;
-        return caught.Count == 0 ? [] : MissingPatterns.For(caught, withNull, handling.Space, model, handling.Start.SpanStart);
-    }
 
     private static PatternSyntax Either(IReadOnlyList<PatternSyntax> patterns) =>
         patterns.Skip(1).Aggregate(patterns[0], (left, right) => BinaryPattern(SyntaxKind.OrPattern, left, right));
@@ -172,7 +161,7 @@ public sealed class ListCaughtCasesCodeFix : CodeFixProvider
                 break;
 
             case SwitchExpressionSyntax { Arms.Count: > 1 } switchExpr when Handling.BeforeDefaultOf(switchExpr, model, session, ct) is { } handling
-                && Caught(handling, model, ct) is { Count: > 0 } caught:
+                && handling.CaughtPatterns(model, ct) is { Count: > 0 } caught:
                 context.RegisterCodeFix(
                     CodeAction.Create($"Handle {Names(caught)} in the throwing arm", ct => NameInArmAsync(context.Document, switchExpr, caught, ct), equivalenceKey: nameof(ListCaughtCasesCodeFix)),
                     context.Diagnostics
@@ -180,7 +169,7 @@ public sealed class ListCaughtCasesCodeFix : CodeFixProvider
                 break;
 
             case ThrowStatementSyntax throwStatement when Handling.BeforeThrow(throwStatement, model, session, ct) is { } after
-                && Caught(after, model, ct) is { Count: > 0 } caughtAfter:
+                && after.CaughtPatterns(model, ct) is { Count: > 0 } caughtAfter:
                 context.RegisterCodeFix(
                     CodeAction.Create($"Handle {Names(caughtAfter)} before the throw", ct => NameBeforeThrowAsync(context.Document, throwStatement, after.Start, after.Input, caughtAfter, ct), equivalenceKey: nameof(ListCaughtCasesCodeFix)),
                     context.Diagnostics
@@ -191,7 +180,7 @@ public sealed class ListCaughtCasesCodeFix : CodeFixProvider
             case ElseClauseSyntax elseClause when TopOfChain(elseClause) is { } top
                 && model.GetOperation(top, ct) is IConditionalOperation topOp
                 && Handling.BeforeThrowingElse(topOp, model, session, ct) is { } chain && chain.Else == elseClause
-                && Caught(chain.Handling, model, ct) is { Count: > 0 } caughtByElse:
+                && chain.Handling.CaughtPatterns(model, ct) is { Count: > 0 } caughtByElse:
                 context.RegisterCodeFix(
                     CodeAction.Create($"Handle {Names(caughtByElse)} before the else", ct => NameBeforeElseAsync(context.Document, elseClause, chain.Handling.Input, caughtByElse, ct), equivalenceKey: nameof(ListCaughtCasesCodeFix)),
                     context.Diagnostics
@@ -199,7 +188,7 @@ public sealed class ListCaughtCasesCodeFix : CodeFixProvider
                 break;
 
             case SwitchStatementSyntax switchStatement when Handling.BeforeDefaultOf(switchStatement, model, session, ct) is { } handling
-                && Caught(handling, model, ct) is { Count: > 0 } caught:
+                && handling.CaughtPatterns(model, ct) is { Count: > 0 } caught:
                 context.RegisterCodeFix(
                     CodeAction.Create($"Handle {Names(caught)} in the default section", ct => NameInSectionAsync(context.Document, switchStatement, caught, ct), equivalenceKey: nameof(ListCaughtCasesCodeFix)),
                     context.Diagnostics

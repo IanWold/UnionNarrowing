@@ -97,6 +97,73 @@ public class CaptureTests
             """
         );
 
+
+    [Fact]
+    public Task Guard_outside_a_lambda_made_after_the_last_write() =>
+        Verify.Suppressions("""
+            class C
+            {
+                Func<int> AfterTheWrites(Pet pet, bool reset)
+                {
+                    if (reset) pet = new Cat("Tom");
+                    if (pet is Bird) return () => 0;
+                    return () => pet /*suppressed*/switch { Cat => 1, Dog => 2 };
+                }
+
+                Func<int> WrittenAfter(Pet pet, Pet other)
+                {
+                    if (pet is Bird) return () => 0;
+                    Func<int> legs = () => pet /*warns*/switch { Cat => 1, Dog => 2 };
+                    /*because*/pet = other;
+                    return legs;
+                }
+
+                List<Func<int>> InALoopThatWrites(Pet pet, Pet[] others)
+                {
+                    var all = new List<Func<int>>();
+                    foreach (var other in others)
+                    {
+                        if (pet is not Bird) all.Add(() => pet /*warns*/switch { Cat => 1, Dog => 2 });
+                        /*because*/pet = other;
+                    }
+
+                    return all;
+                }
+            }
+            """
+        );
+
+
+    [Fact]
+    public Task Lambda_made_in_the_assignment_that_writes_the_variable() =>
+        Verify.Suppressions("""
+            class C
+            {
+                static Func<int>? Saved;
+
+                static Pet Make(Func<int> f)
+                {
+                    Saved = f;
+                    return new Bird("Polly");
+                }
+
+                int Assigned(Pet pet)
+                {
+                    if (pet is Bird) return 0;
+                    pet = Make(() => pet /*warns*/switch { Cat => 1, Dog => 2 });
+                    return Saved!();
+                }
+
+                int Coalesced(Pet? pet)
+                {
+                    if (pet is null or Bird) return 0;
+                    pet ??= Make(() => pet.Value /*warns*/switch { Cat => 1, Dog => 2 });
+                    return Saved!();
+                }
+            }
+            """
+        );
+
     [Fact]
     public Task Labels_that_can_not_run_the_declaration_again() =>
         Verify.Suppressions("""

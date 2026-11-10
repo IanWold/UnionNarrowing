@@ -38,6 +38,28 @@ public class BoxedUnionTests
     }
 
     [Fact]
+    public Task Equals_through_object_or_the_default_comparer() =>
+        Diagnostics("""
+            class C
+            {
+                void M(Pet pet, Pet other, Cat cat, object any, IEqualityComparer<object> comparer)
+                {
+                    var a = /*!UN0014*/Equals(pet, cat);
+                    var b = /*!UN0014*/object.Equals(cat, pet);
+                    var c = /*!UN0014*/EqualityComparer<object>.Default.Equals(pet, cat);
+
+                    var d = Equals(pet, other);
+                    var e = object.Equals(pet, any);
+                    var f = EqualityComparer<object>.Default.Equals(pet, new Pet(cat));
+                    var g = comparer.Equals(pet, cat);
+                    var h = Equals(pet.Value, cat);
+                    Console.WriteLine($"{a}{b}{c}{d}{e}{f}{g}{h}");
+                }
+            }
+            """
+        );
+
+    [Fact]
     public async Task Record_that_prints_a_union_member()
     {
         var diagnostics = await Diagnostics("""
@@ -60,10 +82,16 @@ public class BoxedUnionTests
             {
                 public override string ToString() => $"Shown {{ Pet = {Pet.Value} }}";
             }
+
+            union ShownPet(Cat, Dog)
+            {
+                public override string ToString() => Value?.ToString() ?? "";
+            }
+            record HoldsShownPet(ShownPet Pet, ShownPet? Maybe);
             """
         );
 
-        Assert.Contains("'Owner' prints its Pet as 'Pet', the union's type name, in ToString: declare PrintMembers to print its Value", diagnostics.Select(d => d.GetMessage()));
+        Assert.Contains("'Owner' prints its Pet as 'Pet', the union's type name, in ToString: declare PrintMembers to print its Value, or override ToString in Pet", diagnostics.Select(d => d.GetMessage()));
     }
 
     [Fact]
@@ -84,12 +112,18 @@ public class BoxedUnionTests
                     var b = /*!UN0014*/ReferenceEquals(pet, other);
                     var c = ReferenceEquals(pet.Value, other.Value);
                     Console.WriteLine($"{a}{b}{c}");
+
+                    switch ((object)pet)
+                    {
+                        case /*!UN0014*/string: break;
+                    }
                 }
             }
             """
         );
 
-        Assert.Contains("'Cat' never matches: a boxed Pet is a Pet, not one of its cases. Switch on the union itself, without boxing it.", diagnostics.Select(d => d.GetMessage()));
+        Assert.Contains("'Cat' never matches: a boxed Pet is a Pet, not what it holds. Switch on the union itself, without boxing it.", diagnostics.Select(d => d.GetMessage()));
+        Assert.Contains("'string' never matches: a boxed Pet is a Pet, not what it holds. Switch on the union itself, without boxing it.", diagnostics.Select(d => d.GetMessage()));
     }
 
     [Fact]
@@ -119,8 +153,8 @@ public class BoxedUnionTests
             """
         );
 
-        Assert.Contains("'(object)pet is Cat' is never true: a boxed Pet is a Pet, not one of its cases. Test the union itself, without boxing it.", diagnostics.Select(d => d.GetMessage()));
-        Assert.Contains("'(Cat)(object)pet' always throws: a boxed Pet is a Pet, not one of its cases. Use a pattern on the union, or cast its Value.", diagnostics.Select(d => d.GetMessage()));
+        Assert.Contains("'(object)pet is Cat' is never true: a boxed Pet is a Pet, not what it holds. Test the union itself, without boxing it.", diagnostics.Select(d => d.GetMessage()));
+        Assert.Contains("'(Cat)(object)pet' always throws: a boxed Pet is a Pet, not what it holds. Use a pattern on the union, or cast its Value.", diagnostics.Select(d => d.GetMessage()));
     }
 
     [Fact]
@@ -154,13 +188,95 @@ public class BoxedUnionTests
             """
         );
 
-        Assert.Contains("'pet' shows the union's type name, 'Pet', not what it holds: format 'pet.Value' instead", diagnostics.Select(d => d.GetMessage()));
+        Assert.Contains("'pet' shows the union's type name, 'Pet', not what it holds: format 'pet.Value' instead, or override ToString in Pet", diagnostics.Select(d => d.GetMessage()));
+    }
+
+    [Fact]
+    public Task Union_formatted_through_an_interpolated_string_handler() =>
+        Diagnostics("""
+            using System.Diagnostics;
+            using System.Runtime.CompilerServices;
+            using System.Text;
+
+            union Described(Cat, Dog)
+            {
+                public override string ToString() => Value?.ToString() ?? "";
+            }
+
+            [InterpolatedStringHandler]
+            public ref struct AnyHandler
+            {
+                public AnyHandler(int literalLength, int formattedCount) { }
+                public void AppendLiteral(string literal) { }
+                public void AppendFormatted<T>(T value) { }
+            }
+
+            // Formats a Pet its own way.
+            [InterpolatedStringHandler]
+            public ref struct PetHandler
+            {
+                public PetHandler(int literalLength, int formattedCount) { }
+                public void AppendLiteral(string literal) { }
+                public void AppendFormatted(Pet pet) { }
+            }
+
+            class C
+            {
+                void M(Pet pet, Described described, StringBuilder builder, IFormatProvider provider)
+                {
+                    builder.Append($"{/*!UN0015*/pet}");
+                    builder.AppendLine($"now {/*!UN0015*/pet,-10}");
+                    Debug.Assert(pet is not Bird, $"a bird: {/*!UN0015*/pet}");
+                    var a = string.Create(provider, $"pet {/*!UN0015*/pet}");
+                    Log($"pet {/*!UN0015*/pet}");
+
+                    builder.Append($"{pet.Value} {described}");
+                    LogPet($"pet {pet}");
+                    Console.WriteLine(a);
+                }
+
+                static void Log(AnyHandler handler) { }
+                static void LogPet(PetHandler handler) { }
+            }
+            """
+        );
+
+    [Fact]
+    public async Task Nullable_union_formatted_as_text()
+    {
+        var diagnostics = await Diagnostics("""
+            union Described(Cat, Dog)
+            {
+                public override string ToString() => Value?.ToString() ?? "";
+            }
+
+            class C
+            {
+                void M(Pet? maybe, List<Pet?> maybes, Described? described)
+                {
+                    var a = $"{/*!UN0015*/maybe}";
+                    var b = "maybe: " + /*!UN0015*/maybe;
+                    var c = /*!UN0015*/maybe.ToString();
+                    Console.WriteLine(/*!UN0015*/maybe);
+                    var d = string.Join(", ", /*!UN0015*/maybes);
+
+                    var e = $"{described} {maybe?.Value}";
+                    Console.WriteLine($"{a}{b}{c}{d}{e}");
+                }
+            }
+            """
+        );
+
+        var messages = diagnostics.Select(d => d.GetMessage()).ToList();
+        Assert.Contains("'maybe' shows the union's type name, 'Pet', not what it holds: format 'maybe?.Value' instead, or override ToString in Pet", messages);
+        Assert.Contains("'maybes' shows the union's type name, 'Pet', not what it holds: format 'maybes.Select(x => x?.Value)' instead, or override ToString in Pet", messages);
     }
 
     [Fact]
     public async Task Unions_joined_or_logged()
     {
         var diagnostics = await Diagnostics("""
+            using System.Diagnostics;
             using Microsoft.Extensions.Logging;
 
             class C
@@ -169,17 +285,20 @@ public class BoxedUnionTests
                 {
                     logger.LogInformation("pet {Pet}", /*!UN0015*/pet);
                     logger.LogWarning("pets {A} and {B}", /*!UN0015*/pet, 1);
+                    using var scope = logger.BeginScope("pet {Pet}", /*!UN0015*/pet);
                     var joined = string.Join(", ", /*!UN0015*/pets);
                     builder.AppendJoin(", ", /*!UN0015*/pets);
+                    var converted = Convert.ToString(/*!UN0015*/pet);
+                    Trace.TraceInformation("pet {0}", /*!UN0015*/pet);
 
                     logger.LogInformation("pet {Pet}", pet.Value);
                     var values = string.Join(", ", pets.Select(p => p.Value));
-                    Console.WriteLine(joined + values);
+                    Console.WriteLine(joined + values + converted);
                 }
             }
             """
         );
 
-        Assert.Contains("'pets' shows the union's type name, 'Pet', not what it holds: format 'pets.Select(x => x.Value)' instead", diagnostics.Select(d => d.GetMessage()));
+        Assert.Contains("'pets' shows the union's type name, 'Pet', not what it holds: format 'pets.Select(x => x.Value)' instead, or override ToString in Pet", diagnostics.Select(d => d.GetMessage()));
     }
 }

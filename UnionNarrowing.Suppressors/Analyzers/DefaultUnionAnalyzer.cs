@@ -1,3 +1,4 @@
+using System.Collections.Generic;
 using System.Collections.Immutable;
 using System.Linq;
 using System.Threading;
@@ -17,13 +18,14 @@ namespace UnionNarrowing.Suppressors.Analyzers;
 /// <item>UN0006: <c>new U[n]</c>, whose elements all start out as the default, and APIs that create, grow, clear or pool arrays.</item>
 /// <item>UN0010: methods that fall back to the default, like <c>FirstOrDefault()</c>, or that say so with <c>T?</c> or <c>[MaybeNull]</c>;
 /// and a Try method's out value, read when it failed.</item>
-/// <item>UN0018: the default of a struct or tuple with such a union inside it.</item>
+/// <item>UN0018: the default of a struct or tuple with such a union inside it, unless an object initializer (or <c>with</c>) sets every one.</item>
 /// </list>
 /// </summary>
 /// <remarks>
 /// Doesn't report <c>default</c> assigned to an <c>out</c> parameter:
 /// that's how a Try method says "nothing here", and the caller isn't supposed to look.
-/// Nor a default that's only ever tested (<c>FirstOrDefault() is Cat c</c>, or a switch with a <c>null</c> or discard arm), or put in a local that's assigned again before it's read.
+/// Nor <c>default!</c>, which says the default is meant;
+/// nor a default that's only ever tested (<c>FirstOrDefault() is Cat c</c>, or a switch with a <c>null</c> or discard arm), or put in a local that's assigned again before it's read.
 /// </remarks>
 [DiagnosticAnalyzer(LanguageNames.CSharp)]
 public sealed class DefaultUnionAnalyzer : DiagnosticAnalyzer
@@ -79,10 +81,15 @@ public sealed class DefaultUnionAnalyzer : DiagnosticAnalyzer
             return;
         }
 
+        // An object initializer (or `with`) can set what's inside: `new Entry { Pet = pet }`.
+        var initializer = operation is IObjectCreationOperation creation
+            ? creation.Initializer
+            : (Outermost(operation).Parent as IWithOperation)?.Initializer;
+
         var type = operation.Type;
         var direct = CaseSpace.DefaultHoldsNoCase(type);
-        var inside = direct ? null : UnionInside(type);
-        if ((!direct && inside is null) || IsAssignedToOutParameter(operation) || OnlyTested(operation) || NeverRead(operation, context.CancellationToken))
+        var inside = direct ? null : UnionInside(type, initializer);
+        if ((!direct && inside is null) || IsForgiven(operation) || IsAssignedToOutParameter(operation) || OnlyTested(operation) || NeverRead(operation, context.CancellationToken))
         {
             return;
         }
@@ -192,7 +199,7 @@ public sealed class DefaultUnionAnalyzer : DiagnosticAnalyzer
             }
 
             if (invocation.Parent is IExpressionStatementOperation
-                || ReadWhereCallGave(invocation, failedResult, local, invocation.SemanticModel!, context.CancellationToken)
+                || ReadWhereCallGave(invocation, failedResult, local, invocation.SemanticModel!)
             )
             {
                 var detail = $"when '{invocation.TargetMethod.Name}' returns {(failedResult ? "true" : "false")}";
@@ -369,6 +376,20 @@ public sealed class DefaultUnionAnalyzer : DiagnosticAnalyzer
         };
 
     /// <summary>
+    /// Whether the null-forgiving operator says the default is meant (<c>default!</c>).
+    /// </summary>
+    private static bool IsForgiven(IOperation operation)
+    {
+        var syntax = operation.Syntax;
+        while (syntax.Parent is ParenthesizedExpressionSyntax parenthesized)
+        {
+            syntax = parenthesized;
+        }
+
+        return syntax.Parent is PostfixUnaryExpressionSyntax { RawKind: (int)SyntaxKind.SuppressNullableWarningExpression };
+    }
+
+    /// <summary>
     /// Whether a generic method says it can return the default for its type parameter:
     /// a <c>T?</c> return for an unconstrained T, or <c>[return: MaybeNull]</c>.
     /// Not LINQ's Max, Min, MaxBy and MinBy:
@@ -468,9 +489,10 @@ public sealed class DefaultUnionAnalyzer : DiagnosticAnalyzer
         };
 
     /// <summary>
-    /// Whether <paramref name="local"/> is read in the branch of an <c>if</c> on the call that runs when the call returned <paramref name="result"/> (<c>if (!TryGet(out var x)) { ... x ... }</c>, or the else of <c>if (TryGet(out var x))</c>).
+    /// Whether the value the call put in <paramref name="local"/> is read in the branch of an <c>if</c> on the call that runs when the call returned <paramref name="result"/> (<c>if (!TryGet(out var x)) { ... x ... }</c>, or the else of <c>if (TryGet(out var x))</c>).
+    /// Not where the branch assigns the local before reading it (<c>if (!TryGet(out var x)) x = fallback;</c>).
     /// </summary>
-    private static bool ReadWhereCallGave(IInvocationOperation invocation, bool result, ILocalSymbol local, SemanticModel model, CancellationToken ct)
+    private static bool ReadWhereCallGave(IInvocationOperation invocation, bool result, ILocalSymbol local, SemanticModel model)
     {
         var negated = false;
         IOperation condition = invocation;
@@ -488,7 +510,14 @@ public sealed class DefaultUnionAnalyzer : DiagnosticAnalyzer
 
         // The branch that runs when the condition is true is the one where the call returned !negated.
         var branch = result == !negated ? ifStatement.WhenTrue : ifStatement.WhenFalse;
-        return branch is not null && Symbols.References(local, branch.Syntax, model, ct).Any();
+        var flow = branch?.Syntax switch
+        {
+            StatementSyntax statement => model.AnalyzeDataFlow(statement),
+            ExpressionSyntax expression => model.AnalyzeDataFlow(expression),
+            _ => null,
+        };
+
+        return flow is { Succeeded: true } && flow.DataFlowsIn.Contains(local, SymbolEqualityComparer.Default);
     }
 
     /// <summary>
@@ -521,6 +550,23 @@ public sealed class DefaultUnionAnalyzer : DiagnosticAnalyzer
     }
 
     /// <summary>
+    /// Whether an object initializer sets the field at the end of <paramref name="path"/>:
+    /// it assigns the first field (or its property), or gives it a nested initializer that sets the rest.
+    /// </summary>
+    private static bool Sets(IObjectOrCollectionInitializerOperation? initializer, IReadOnlyList<IFieldSymbol> path)
+    {
+        bool IsFirst(ISymbol member) =>
+            SymbolEqualityComparer.Default.Equals(member.OriginalDefinition, (path[0].AssociatedSymbol ?? path[0]).OriginalDefinition);
+
+        return initializer is not null && initializer.Initializers.Any(set => set switch
+        {
+            ISimpleAssignmentOperation { Target: IMemberReferenceOperation target } => IsFirst(target.Member),
+            IMemberInitializerOperation { InitializedMember: IMemberReferenceOperation member, Initializer: var nested } => path.Count > 1 && IsFirst(member.Member) && Sets(nested, [.. path.Skip(1)]),
+            _ => false,
+        });
+    }
+
+    /// <summary>
     /// Whether the method's body assigns <c>default</c> to the parameter (or to an element of it).
     /// </summary>
     private static bool StoresDefault(IMethodSymbol method, IParameterSymbol parameter, CancellationToken ct)
@@ -547,11 +593,11 @@ public sealed class DefaultUnionAnalyzer : DiagnosticAnalyzer
         invocation.Arguments.FirstOrDefault()?.Value is ITypeOfOperation { TypeOperand: var type } ? type : null;
 
     /// <summary>
-    /// For a struct (or tuple) that isn't a union itself, the first union inside it, through its fields (and its auto-properties' fields) and theirs, whose default holds no case:
-    /// the union type and where it is (<c>Entry.Pet</c>).
-    /// Fields of structs from other assemblies aren't all visible, so those aren't looked into.
+    /// For a struct (or tuple) that isn't a union itself, the unions inside it whose default holds no case, through its fields (and its auto-properties' fields) and theirs:
+    /// each one's type, and the fields that lead to it.
+    /// Not through a ref field, whose default refers to nothing, nor into a struct from another assembly, whose fields aren't all visible.
     /// </summary>
-    private static (ITypeSymbol Union, string Path)? UnionInside(ITypeSymbol? type, int depth = 0)
+    private static IEnumerable<(ITypeSymbol Union, ImmutableArray<IFieldSymbol> Fields)> UnionsInside(ITypeSymbol? type, int depth = 0)
     {
         if (type is not INamedTypeSymbol { IsValueType: true, IsUnion: false, TypeKind: TypeKind.Struct } named
             || named.SpecialType != SpecialType.None
@@ -560,26 +606,40 @@ public sealed class DefaultUnionAnalyzer : DiagnosticAnalyzer
             || (!named.IsTupleType && named.DeclaringSyntaxReferences.IsEmpty)
         )
         {
-            return null;
+            yield break;
         }
 
         var fields = named.IsTupleType
             ? named.TupleElements.AsEnumerable()
-            : named.GetMembers().OfType<IFieldSymbol>().Where(f => !f.IsStatic && !f.IsConst);
+            : named.GetMembers().OfType<IFieldSymbol>().Where(f => !f.IsStatic && !f.IsConst && f.RefKind == RefKind.None);
 
         foreach (var field in fields)
         {
-            var name = field.AssociatedSymbol?.Name ?? field.Name;
-            var where = (named.IsTupleType ? "(...)" : named.Name) + "." + name;
-            
             if (CaseSpace.DefaultHoldsNoCase(field.Type))
             {
-                return (field.Type, where);
+                yield return (field.Type, [field]);
+                continue;
             }
 
-            if (UnionInside(field.Type, depth + 1) is { } inner)
+            foreach (var (union, inner) in UnionsInside(field.Type, depth + 1))
             {
-                return (inner.Union, where + inner.Path.Substring(inner.Path.IndexOf('.')));
+                yield return (union, inner.Insert(0, field));
+            }
+        }
+    }
+
+    /// <summary>
+    /// For a struct (or tuple) that isn't a union itself, the first union inside it whose default holds no case (see <see cref="UnionsInside"/>) that <paramref name="initializer"/> doesn't set:
+    /// the union type and where it is (<c>Entry.Pet</c>).
+    /// </summary>
+    /// <param name="initializer">The object initializer, or <c>with</c>'s, that the struct is created with, if any.</param>
+    internal static (ITypeSymbol Union, string Path)? UnionInside(ITypeSymbol? type, IObjectOrCollectionInitializerOperation? initializer = null)
+    {
+        foreach (var (union, fields) in UnionsInside(type))
+        {
+            if (!Sets(initializer, fields))
+            {
+                return (union, (type!.IsTupleType ? "(...)" : type.Name) + "." + string.Join(".", fields.Select(f => f.AssociatedSymbol?.Name ?? f.Name)));
             }
         }
 

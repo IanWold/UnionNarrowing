@@ -78,6 +78,28 @@ public class DefaultUnionTests
     }
 
     [Fact]
+    public Task Defaults_the_null_forgiving_operator_says_are_meant() =>
+        Diagnostics("""
+            struct Box { public Pet Pet; }
+
+            class C
+            {
+                public Pet Field = default!;
+                public Pet Property { get; set; } = (default)!;
+
+                void M()
+                {
+                    Pet a = default!;
+                    var b = default(Pet)!;
+                    Box c = default!;
+                    Pet d = /*!UN0003*/default;
+                    Console.WriteLine($"{a}{b}{c}{d}");
+                }
+            }
+            """
+        );
+
+    [Fact]
     public Task Defaults_that_are_only_tested_or_never_read() =>
         Diagnostics("""
             class C
@@ -382,6 +404,39 @@ public class DefaultUnionTests
     }
 
     [Fact]
+    public Task Out_value_of_a_try_method_that_failed_replaced_before_it_is_read() =>
+        Diagnostics("""
+            class C
+            {
+                void M(Queue<Pet> inbox, Dictionary<string, Pet> byName)
+                {
+                    if (!inbox.TryDequeue(out var next)) next = new Cat("Tom");
+
+                    if (!byName.TryGetValue("Rex", out var found))
+                    {
+                        found = new Dog("Rex");
+                    }
+
+                    Pet earlier;
+                    if (byName.TryGetValue("Polly", out earlier)) Console.WriteLine("found");
+                    else earlier = new Bird("Polly");
+
+                    var chosen = byName.TryGetValue("Tom", out var tom) ? tom : new Cat("Tom");
+
+                    // Read before it's replaced.
+                    if (!byName.TryGetValue("Max", /*!UN0010*/out var read))
+                    {
+                        Console.WriteLine(read.Value);
+                        read = new Dog("Max");
+                    }
+
+                    Console.WriteLine($"{next}{found}{earlier}{chosen}{read}");
+                }
+            }
+            """
+        );
+
+    [Fact]
     public async Task Structs_and_tuples_holding_a_union()
     {
         var diagnostics = await Diagnostics("""
@@ -412,6 +467,44 @@ public class DefaultUnionTests
         Assert.Contains("'default(Box)' leaves default(Pet) in Box.Pet, which holds none of its cases", messages);
         Assert.Contains("'default' leaves default(Pet) in Outer.Inner.Pet, which holds none of its cases", messages);
         Assert.Contains("'new Box[n]' leaves default(Pet) in each element's Box.Pet, which holds none of its cases", messages);
+    }
+
+    [Fact]
+    public async Task Structs_holding_a_union_set_by_an_initializer()
+    {
+        var diagnostics = await Diagnostics("""
+            struct Slot { public Pet State; public int Version; }
+            struct TwoPets { public Pet A; public Pet B; }
+            struct Outer { public Slot Inner; public int N; }
+            record struct Envelope(Guid Id, Pet State);
+            ref struct PetRef { public ref Pet Target; }
+
+            class C
+            {
+                void M(Pet pet)
+                {
+                    var a = new Slot { State = pet, Version = 1 };
+                    var b = new Envelope { Id = Guid.NewGuid(), State = pet };
+                    var c = new TwoPets { A = pet, B = pet };
+                    var d = new Outer { Inner = new Slot { State = pet } };
+                    var e = new Outer { Inner = { State = pet } };
+                    var f = default(Envelope) with { State = pet };
+
+                    // A ref field's default refers to nothing, rather than holding a default union.
+                    var g = new PetRef { Target = ref pet };
+                    var h = new PetRef();
+
+                    var i = /*!UN0018*/new Slot { Version = 1 };
+                    var j = /*!UN0018*/new TwoPets { A = pet };
+                    var k = /*!UN0018*/new Outer { N = 1 };
+                    var l = /*!UN0018*/default(TwoPets) with { B = pet };
+                    Console.WriteLine($"{a}{b}{c}{d}{e}{f}{i}{j}{k}{l}");
+                }
+            }
+            """
+        );
+
+        Assert.Contains("'new TwoPets { A = pet }' leaves default(Pet) in TwoPets.B, which holds none of its cases", diagnostics.Select(d => d.GetMessage()));
     }
 
     [Fact]

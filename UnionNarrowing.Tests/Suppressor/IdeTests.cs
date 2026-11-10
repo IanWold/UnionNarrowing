@@ -80,6 +80,68 @@ public class IdeTests
             """, diagnosticId: "IDE0010"
         );
 
+
+    [Fact]
+    public Task Switch_statement_whose_sections_assign_what_it_switches_on() =>
+        Verify.Suppressions("""
+            class C
+            {
+                static Pet Next() => new Cat("Tom");
+
+                Pet Step(Pet pet)
+                {
+                    if (pet is Bird) return pet;
+                    /*suppressed*/switch (pet)
+                    {
+                        case Cat:
+                            pet = new Dog("Rex");
+                            break;
+                        case Dog:
+                            pet = new Bird("Polly");
+                            break;
+                    }
+
+                    return pet;
+                }
+
+                Pet Run(Pet pet)
+                {
+                    while (pet is not Bird)
+                    {
+                        /*suppressed*/switch (pet)
+                        {
+                            case Cat:
+                                pet = new Dog("Rex");
+                                break;
+                            case Dog:
+                                pet = new Bird("Polly");
+                                break;
+                        }
+                    }
+
+                    return pet;
+                }
+
+                Pet WrittenBefore(Pet pet, Pet other)
+                {
+                    if (pet is Bird) return pet;
+                    /*because*/pet = other;
+                    /*warns*/switch (pet)
+                    {
+                        case Cat:
+                            pet = new Dog("Rex");
+                            break;
+                        case Dog:
+                            pet = new Bird("Polly");
+                            break;
+                    }
+
+                    return pet;
+                }
+            }
+            """, diagnosticId: "IDE0010"
+        );
+
     [Fact]
     public Task Switch_statement_that_misses_a_case() =>
         Verify.Suppressions("""

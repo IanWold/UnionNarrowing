@@ -49,6 +49,11 @@ file class Places
     private readonly CancellationToken _ct;
     private readonly List<Element> _elements = [];
     private List<CaseSet> _excluded = [];
+
+    /// <summary>
+    /// Combinations of the cases of the elements the analysis follows (by index) that earlier code rules out together (<c>if (b is { Left: Lit, Right: Lit }) return;</c>), as boxes over those elements.
+    /// </summary>
+    private (List<int> Elements, IReadOnlyList<CaseSet[]> Boxes) _together = ([], []);
     private readonly ImmutableArray<IOperation> _inputs;
     private readonly bool _isTuple;
     private readonly SemanticModel _model;
@@ -58,11 +63,38 @@ file class Places
     /// </summary>
     private static readonly object NotThere = new();
 
+    /// <summary>
+    /// What each pattern says about the cases of the element it's on, by pattern and element, which doesn't depend on the combination being visited.
+    /// </summary>
+    private readonly Dictionary<(IPatternOperation, int), Outcome> _outcomes = [];
+
     private bool _stopped;
     private readonly SyntaxNode _switchNode;
 
     private Compilation Compilation =>
         _model.Compilation;
+
+    private Outcome OutcomeAt(IPatternOperation pattern, int at)
+    {
+        if (!_outcomes.TryGetValue((pattern, at), out var outcome))
+        {
+            _outcomes[(pattern, at)] = outcome = Facts.Of(pattern, _elements[at].Space, Compilation);
+        }
+
+        return outcome;
+    }
+
+    /// <summary>
+    /// The combination's cases of the inputs themselves, without what's inside them.
+    /// </summary>
+    public object?[] InputCases =>
+        [.. _combination.Take(_inputs.Length)];
+
+    /// <summary>
+    /// The case spaces of the inputs themselves.
+    /// </summary>
+    public IReadOnlyList<CaseSpace> InputSpaces =>
+        [.. _elements.Take(_inputs.Length).Select(element => element.Space)];
 
     private Places(IOperation input, SyntaxNode switchNode, SemanticModel model, CancellationToken ct)
     {
@@ -87,7 +119,7 @@ file class Places
                 return true;
 
             case ITypePatternOperation or IDeclarationPatternOperation or IConstantPatternOperation or IRelationalPatternOperation:
-                return at >= 0 && candidate != NotThere && Facts.Of(pattern, _elements[at].Space, Compilation).AlwaysTrue.ContainsCase(candidate);
+                return at >= 0 && candidate != NotThere && OutcomeAt(pattern, at).AlwaysTrue.ContainsCase(candidate);
 
             case IRecursivePatternOperation recursive:
                 if (at < 0 || candidate is null || candidate == NotThere || !Facts.CaseIsAlways(candidate, recursive.MatchedType, _elements[at].Space, Compilation))
@@ -168,7 +200,7 @@ file class Places
             return;
         }
 
-        if (path.Count > 0 && Find(root, path) < 0 && CaseSpace.OfElement(pattern.InputType, _switchNode.SpanStart, _model, _ct) is { IsOfTypes: true } space)
+        if (path.Count > 0 && Find(root, path) < 0 && CaseSpace.OfElement(PlaceType(pattern, path), _switchNode.SpanStart, _model, _ct) is { IsOfTypes: true } space)
         {
             var requires = new List<(int, ITypeSymbol)>();
             for (var k = 0; k < path.Count; k++)
@@ -221,6 +253,20 @@ file class Places
     }
 
     /// <summary>
+    /// The type of the place a pattern looks at:
+    /// a member's declared type, which says whether it can be null as the compiler goes by it (the pattern's input type has no nullable annotation), or else the pattern's input type.
+    /// </summary>
+    private static ITypeSymbol PlaceType(IPatternOperation pattern, IReadOnlyList<Step> path) =>
+        path.Count == 0
+            ? pattern.InputType
+            : path[path.Count - 1] switch
+            {
+                MemberStep { Member: IFieldSymbol field } => field.Type,
+                MemberStep { Member: IPropertySymbol property } => property.Type,
+                _ => pattern.InputType,
+            };
+
+    /// <summary>
     /// Collects the places a pattern looks at:
     /// on a tuple literal, its arms are tuple patterns, element by element;
     /// anything else is a pattern on the one input.
@@ -268,10 +314,10 @@ file class Places
                 return true;
 
             case ITypePatternOperation or IDeclarationPatternOperation or IConstantPatternOperation or IRelationalPatternOperation:
-                return at < 0 || candidate == NotThere || !Facts.Of(pattern, _elements[at].Space, Compilation).AlwaysFalse.ContainsCase(candidate);
+                return at < 0 || candidate == NotThere || !OutcomeAt(pattern, at).AlwaysFalse.ContainsCase(candidate);
 
             case IRecursivePatternOperation recursive:
-                if (at >= 0 && candidate != NotThere && (candidate is null || Facts.Of(pattern, _elements[at].Space, Compilation).AlwaysFalse.ContainsCase(candidate)))
+                if (at >= 0 && candidate != NotThere && (candidate is null || OutcomeAt(pattern, at).AlwaysFalse.ContainsCase(candidate)))
                 {
                     return false;
                 }
@@ -378,7 +424,7 @@ file class Places
 
         IReadOnlyList<Step> inside = element.Space.IsOfTypes ? [.. element.Path, new CaseStep(type)] : element.Path;
         var subpatterns = Children(element, inside);
-        var name = ParseTypeName(type.ToMinimalDisplayString(_model, _switchNode.SpanStart));
+        var name = MissingPatterns.TypeName(type, _model, _switchNode.SpanStart);
 
         PatternSyntax written = subpatterns.Count > 0
             ? RecursivePattern(name, null, PropertyPatternClause(SeparatedList(subpatterns)), null)
@@ -470,13 +516,18 @@ file class Places
 
         var roots = places._inputs.Select(each => TrackedValue.From(each, session) is { } value && Narrowing.IsTrackable(value, switchNode, model, ct) ? value : null).ToList();
         var followsMutableState = session.FollowsMutableState(switchNode.SyntaxTree);
-        places._excluded = [..
-            places._elements
-            .Select(e => roots[e.Root]?.Through(e.Path, model.Compilation, followsMutableState) is { } place && Narrowing.IsTrackable(place, switchNode, model, ct)
-                ? Narrowing.Excluded(switchNode, place, e.Space, model, ct)
-                : CaseSet.Empty
-            )
-        ];
+        var followed = places._elements
+            .Select(e => roots[e.Root]?.Through(e.Path, model.Compilation, followsMutableState) is { } place && Narrowing.IsTrackable(place, switchNode, model, ct) ? place : null)
+            .ToList();
+
+        places._excluded = [.. followed.Select((place, i) => place is null ? CaseSet.Empty : Narrowing.Excluded(switchNode, place, places._elements[i].Space, model, ct))];
+
+        var together = Enumerable.Range(0, followed.Count).Where(i => followed[i] is not null).ToList();
+        if (together.Count > 1)
+        {
+            places._together = (together, Narrowing.ExcludedTogether(switchNode, [.. together.Select(i => followed[i]!)], [.. together.Select(i => places._elements[i].Space)], model, ct));
+        }
+
         return places;
     }
 
@@ -484,8 +535,15 @@ file class Places
     /// Whether earlier code ruled out the combination:
     /// one of its elements' cases.
     /// </summary>
+    /// <summary>
+    /// Whether earlier code rules out nothing at any of the places, on its own or together with others.
+    /// </summary>
+    public bool NothingRuledOut =>
+        _excluded.All(excluded => excluded.IsEmpty) && _together.Boxes.Count == 0;
+
     public bool RuledOut() =>
-        _combination.Select((candidate, i) => candidate != NotThere && _excluded[i].ContainsCase(candidate)).Any(x => x);
+        _combination.Select((candidate, i) => candidate != NotThere && _excluded[i].ContainsCase(candidate)).Any(x => x)
+        || _together.Boxes.Any(box => _together.Elements.Select((element, j) => _combination[element] != NotThere && box[j].ContainsCase(_combination[element])).All(x => x));
 
     /// <summary>
     /// The combination, as a pattern on the input.
@@ -522,6 +580,11 @@ internal static class NestedCoverage
             return null;
         }
 
+        if (places.NothingRuledOut)
+        {
+            return [];
+        }
+
         var possible = new bool[labels.Count];
         var alive = new bool[labels.Count];
         var finished = places.Enumerate(withNull: true, () =>
@@ -540,7 +603,7 @@ internal static class NestedCoverage
                 taken |= labels[i].Guard is null && (labels[i].IsDefault || patterns[i] is { } earlier && places.AlwaysTop(earlier));
             }
 
-            return true;
+            return Enumerable.Range(0, labels.Count).Any(i => patterns[i] is not null && !alive[i]);
         });
 
         return finished is null
@@ -549,7 +612,8 @@ internal static class NestedCoverage
     }
 
     /// <summary>
-    /// Patterns for (some of) the combinations the arms miss, written to look inside the way the arms do (<c>Kitten { Toy: Ball }</c>, <c>Pet and Bird</c>, <c>{ Pet: Bird }</c>).
+    /// Patterns for the combinations the arms miss, written to look inside the way the arms do (<c>Kitten { Toy: Ball }</c>, <c>Pet and Bird</c>, <c>{ Pet: Bird }</c>).
+    /// Past <see cref="Limits.WrittenOutMissing"/> of them, patterns for the inputs' cases they're in instead, as <see cref="MissingPatterns"/> writes them (<c>Kitten</c>).
     /// Null if the arms don't look inside.
     /// </summary>
     public static List<PatternSyntax>? Missing(IOperation input, IReadOnlyList<SwitchLabel> labels, SyntaxNode switchNode, SemanticModel model, Session session, CancellationToken ct)
@@ -561,17 +625,30 @@ internal static class NestedCoverage
         }
 
         var missing = new List<PatternSyntax>();
+        var inputCases = new List<object?[]>();
         var finished = places.Enumerate(withNull: false, () =>
         {
-            if (!places.Handled(unguarded) && !places.RuledOut() && places.Written() is var written && !missing.Any(m => m.IsEquivalentTo(written)))
+            if (places.Handled(unguarded) || places.RuledOut())
+            {
+                return true;
+            }
+
+            if (missing.Count <= Limits.WrittenOutMissing && places.Written() is var written && !missing.Any(m => m.IsEquivalentTo(written)))
             {
                 missing.Add(written);
             }
 
-            return missing.Count < Limits.WrittenOutMissing;
+            if (places.InputCases is var cases && !inputCases.Any(seen => seen.Zip(cases, CaseComparer.Instance.Equals).All(same => same)))
+            {
+                inputCases.Add(cases);
+            }
+
+            return true;
         });
 
-        return finished is null || missing.Count == 0 ? null : missing;
+        return finished is null || missing.Count == 0 ? null
+            : missing.Count <= Limits.WrittenOutMissing ? missing
+            : MissingPatterns.Of(places.InputSpaces, inputCases, model, switchNode.SpanStart);
     }
 
     /// <summary>

@@ -234,6 +234,51 @@ public class LinqTests
             """
         );
 
+
+    [Fact]
+    public Task Generic_filters() =>
+        Verify.Suppressions("""
+            sealed record Ok<T>(T Value);
+            sealed record Err<E>(E Error);
+            union Result<T, E>(Ok<T>, Err<E>);
+
+            static class Results
+            {
+                public static bool IsOk<T, E>(this Result<T, E> r) => r is Ok<T>;
+            }
+
+            class C
+            {
+                IEnumerable<int> MethodGroup(IEnumerable<Result<int, string>> rs) =>
+                    rs.Where(Results.IsOk).Select(r => r /*suppressed*/switch { Ok<int> ok => ok.Value });
+
+                IEnumerable<int> Lambda(IEnumerable<Result<int, string>> rs) =>
+                    rs.Where(r => r.IsOk()).Select(r => r /*suppressed*/switch { Ok<int> ok => ok.Value });
+
+                IEnumerable<int> Negated(IEnumerable<Result<int, string>> rs) =>
+                    rs.Where(r => !r.IsOk()).Select(r => r /*warns*/switch { Ok<int> ok => ok.Value });
+            }
+            """
+        );
+
+
+    [Fact]
+    public Task Groups_flattened_back_out() =>
+        Verify.Suppressions("""
+            class C
+            {
+                IEnumerable<int> GroupedThenFlattened(IEnumerable<Pet> pets) =>
+                    pets.Where(p => p is not Bird).GroupBy(p => p.Value?.GetType()).SelectMany(g => g).Select(p => p /*suppressed*/switch { Cat => 1, Dog => 2 });
+
+                IEnumerable<int> ChunkedThenFlattened(IEnumerable<Pet> pets) =>
+                    pets.Where(p => p is not Bird).Chunk(10).SelectMany(c => c).Select(p => p /*suppressed*/switch { Cat => 1, Dog => 2 });
+
+                IEnumerable<int> GroupedByElement(IEnumerable<Pet> pets, Pet other) =>
+                    pets.Where(p => p is not Bird).GroupBy(p => p.Value?.GetType(), p => other).SelectMany(g => g).Select(p => p /*warns*/switch { Cat => 1, Dog => 2 });
+            }
+            """
+        );
+
     [Fact]
     public Task Other_lambdas_that_get_elements() =>
         Verify.Suppressions("""

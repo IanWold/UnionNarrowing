@@ -39,7 +39,7 @@ public class SwitchOnUnionCodeFixTests
             {
                 int M(Pet pet) => pet switch { Cat => 1, Dog => 2, Bird => 3, _ => 0 };
             }
-            """, new SwitchOnValueAnalyzer()
+            """, new SwitchOnValueAnalyzer(), title: "Switch on 'pet'"
         );
 
     [Fact]
@@ -54,6 +54,21 @@ public class SwitchOnUnionCodeFixTests
             {
                 bool M(Pet pet) => pet is Cat or Dog;
             }
-            """, new UnionNarrowing.Suppressors.Analyzers.SwitchOnValueAnalyzer()
+            """, new SwitchOnValueAnalyzer(), title: "Test 'pet'"
+        );
+
+    [Fact]
+    public Task Test_the_union_for_a_type() =>
+        Verify.CodeFix(new SwitchOnUnionCodeFix(), """
+            class C
+            {
+                bool M(Pet pet) => (pet.Value) is Cat;
+            }
+            """, """
+            class C
+            {
+                bool M(Pet pet) => (pet) is Cat;
+            }
+            """, new SwitchOnValueAnalyzer(), title: "Test 'pet'"
         );
 }

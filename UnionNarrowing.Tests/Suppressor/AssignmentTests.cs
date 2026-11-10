@@ -558,6 +558,69 @@ public class AssignmentTests
             """
         );
 
+
+    [Fact]
+    public Task New_objects_whose_initializers_or_copies_run_code() =>
+        Verify.Suppressions("""
+            sealed class Settings
+            {
+                public Pet State { get; init; }
+                public int Level { get => 0; init => State = new Bird("Polly"); }
+                public int Plain { get; init; }
+            }
+
+            record Snapshot(Pet State, int Version)
+            {
+                protected Snapshot(Snapshot original)
+                {
+                    State = new Bird("Polly");
+                    Version = original.Version;
+                }
+            }
+
+            record Plain(Pet State, int Version)
+            {
+                public int Level { get => 0; init => State = new Bird("Polly"); }
+            }
+
+            class C
+            {
+                int LaterInitializerSetsIt()
+                {
+                    var settings = new Settings { State = new Cat("Tom"), Level = 3 };
+                    return settings.State /*warns*/switch { Cat => 1 };
+                }
+
+                int LaterInitializerOfAnAutoProperty()
+                {
+                    var settings = new Settings { State = new Cat("Tom"), Plain = 3 };
+                    return settings.State /*suppressed*/switch { Cat => 1 };
+                }
+
+                int CopyConstructorOfYourOwn(Snapshot snapshot)
+                {
+                    if (snapshot.State is Bird) return 0;
+                    var next = snapshot with { Version = 2 };
+                    return next.State /*warns*/switch { Cat => 1, Dog => 2 };
+                }
+
+                int WithRunsAnInitAccessor(Plain plain)
+                {
+                    if (plain.State is Bird) return 0;
+                    var next = plain with { Level = 2 };
+                    return next.State /*warns*/switch { Cat => 1, Dog => 2 };
+                }
+
+                int GeneratedCopy(Plain plain)
+                {
+                    if (plain.State is Bird) return 0;
+                    var next = plain with { Version = 2 };
+                    return next.State /*suppressed*/switch { Cat => 1, Dog => 2 };
+                }
+            }
+            """
+        );
+
     [Fact]
     public Task Out_values_a_helper_always_sets() =>
         Verify.Suppressions("""
@@ -655,6 +718,60 @@ public class AssignmentTests
                 {
                     var pet = MakeCat();
                     return pet /*suppressed*/switch { Cat => 1 };
+                }
+            }
+            """
+        );
+
+
+    [Fact]
+    public Task What_a_generic_method_returns() =>
+        Verify.Suppressions("""
+            using System;
+            using System.Threading.Tasks;
+            sealed record Some<T>(T Value);
+            sealed record None;
+            union Option<T>(Some<T>, None);
+            sealed record Ok<T>(T Value);
+            sealed record Err<E>(E Error);
+            union Result<T, E>(Ok<T>, Err<E>);
+
+            static class Opt
+            {
+                public static Option<T> Some<T>(T value) => new Some<T>(value);
+                public static Option<T> Nothing<T>() => new None();
+                public static Result<U, E> Map<T, U, E>(this Result<T, E> r, Func<T, U> f) =>
+                    r switch { Ok<T> ok => new Ok<U>(f(ok.Value)), Err<E> err => err };
+                public static async Task<Option<T>> SomeLater<T>(T value) { await Task.Yield(); return new Some<T>(value); }
+                public static void Out<T>(T value, out Option<T> option) => option = new Some<T>(value);
+            }
+
+            static class Factory<T>
+            {
+                public static Option<T> Make(T value) => new Some<T>(value);
+                public static readonly Option<T> Empty = new None();
+            }
+
+            class C
+            {
+                int ReturnsTheCaseItWasGiven() => Opt.Some(1) /*suppressed*/switch { Some<int> s => s.Value };
+
+                int ReturnsAnotherCase() => Opt.Some(1) /*warns*/switch { None => 0 };
+
+                int ReturnsNone() => Opt.Nothing<int>() /*warns*/switch { Some<int> => 0 };
+
+                int MapGivesEitherCase(Result<int, string> r) => r.Map(x => x + 1) /*warns*/switch { Err<string> => 0 };
+
+                int OfAGenericClass() => Factory<int>.Make(1) /*warns*/switch { None => 0 };
+
+                int InitializerOfAGenericClass() => Factory<int>.Empty /*warns*/switch { Some<int> => 0 };
+
+                async Task<int> Awaited() => await Opt.SomeLater(1) /*warns*/switch { None => 0 };
+
+                int OutArgument()
+                {
+                    Opt.Out(1, out var option);
+                    return option /*warns*/switch { None => 0 };
                 }
             }
             """

@@ -14,6 +14,58 @@ public class AddMissingArmsCodeFixTests
         public record Owner(Pet Pet);
         """;
 
+    /// <summary>
+    /// The snippet with Windows line breaks, indented with tabs.
+    /// </summary>
+    private static string WithCrLfAndTabs(string text) =>
+        text.ReplaceLineEndings("\r\n").Replace("    ", "\t");
+
+    [Fact]
+    public Task Add_missing_arms_after_a_comment_ending_the_last_arm() =>
+        Verify.CodeFix(new AddMissingArmsCodeFix(), """
+            class C
+            {
+                int M(Pet pet) => pet switch
+                {
+                    Cat => 1, // meow
+                };
+            }
+            """, """
+            class C
+            {
+                int M(Pet pet) => pet switch
+                {
+                    Cat => 1, // meow
+                    Dog => throw new NotImplementedException(),
+                    Bird => throw new NotImplementedException(),
+                };
+            }
+            """
+        );
+
+    [Fact]
+    public Task Add_missing_arms_after_a_comment_ending_the_last_arm_without_a_trailing_comma() =>
+        Verify.CodeFix(new AddMissingArmsCodeFix(), """
+            class C
+            {
+                int M(Pet pet) => pet switch
+                {
+                    Cat => 1 // meow
+                };
+            }
+            """, """
+            class C
+            {
+                int M(Pet pet) => pet switch
+                {
+                    Cat => 1, // meow
+                    Dog => throw new NotImplementedException(),
+                    Bird => throw new NotImplementedException()
+                };
+            }
+            """
+        );
+
     [Fact]
     public Task Add_missing_arms_alongside_when_arms() =>
         Verify.CodeFix(new AddMissingArmsCodeFix(), """
@@ -25,6 +77,53 @@ public class AddMissingArmsCodeFixTests
             class C
             {
                 int M(Pet pet, bool flag) => pet switch { Cat => 1, _ when flag => 2, Dog => throw new NotImplementedException(), Bird => throw new NotImplementedException() };
+            }
+            """
+        );
+
+    [Fact]
+    public Task Add_missing_arms_before_a_brace_on_the_last_arm_s_line() =>
+        Verify.CodeFix(new AddMissingArmsCodeFix(), """
+            class C
+            {
+                int M(Pet pet) => pet switch {
+                    Cat => 1,
+                    Dog => 2 };
+            }
+            """, """
+            class C
+            {
+                int M(Pet pet) => pet switch {
+                    Cat => 1,
+                    Dog => 2,
+                    Bird => throw new NotImplementedException() };
+            }
+            """
+        );
+
+    [Fact]
+    public Task Add_missing_arms_below_a_comment_above_the_first_arm() =>
+        Verify.CodeFix(new AddMissingArmsCodeFix(), """
+            class C
+            {
+                int M(Pet pet) => pet switch
+                {
+
+                    // Cats first
+                    Cat => 1,
+                };
+            }
+            """, """
+            class C
+            {
+                int M(Pet pet) => pet switch
+                {
+
+                    // Cats first
+                    Cat => 1,
+                    Dog => throw new NotImplementedException(),
+                    Bird => throw new NotImplementedException(),
+                };
             }
             """
         );
@@ -103,6 +202,33 @@ public class AddMissingArmsCodeFixTests
         );
 
     [Fact]
+    public Task Add_missing_arms_for_a_tuple_in_one_arm_per_element_that_differs() =>
+        Verify.CodeFix(new AddMissingArmsCodeFix(), """
+            class C
+            {
+                int M(Scalar left, Scalar right)
+                {
+                    if (left is bool) return 0;
+                    return (left, right) switch { (long, long) => 1, (string, string) => 2 };
+                }
+            }
+
+            public union Scalar(long, bool, string);
+            """, """
+            class C
+            {
+                int M(Scalar left, Scalar right)
+                {
+                    if (left is bool) return 0;
+                    return (left, right) switch { (long, long) => 1, (string, string) => 2, (long, bool or string) => throw new NotImplementedException(), (string, long or bool) => throw new NotImplementedException() };
+                }
+            }
+
+            public union Scalar(long, bool, string);
+            """
+        );
+
+    [Fact]
     public Task Add_missing_arms_for_a_tuple_with_a_bool() =>
         Verify.CodeFix(new AddMissingArmsCodeFix(), """
             class C
@@ -122,6 +248,25 @@ public class AddMissingArmsCodeFixTests
                     return (pet, flag) switch { (Cat, true) => 1, (Cat, false) => throw new NotImplementedException(), (Dog, _) => throw new NotImplementedException() };
                 }
             }
+            """
+        );
+
+    [Fact]
+    public Task Add_missing_arms_for_case_types_a_pattern_names_differently() =>
+        Verify.CodeFix(new AddMissingArmsCodeFix(), """
+            class C
+            {
+                int M(Mixed mixed) => mixed switch { int => 1 };
+            }
+
+            public union Mixed(int, (int, string), char?, int?[]);
+            """, """
+            class C
+            {
+                int M(Mixed mixed) => mixed switch { int => 1, ValueTuple<int, string> => throw new NotImplementedException(), char => throw new NotImplementedException(), int?[] => throw new NotImplementedException(), null => throw new NotImplementedException() };
+            }
+
+            public union Mixed(int, (int, string), char?, int?[]);
             """
         );
 
@@ -158,6 +303,29 @@ public class AddMissingArmsCodeFixTests
         );
 
     [Fact]
+    public Task Add_missing_arms_for_the_cases_when_too_much_is_missing_inside_them() =>
+        Verify.CodeFix(new AddMissingArmsCodeFix(), """
+            class C
+            {
+                int M(Group group) => group switch { Trio { A: Cat, B: Cat, C: Cat } => 1, Rock => 2 };
+            }
+
+            public record Trio(Pet A, Pet B, Pet C);
+            public record Rock;
+            public union Group(Trio, Rock);
+            """, """
+            class C
+            {
+                int M(Group group) => group switch { Trio { A: Cat, B: Cat, C: Cat } => 1, Rock => 2, Trio => throw new NotImplementedException() };
+            }
+
+            public record Trio(Pet A, Pet B, Pet C);
+            public record Rock;
+            public union Group(Trio, Rock);
+            """
+        );
+
+    [Fact]
     public Task Add_missing_arms_for_the_union_a_case_holds() =>
         Verify.CodeFix(new AddMissingArmsCodeFix(), """
             class C
@@ -170,6 +338,25 @@ public class AddMissingArmsCodeFixTests
                 int M(Thing t) => t switch { Pet and (Cat or Dog) => 1, Rock => 2, Pet and Bird => throw new NotImplementedException() };
             }
             """ + Nested
+        );
+
+    [Fact]
+    public Task Add_missing_arms_for_the_values_of_an_enum_no_member_has() =>
+        Verify.CodeFix(new AddMissingArmsCodeFix(), """
+            class C
+            {
+                int M(Pet pet, Color color) => (pet, color) switch { (Cat, Color.Red) => 1, (Cat, Color.Green) => 2, (Dog, _) => 3 };
+            }
+
+            public enum Color { Red, Green }
+            """, """
+            class C
+            {
+                int M(Pet pet, Color color) => (pet, color) switch { (Cat, Color.Red) => 1, (Cat, Color.Green) => 2, (Dog, _) => 3, (Cat, not (Color.Red or Color.Green)) => throw new NotImplementedException(), (Bird, _) => throw new NotImplementedException() };
+            }
+
+            public enum Color { Red, Green }
+            """
         );
 
     [Fact]
@@ -222,6 +409,25 @@ public class AddMissingArmsCodeFixTests
         );
 
     [Fact]
+    public Task Add_missing_arms_inside_a_case_qualifies_a_case_type_a_member_of_its_name_hides() =>
+        Verify.CodeFix(new AddMissingArmsCodeFix(), """
+            class C
+            {
+                public Dog Dog { get; } = new("Rex");
+
+                int M(Young y) => y switch { Kitten { Toy: Mouse } => 1 };
+            }
+            """ + Nested, """
+            class C
+            {
+                public Dog Dog { get; } = new("Rex");
+
+                int M(Young y) => y switch { Kitten { Toy: Mouse } => 1, Kitten { Toy: Ball } => throw new NotImplementedException(), global::Dog => throw new NotImplementedException() };
+            }
+            """ + Nested
+        );
+
+    [Fact]
     public Task Add_missing_arms_names_a_case_type_whose_parts_are_all_missing() =>
         Verify.CodeFix(new AddMissingArmsCodeFix(), """
             class C
@@ -242,6 +448,22 @@ public class AddMissingArmsCodeFixTests
             class C
             {
                 int M(object value) => value switch { int => 1 };
+            }
+            """, expected: null
+        );
+
+    [Fact]
+    public Task Add_missing_arms_not_offered_with_arms_in_an_inactive_if() =>
+        Verify.CodeFix(new AddMissingArmsCodeFix(), """
+            class C
+            {
+                int M(Pet pet) => pet switch
+                {
+                    Cat => 1,
+            #if DEBUG
+                    Dog => 2,
+            #endif
+                };
             }
             """, expected: null
         );
@@ -274,6 +496,33 @@ public class AddMissingArmsCodeFixTests
         );
 
     [Fact]
+    public Task Add_missing_arms_qualifies_a_case_type_a_member_of_its_name_hides() =>
+        Verify.CodeFix(new AddMissingArmsCodeFix(), """
+            class C
+            {
+                public Failure Failure { get; } = new("x");
+
+                int M(Outcome outcome) => outcome switch { Success => 1 };
+            }
+
+            public record Success;
+            public record Failure(string Reason);
+            public union Outcome(Success, Failure);
+            """, """
+            class C
+            {
+                public Failure Failure { get; } = new("x");
+
+                int M(Outcome outcome) => outcome switch { Success => 1, global::Failure => throw new NotImplementedException() };
+            }
+
+            public record Success;
+            public record Failure(string Reason);
+            public union Outcome(Success, Failure);
+            """
+        );
+
+    [Fact]
     public Task Add_missing_arms_skips_what_earlier_code_ruled_out() =>
         Verify.CodeFix(new AddMissingArmsCodeFix(), """
             class C
@@ -294,6 +543,46 @@ public class AddMissingArmsCodeFixTests
                 }
             }
             """
+        );
+
+    [Fact]
+    public Task Add_missing_arms_with_a_using_for_the_exception() =>
+        Verify.CodeFix(new AddMissingArmsCodeFix(), """
+            class C
+            {
+                int M(Pet pet) => pet switch { Cat => 1 };
+            }
+            """, """
+            using System;
+
+            class C
+            {
+                int M(Pet pet) => pet switch { Cat => 1, Dog => throw new NotImplementedException(), Bird => throw new NotImplementedException() };
+            }
+            """, usings: false
+        );
+
+    [Fact]
+    public Task Add_missing_arms_with_the_file_s_line_breaks_and_indentation() =>
+        Verify.CodeFix(new AddMissingArmsCodeFix(), WithCrLfAndTabs("""
+            class C
+            {
+                int M(Pet pet) => pet switch
+                {
+                    Cat => 1,
+                };
+            }
+            """), WithCrLfAndTabs("""
+            class C
+            {
+                int M(Pet pet) => pet switch
+                {
+                    Cat => 1,
+                    Dog => throw new NotImplementedException(),
+                    Bird => throw new NotImplementedException(),
+                };
+            }
+            """)
         );
 
     [Fact]
@@ -375,5 +664,26 @@ public class AddMissingArmsCodeFixTests
                 int N(Pet pet, Pet other) => pet switch { Cat => other switch { Cat => 1, Dog => throw new NotImplementedException(), Bird => throw new NotImplementedException() }, Dog => 2, Bird => throw new NotImplementedException() };
             }
             """
+        );
+
+    [Fact]
+    public Task Fix_all_with_one_using_for_the_exception() =>
+        Verify.FixAll(new AddMissingArmsCodeFix(), """
+            class C
+            {
+                int M(Pet pet) => pet switch { Cat => 1 };
+
+                int N(Pet pet) => pet switch { Dog => 1 };
+            }
+            """, """
+            using System;
+
+            class C
+            {
+                int M(Pet pet) => pet switch { Cat => 1, Dog => throw new NotImplementedException(), Bird => throw new NotImplementedException() };
+
+                int N(Pet pet) => pet switch { Dog => 1, Cat => throw new NotImplementedException(), Bird => throw new NotImplementedException() };
+            }
+            """, usings: false
         );
 }

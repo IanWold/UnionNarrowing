@@ -10,6 +10,8 @@ public class AddThrowingDefaultCodeFixTests
     [Fact]
     public Task Add_a_throwing_default_for_a_return() =>
         Verify.CodeFix(new AddThrowingDefaultCodeFix(), """
+            using System.Diagnostics;
+
             class C
             {
                 int M(Pet pet)
@@ -23,6 +25,8 @@ public class AddThrowingDefaultCodeFixTests
                 }
             }
             """, """
+            using System.Diagnostics;
+
             class C
             {
                 int M(Pet pet)
@@ -33,7 +37,7 @@ public class AddThrowingDefaultCodeFixTests
                         case Cat: return 1;
                         case Dog: return 2;
                         default:
-                            throw new System.Diagnostics.UnreachableException();
+                            throw new UnreachableException();
                     }
                 }
             }
@@ -41,8 +45,48 @@ public class AddThrowingDefaultCodeFixTests
         );
 
     [Fact]
+    public Task Add_a_throwing_default_and_a_using_for_its_exception() =>
+        Verify.CodeFix(new AddThrowingDefaultCodeFix(), """
+            using System;
+
+            class C
+            {
+                int M(Pet pet)
+                {
+                    switch (pet)
+                    {
+                        case Cat: return 1;
+                        case Dog: return 2;
+                        case Bird: return 3;
+                    }
+                }
+            }
+            """, """
+            using System;
+            using System.Diagnostics;
+
+            class C
+            {
+                int M(Pet pet)
+                {
+                    switch (pet)
+                    {
+                        case Cat: return 1;
+                        case Dog: return 2;
+                        case Bird: return 3;
+                        default:
+                            throw new UnreachableException();
+                    }
+                }
+            }
+            """, usings: false
+        );
+
+    [Fact]
     public Task Add_a_throwing_default_for_an_assignment() =>
         Verify.CodeFix(new AddThrowingDefaultCodeFix(), """
+            using System.Diagnostics;
+
             class C
             {
                 int M(Pet pet)
@@ -58,6 +102,8 @@ public class AddThrowingDefaultCodeFixTests
                 }
             }
             """, """
+            using System.Diagnostics;
+
             class C
             {
                 int M(Pet pet)
@@ -69,7 +115,7 @@ public class AddThrowingDefaultCodeFixTests
                         case Dog: legs = 4; break;
                         case Bird: legs = 2; break;
                         default:
-                            throw new System.Diagnostics.UnreachableException();
+                            throw new UnreachableException();
                     }
                     return legs;
                 }
@@ -80,6 +126,8 @@ public class AddThrowingDefaultCodeFixTests
     [Fact]
     public Task Add_a_throwing_default_in_a_getter() =>
         Verify.CodeFix(new AddThrowingDefaultCodeFix(), """
+            using System.Diagnostics;
+
             class C
             {
                 readonly Pet _pet = new Cat("Tom");
@@ -98,6 +146,8 @@ public class AddThrowingDefaultCodeFixTests
                 }
             }
             """, """
+            using System.Diagnostics;
+
             class C
             {
                 readonly Pet _pet = new Cat("Tom");
@@ -112,7 +162,7 @@ public class AddThrowingDefaultCodeFixTests
                             case Dog: return 4;
                             case Bird: return 2;
                             default:
-                                throw new System.Diagnostics.UnreachableException();
+                                throw new UnreachableException();
                         }
                     }
                 }
@@ -126,6 +176,8 @@ public class AddThrowingDefaultCodeFixTests
     [Fact]
     public Task Add_a_throwing_default_in_a_lambda() =>
         Verify.CodeFix(new AddThrowingDefaultCodeFix(), """
+            using System.Diagnostics;
+
             class C
             {
                 Func<Pet, int> Legs() => pet =>
@@ -139,6 +191,8 @@ public class AddThrowingDefaultCodeFixTests
                 };
             }
             """, """
+            using System.Diagnostics;
+
             class C
             {
                 Func<Pet, int> Legs() => pet =>
@@ -149,7 +203,7 @@ public class AddThrowingDefaultCodeFixTests
                         case Dog: return 4;
                         case Bird: return 2;
                         default:
-                            throw new System.Diagnostics.UnreachableException();
+                            throw new UnreachableException();
                     }
                 };
             }
@@ -159,6 +213,8 @@ public class AddThrowingDefaultCodeFixTests
     [Fact]
     public Task Add_a_throwing_default_in_a_local_function() =>
         Verify.CodeFix(new AddThrowingDefaultCodeFix(), """
+            using System.Diagnostics;
+
             class C
             {
                 int M(Pet pet)
@@ -177,6 +233,8 @@ public class AddThrowingDefaultCodeFixTests
                 }
             }
             """, """
+            using System.Diagnostics;
+
             class C
             {
                 int M(Pet pet)
@@ -191,7 +249,7 @@ public class AddThrowingDefaultCodeFixTests
                             case Dog: return 4;
                             case Bird: return 2;
                             default:
-                                throw new System.Diagnostics.UnreachableException();
+                                throw new UnreachableException();
                         }
                     }
                 }
@@ -201,6 +259,56 @@ public class AddThrowingDefaultCodeFixTests
 
     [Fact]
     public Task Fix_all() =>
+        Verify.FixAll(new AddThrowingDefaultCodeFix(), """
+            using System.Diagnostics;
+
+            class C
+            {
+                int M(Pet pet)
+                {
+                    switch (pet)
+                    {
+                        case Cat: return 1;
+                        case Dog or Bird: return 2;
+                    }
+                }
+
+                int N(Pet pet)
+                {
+                    if (pet is Cat) return 1;
+                    else if (pet is Dog) return 2;
+                    else if (pet is Bird) return 3;
+                }
+            }
+            """, """
+            using System.Diagnostics;
+
+            class C
+            {
+                int M(Pet pet)
+                {
+                    switch (pet)
+                    {
+                        case Cat: return 1;
+                        case Dog or Bird: return 2;
+                        default:
+                            throw new UnreachableException();
+                    }
+                }
+
+                int N(Pet pet)
+                {
+                    if (pet is Cat) return 1;
+                    else if (pet is Dog) return 2;
+                    else if (pet is Bird) return 3;
+                    throw new UnreachableException();
+                }
+            }
+            """
+        );
+
+    [Fact]
+    public Task Fix_all_with_one_using_for_the_exception() =>
         Verify.FixAll(new AddThrowingDefaultCodeFix(), """
             class C
             {
@@ -216,11 +324,13 @@ public class AddThrowingDefaultCodeFixTests
                 int N(Pet pet)
                 {
                     if (pet is Cat) return 1;
-                    else if (pet is Dog) return 2;
-                    else if (pet is Bird) return 3;
+                    if (pet is Dog) return 2;
+                    if (pet is Bird) return 3;
                 }
             }
             """, """
+            using System.Diagnostics;
+
             class C
             {
                 int M(Pet pet)
@@ -230,19 +340,19 @@ public class AddThrowingDefaultCodeFixTests
                         case Cat: return 1;
                         case Dog or Bird: return 2;
                         default:
-                            throw new System.Diagnostics.UnreachableException();
+                            throw new UnreachableException();
                     }
                 }
 
                 int N(Pet pet)
                 {
                     if (pet is Cat) return 1;
-                    else if (pet is Dog) return 2;
-                    else if (pet is Bird) return 3;
-                    throw new System.Diagnostics.UnreachableException();
+                    if (pet is Dog) return 2;
+                    if (pet is Bird) return 3;
+                    throw new UnreachableException();
                 }
             }
-            """
+            """, usings: false
         );
 
     [Fact]
@@ -265,6 +375,8 @@ public class AddThrowingDefaultCodeFixTests
     [Fact]
     public Task Throw_after_ifs_that_test_every_case() =>
         Verify.CodeFix(new AddThrowingDefaultCodeFix(), """
+            using System.Diagnostics;
+
             class C
             {
                 int M(Pet pet)
@@ -275,6 +387,8 @@ public class AddThrowingDefaultCodeFixTests
                 }
             }
             """, """
+            using System.Diagnostics;
+
             class C
             {
                 int M(Pet pet)
@@ -282,7 +396,7 @@ public class AddThrowingDefaultCodeFixTests
                     if (pet is Cat) return 1;
                     else if (pet is Dog) return 2;
                     else if (pet is Bird) return 3;
-                    throw new System.Diagnostics.UnreachableException();
+                    throw new UnreachableException();
                 }
             }
             """

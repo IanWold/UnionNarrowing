@@ -250,6 +250,26 @@ internal class SwitchCoverage
     }
 
     /// <summary>
+    /// The <paramref name="cases"/> of a value that earlier code rules out by ruling out everything one of their members can be:
+    /// after <c>if (r is Err { Error: Invalid }) return; if (r is Err { Error: Missing }) return;</c>, where an Error can only be Invalid or Missing, r isn't an Err.
+    /// Only members that are unions or of a closed type, and that the analysis follows.
+    /// </summary>
+    private static CaseSet RuledOutInside(TrackedValue value, CaseSpace space, IEnumerable<ITypeSymbol> cases, SyntaxNode switchNode, SemanticModel model, Session session, CancellationToken ct)
+    {
+        var followsMutableState = session.FollowsMutableState(switchNode.SyntaxTree);
+        var ruledOut = cases.Where(caseType => caseType.GetMembers().Any(member =>
+            member switch { IFieldSymbol { IsStatic: false, IsImplicitlyDeclared: false } field => field.Type, IPropertySymbol { IsStatic: false, IsIndexer: false } property => property.Type, _ => null } is { } memberType
+            && CaseSpace.OfElement(memberType, switchNode.SpanStart, model, ct) is { IsOfTypes: true } memberSpace
+            && value.Through([new CaseStep(caseType), new MemberStep(member)], model.Compilation, followsMutableState) is { } place
+            && Narrowing.IsTrackable(place, switchNode, model, ct)
+            && Narrowing.Excluded(switchNode, place, memberSpace, model, ct) is var excluded
+            && memberSpace.Cases.All(excluded.Contains) && (!memberSpace.NullMatters || excluded.IncludesNull)
+        ));
+
+        return CaseSet.Of(ruledOut);
+    }
+
+    /// <summary>
     /// The cases that <c>when</c> clauses handle between them, over the values of the bools they test:
     /// <c>Cat when loud =&gt; 1, Cat when !loud =&gt; 2</c> handles Cat, whatever loud is.
     /// A bool counts if it's a local or by-value parameter the analysis can follow, and no clause writes it.
@@ -389,6 +409,19 @@ internal class SwitchCoverage
             {
                 missing.Add(combination);
             }
+        }
+
+        if (missing.Count > 0)
+        {
+            var inside = inputs.Select((each, i) => each.Value is { } value
+                ? RuledOutInside(value, each.Space, missing.Select(m => m[i]).OfType<ITypeSymbol>().Distinct<ITypeSymbol>(SymbolEqualityComparer.Default), switchNode, model, session, ct)
+                : CaseSet.Empty
+            ).ToList();
+
+            var stillMissing = missing.Where(combination => !inside.Zip(combination, (set, candidate) => set.ContainsCase(candidate)).Any(x => x)).ToList();
+            
+            thanksToAnalysis |= stillMissing.Count < missing.Count;
+            missing = stillMissing;
         }
 
         // Arms that look inside the input (at the union a case holds, or a union member) may handle what's missing at

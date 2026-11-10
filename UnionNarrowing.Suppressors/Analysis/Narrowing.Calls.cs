@@ -22,7 +22,7 @@ internal static partial class Narrowing
         function = function.OriginalDefinition;
 
         var body = function.DeclaringSyntaxReferences.Length == 1 ? function.DeclaringSyntaxReferences[0].GetSyntax(ct) : null;
-        if (body is null || Functions.CallerScopes(function, body, model, ct) is not { } scopes)
+        if (body is null || Functions.CallerScopes(function, body, model, context.Value.Session, ct) is not { } scopes)
         {
             return CaseSet.Empty;
         }
@@ -239,7 +239,8 @@ internal static partial class Narrowing
         : function.MethodKind switch
         {
             MethodKind.AnonymousFunction => FactsFromLinqSource(parameter, context) | FactsFromDelegateCalls(parameter, context),
-            MethodKind.LocalFunction or MethodKind.Ordinary or MethodKind.Constructor => FactsFromCallers(function, parameter, context),
+            MethodKind.LocalFunction => FactsFromCallers(function, parameter, context),
+            MethodKind.Ordinary or MethodKind.Constructor when context.Value.Session.FollowsCallers => FactsFromCallers(function, parameter, context),
             _ => CaseSet.Empty,
         };
 

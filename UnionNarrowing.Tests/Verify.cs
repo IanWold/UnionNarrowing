@@ -106,26 +106,11 @@ internal static partial class Verify
     public static DiagnosticAnalyzer IdePopulateSwitchStatement =>
         IdePopulateSwitchAnalyzers[1];
 
-    private static async Task<Document> Apply(CodeAction action, Document document, CancellationToken ct)
-    {
-        var operation = Assert.Single((await action.GetOperationsAsync(ct)).OfType<ApplyChangesOperation>());
-        return operation.ChangedSolution.GetDocument(document.Id)!;
-    }
-
     /// <summary>
-    /// The fixed code has to be <paramref name="expected"/>, compile, and no longer have anything the fix is for, once the suppressor has had its say:
-    /// an arm Add missing arms leaves out because earlier code ruled its case out still gets CS8509 from the compiler, which the suppressor has to agree with and silence.
+    /// Every diagnostic, from the compiler and <paramref name="analyzer"/>, with the suppressor's suppressions.
     /// </summary>
-    private static async Task CheckFixed(
-        Document fixedDocument, string expected, CodeFixProvider fix, DiagnosticAnalyzer? analyzer, CancellationToken ct, bool someLeftAlone = false, bool usings = true
-    )
+    private static async Task<ImmutableArray<Diagnostic>> AfterTheSuppressor(Document document, DiagnosticAnalyzer? analyzer, CancellationToken ct)
     {
-        Assert.Equal((usings ? Usings : "") + expected + Types, (await fixedDocument.GetTextAsync(ct)).ToString());
-
-        var compilation = (await fixedDocument.Project.GetCompilationAsync(ct))!;
-        var errors = compilation.GetDiagnostics(ct).Where(d => d.Severity == DiagnosticSeverity.Error).ToList();
-        Assert.True(errors.Count == 0, "The fixed code doesn't compile:\n" + string.Join("\n", errors));
-
         var analyzers = ImmutableArray.Create<DiagnosticAnalyzer>(new UnionNarrowingSuppressor());
         if (analyzer is not null)
         {
@@ -139,9 +124,35 @@ internal static partial class Verify
             logAnalyzerExecutionTime: false,
             reportSuppressedDiagnostics: true
         );
-        var left = (await compilation.WithAnalyzers(analyzers, options).GetAllDiagnosticsAsync(ct))
-            .Where(d => fix.FixableDiagnosticIds.Contains(d.Id) && !d.IsSuppressed)
-            .ToList();
+        return await (await document.Project.GetCompilationAsync(ct))!.WithAnalyzers(analyzers, options).GetAllDiagnosticsAsync(ct);
+    }
+
+    private static async Task<Document> Apply(CodeAction action, Document document, CancellationToken ct)
+    {
+        var operation = Assert.Single((await action.GetOperationsAsync(ct)).OfType<ApplyChangesOperation>());
+        return operation.ChangedSolution.GetDocument(document.Id)!;
+    }
+
+    /// <summary>
+    /// The fixed code has to be <paramref name="expected"/>, compile, and no longer have anything the fix is for, nor any warning <paramref name="document"/> didn't have, once the suppressor has had its say:
+    /// an arm Add missing arms leaves out because earlier code ruled its case out still gets CS8509 from the compiler, which the suppressor has to agree with and silence.
+    /// What's compiled is the fixed text parsed again, not the fix's syntax tree, which can hold nodes that the text they print as doesn't parse back to.
+    /// </summary>
+    private static async Task CheckFixed(Document document, Document fixedDocument, string expected, CodeFixProvider fix, DiagnosticAnalyzer? analyzer, CancellationToken ct, bool someLeftAlone = false, bool usings = true)
+    {
+        var fixedText = (await fixedDocument.GetTextAsync(ct)).ToString();
+        Assert.Equal((usings ? Usings : "") + expected + Types, fixedText);
+        fixedDocument = fixedDocument.WithText(SourceText.From(fixedText));
+
+        var diagnostics = await AfterTheSuppressor(fixedDocument, analyzer, ct);
+        var errors = diagnostics.Where(d => d.Severity == DiagnosticSeverity.Error).ToList();
+        Assert.True(errors.Count == 0, "The fixed code doesn't compile:\n" + string.Join("\n", errors));
+
+        var warningsBefore = WarningsLeft(await AfterTheSuppressor(document, analyzer, ct), fix).ToList();
+        var added = WarningsLeft(diagnostics, fix).GroupBy(d => d.Id).Where(same => same.Count() > warningsBefore.Count(d => d.Id == same.Key)).SelectMany(same => same).ToList();
+        Assert.True(added.Count == 0, "The fixed code has warnings it didn't have before:\n" + string.Join("\n", added));
+
+        var left = diagnostics.Where(d => fix.FixableDiagnosticIds.Contains(d.Id) && !d.IsSuppressed).ToList();
         if (someLeftAlone)
         {
             Assert.True(left.Count > 0, $"Nothing was left alone, so {nameof(someLeftAlone)} isn't needed.");
@@ -193,7 +204,7 @@ internal static partial class Verify
         );
     }
 
-    private static Document CreateDocument(AdhocWorkspace workspace, string source, IEnumerable<string>? enabled, bool usings)
+    private static Document CreateDocument(AdhocWorkspace workspace, string source, IEnumerable<string>? enabled, bool usings, IEnumerable<MetadataReference>? references = null)
     {
         var projectId = ProjectId.CreateNewId();
         var documentId = DocumentId.CreateNewId(projectId);
@@ -210,7 +221,7 @@ internal static partial class Verify
                     specificDiagnosticOptions: (enabled ?? []).Select(id => KeyValuePair.Create(id, ReportDiagnostic.Info))
                 ),
                 parseOptions: new CSharpParseOptions(LanguageVersion.Latest),
-                metadataReferences: FrameworkReferences
+                metadataReferences: FrameworkReferences.AddRange(references ?? [])
             ))
             .AddDocument(documentId, "Test.cs", (usings ? Usings : "") + source + Types);
         return solution.GetDocument(documentId)!;
@@ -367,6 +378,12 @@ internal static partial class Verify
     }
 
     /// <summary>
+    /// The warnings the suppressor leaves in place, apart from those <paramref name="fix"/> is for.
+    /// </summary>
+    private static IEnumerable<Diagnostic> WarningsLeft(IEnumerable<Diagnostic> diagnostics, CodeFixProvider fix) =>
+        diagnostics.Where(d => d.Severity == DiagnosticSeverity.Warning && !d.IsSuppressed && !fix.FixableDiagnosticIds.Contains(d.Id));
+
+    /// <summary>
     /// Where a position is, for messages:
     /// its line, and the members and local functions it's in, like <c>line 12 (in Partly)</c> or <c>line 30 (in AfterTheGuard.Local)</c>.
     /// </summary>
@@ -444,17 +461,22 @@ internal static partial class Verify
     }
 
     /// <summary>
-    /// Applies <paramref name="fix"/> to the one diagnostic it fixes in <paramref name="source"/> (from the compiler, or from <paramref name="analyzer"/>) and checks the result is <paramref name="expected"/>, still compiles, and no longer has that diagnostic once the suppressor has run.
+    /// Applies <paramref name="fix"/> to the one diagnostic it fixes in <paramref name="source"/> (from the compiler, or from <paramref name="analyzer"/>) and checks the result is <paramref name="expected"/>, still compiles, and no longer has that diagnostic, nor any warning it didn't have, once the suppressor has run.
     /// With <paramref name="expected"/> null, checks that the fix isn't offered.
     /// </summary>
     /// <param name="enabled">Rules that are off by default, turned on.</param>
     /// <param name="usings">Whether to put <see cref="Usings"/> before the snippet.
     /// Without them, the snippet has only the usings it declares.</param>
-    public static async Task CodeFix(CodeFixProvider fix, string source, string? expected, DiagnosticAnalyzer? analyzer = null, IEnumerable<string>? enabled = null, bool usings = true)
+    /// <param name="title">What the fix has to be called, if it matters.</param>
+    /// <param name="references">Assemblies the snippet uses, from <see cref="CompileToMetadata"/>.</param>
+    public static async Task CodeFix(
+        CodeFixProvider fix, string source, string? expected, DiagnosticAnalyzer? analyzer = null, IEnumerable<string>? enabled = null, bool usings = true, string? title = null,
+        IEnumerable<MetadataReference>? references = null
+    )
     {
         var ct = TestContext.Current.CancellationToken;
         using var workspace = new AdhocWorkspace();
-        var document = CreateDocument(workspace, source, enabled, usings);
+        var document = CreateDocument(workspace, source, enabled, usings, references);
         var diagnostic = Assert.Single(await FixableDiagnostics(document, fix, analyzer, ct));
 
         var actions = new List<CodeAction>();
@@ -465,7 +487,13 @@ internal static partial class Verify
             return;
         }
 
-        await CheckFixed(await Apply(Assert.Single(actions), document, ct), expected, fix, analyzer, ct, usings: usings);
+        var offered = Assert.Single(actions);
+        if (title is not null)
+        {
+            Assert.Equal(title, offered.Title);
+        }
+
+        await CheckFixed(document, await Apply(offered, document, ct), expected, fix, analyzer, ct, usings: usings);
     }
 
     /// <summary>
@@ -540,11 +568,15 @@ internal static partial class Verify
     /// <param name="enabled">Rules that are off by default, turned on.</param>
     /// <param name="someLeftAlone">Some diagnostics are left in place on purpose, because the fix isn't offered for them.
     /// Then what's checked is that the fix isn't offered for any that are left.</param>
-    public static async Task FixAll(CodeFixProvider fix, string source, string expected, DiagnosticAnalyzer? analyzer = null, IEnumerable<string>? enabled = null, bool someLeftAlone = false)
+    /// <param name="usings">Whether to put <see cref="Usings"/> before the snippet.
+    /// Without them, the snippet has only the usings it declares.</param>
+    public static async Task FixAll(
+        CodeFixProvider fix, string source, string expected, DiagnosticAnalyzer? analyzer = null, IEnumerable<string>? enabled = null, bool someLeftAlone = false, bool usings = true
+    )
     {
         var ct = TestContext.Current.CancellationToken;
         using var workspace = new AdhocWorkspace();
-        var document = CreateDocument(workspace, source, enabled, usings: true);
+        var document = CreateDocument(workspace, source, enabled, usings);
         var diagnostics = await FixableDiagnostics(document, fix, analyzer, ct);
         Assert.True(diagnostics.Length >= 2, $"Fix All needs at least two diagnostics to fix, but there are {diagnostics.Length}. For one, use {nameof(CodeFix)}.");
 
@@ -556,7 +588,7 @@ internal static partial class Verify
         var context = new FixAllContext(document, fix, FixAllScope.Document, Assert.Single(actions).EquivalenceKey, fix.FixableDiagnosticIds, new GivenDiagnostics(diagnostics), ct);
         var action = await provider.GetFixAsync(context);
         Assert.NotNull(action);
-        await CheckFixed(await Apply(action, document, ct), expected, fix, analyzer, ct, someLeftAlone);
+        await CheckFixed(document, await Apply(action, document, ct), expected, fix, analyzer, ct, someLeftAlone, usings);
     }
 
     /// <summary>

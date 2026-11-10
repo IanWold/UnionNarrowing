@@ -550,6 +550,152 @@ public class MemberTests
             """
         );
 
+
+    [Fact]
+    public Task Lambdas_made_while_the_object_is_constructed() =>
+        Verify.Suppressions("""
+            class Early
+            {
+                private readonly Pet _pet;
+                public Func<int> Legs = () => 0;
+                public Func<int> Later = () => 0;
+
+                public Early(Pet pet)
+                {
+                    _pet = new Cat("Tom");
+                    Init();
+                    _pet = pet;
+                }
+
+                // Runs before the constructor sets _pet for good.
+                void Init()
+                {
+                    if (_pet is Bird) return;
+                    Legs = () => _pet /*warns*/switch { Cat => 4, Dog => 4 };
+                }
+
+                public void Reset()
+                {
+                    if (_pet is Bird) return;
+                    Later = () => _pet /*suppressed*/switch { Cat => 4, Dog => 4 };
+                }
+            }
+
+            abstract class Base
+            {
+                protected Base() => Setup();
+                protected abstract void Setup();
+            }
+
+            class Derived : Base
+            {
+                private readonly Pet _pet;
+                public Func<int> Legs = () => 0;
+
+                public Derived(Pet pet) => _pet = pet;
+
+                // The base constructor calls this before _pet is set.
+                protected override void Setup()
+                {
+                    if (_pet is Bird) return;
+                    Legs = () => _pet /*warns*/switch { Cat => 4, Dog => 4 };
+                }
+            }
+            """
+        );
+
+
+    [Fact]
+    public Task Lambdas_made_while_the_object_is_constructed_in_other_ways() =>
+        Verify.Suppressions("""
+            static class Other
+            {
+                public static void Go() => Statics.Make();
+            }
+
+            class Statics
+            {
+                private static readonly Pet s_pet;
+                public static Func<int> Legs = () => 0;
+
+                static Statics()
+                {
+                    s_pet = new Cat("Tom");
+                    Other.Go();
+                    s_pet = new Bird("Polly");
+                }
+
+                public static void Make()
+                {
+                    if (s_pet is Bird) return;
+                    Legs = () => s_pet /*warns*/switch { Cat => 4, Dog => 4 };
+                }
+            }
+
+            class Initialized
+            {
+                private readonly Pet _pet;
+                public Func<int> Legs = () => 0;
+
+                public Pet Pet { init { MakeLambda(); _pet = value; } }
+
+                public Initialized() => _pet = new Cat("Tom");
+
+                void MakeLambda()
+                {
+                    if (_pet is Bird) return;
+                    Legs = () => _pet /*warns*/switch { Cat => 4, Dog => 4 };
+                }
+            }
+
+            class Owner
+            {
+                public readonly Pet Pet;
+                public Func<int> Legs = () => 0;
+
+                public Owner(Pet pet)
+                {
+                    Pet = new Cat("Tom");
+                    Make(this);
+                    Pet = pet;
+                }
+
+                static void Make(Owner owner)
+                {
+                    if (owner.Pet is Bird) return;
+                    owner.Legs = () => owner.Pet /*warns*/switch { Cat => 4, Dog => 4 };
+                }
+            }
+            """
+        );
+
+    [Fact]
+    public Task Partial_properties() =>
+        Verify.Suppressions("""
+            public partial class Owner
+            {
+                public partial Pet Pet { get; }
+            }
+
+            public partial class Owner
+            {
+                private Pet _pet = new Cat("Tom");
+                public partial Pet Pet { get => _pet; }
+                public void Change() => _pet = new Bird("Polly");
+            }
+
+            class C
+            {
+                int M(Owner owner)
+                {
+                    if (owner.Pet is Bird) return 0;
+                    owner.Change();
+                    return owner.Pet /*warns*/switch { Cat => 1, Dog => 2 };
+                }
+            }
+            """
+        );
+
     [Fact]
     public Task Root_written_between() =>
         Verify.Suppressions("""

@@ -43,13 +43,78 @@ public class HelperTests
             """
         );
 
+
+    [Fact]
+    public Task Generic_helpers_over_a_generic_union() =>
+        Verify.Suppressions("""
+            sealed record NotAsked;
+            sealed record Loading;
+            sealed record Success<T>(T Data);
+            sealed record Failure(string Error);
+            union RemoteData<T>(NotAsked, Loading, Success<T>, Failure)
+            {
+                public bool IsPending => this is NotAsked or Loading;
+            }
+
+            sealed record Ok<T>(T Value);
+            sealed record Err<E>(E Error);
+            union Result<T, E>(Ok<T>, Err<E>);
+
+            static class Ext
+            {
+                public static bool IsSettled<T>(this RemoteData<T> d) => d is Success<T> or Failure;
+                public static bool IsErr<T, E>(this Result<T, E> r) => r is Err<E>;
+                public static bool IsOkOf<T>(Result<T, string> r) => r is Ok<T>;
+            }
+
+            class C
+            {
+                int Extension(RemoteData<int> d)
+                {
+                    if (!d.IsSettled()) return 0;
+                    return d /*suppressed*/switch { Success<int> s => s.Data, Failure => -1 };
+                }
+
+                int InGenericCode<T>(RemoteData<T> d)
+                {
+                    if (!d.IsSettled()) return 0;
+                    return d /*suppressed*/switch { Success<T> => 1, Failure => -1 };
+                }
+
+                int UnionMember(RemoteData<int> d)
+                {
+                    if (d.IsPending) return 0;
+                    return d /*suppressed*/switch { Success<int> s => s.Data, Failure => -1 };
+                }
+
+                int TypeArgumentInACaseType(Result<int, string> r)
+                {
+                    if (r.IsErr()) return 0;
+                    return r /*suppressed*/switch { Ok<int> ok => ok.Value };
+                }
+
+                int Static(Result<int, string> r)
+                {
+                    if (Ext.IsOkOf(r)) return 0;
+                    return r /*suppressed*/switch { Err<string> => 1 };
+                }
+
+                int RulesOutTheWrongCase(Result<int, string> r)
+                {
+                    if (r.IsErr()) return 0;
+                    return r /*warns*/switch { Err<string> => 1 };
+                }
+            }
+            """
+        );
+
     [Fact]
     public Task Helpers_that_are_not_read() =>
         Verify.Suppressions("""
             abstract class Checker
             {
                 public virtual bool IsBird(Pet pet) => pet is Bird;
-                public bool Logs(Pet pet) { Console.WriteLine(pet); return pet is Bird; }
+                public bool Logs(Pet pet) { for (var i = 0; i < 2; i++) Console.WriteLine(pet); return pet is Bird; }
             }
 
             static class Helpers
@@ -141,6 +206,189 @@ public class HelperTests
                 {
                     if (!animal.IsPet()) return 0;
                     return animal /*suppressed*/switch { Cat => 1, Dog => 2 };
+                }
+            }
+            """
+        );
+
+
+    [Fact]
+    public Task Helpers_with_a_block_body() =>
+        Verify.Suppressions("""
+            sealed record Ok<T>(T Value);
+            sealed record Err<E>(E Error);
+            union Result<T, E>(Ok<T>, Err<E>)
+            {
+                public bool TryGetOk(out T value)
+                {
+                    if (this is Ok<T> ok)
+                    {
+                        value = ok.Value;
+                        return true;
+                    }
+
+                    value = default!;
+                    return false;
+                }
+            }
+
+            static class Pets
+            {
+                public static bool TryGetCat(this Pet pet, out Cat cat)
+                {
+                    if (pet is Cat found)
+                    {
+                        cat = found;
+                        return true;
+                    }
+
+                    cat = null!;
+                    return false;
+                }
+
+                public static bool IsGrounded(Pet pet)
+                {
+                    if (pet is Bird) return false;
+                    return true;
+                }
+
+                public static bool Unsure(Pet pet, bool flag)
+                {
+                    if (flag) return true;
+                    return pet is not Bird;
+                }
+
+                public static void AssertGrounded(Pet pet)
+                {
+                    if (pet is Bird) throw new ArgumentException("A bird", nameof(pet));
+                }
+
+                public static void AssertMaybe(Pet pet, bool strict)
+                {
+                    if (strict && pet is Bird) throw new ArgumentException("A bird", nameof(pet));
+                }
+
+                public static Cat RequireCat(Pet pet)
+                {
+                    if (pet is not Cat cat) throw new ArgumentException("Not a cat", nameof(pet));
+                    return cat;
+                }
+            }
+
+            class C
+            {
+                int TryGet(Result<int, string> r)
+                {
+                    if (!r.TryGetOk(out var value)) return 0;
+                    return r /*suppressed*/switch { Ok<int> => value };
+                }
+
+                int TryGetElse(Result<int, string> r)
+                {
+                    if (r.TryGetOk(out var value)) return value;
+                    return r /*suppressed*/switch { Err<string> e => e.Error.Length };
+                }
+
+                int TryGetExtension(Pet pet)
+                {
+                    if (pet.TryGetCat(out var cat)) return cat.Name.Length;
+                    return pet /*suppressed*/switch { Dog => 1, Bird => 2 };
+                }
+
+                int GuardThenReturn(Pet pet)
+                {
+                    if (!Pets.IsGrounded(pet)) return 0;
+                    return pet /*suppressed*/switch { Cat => 1, Dog => 2 };
+                }
+
+                int GuardThatDoesNotDecide(Pet pet, bool flag)
+                {
+                    if (!Pets.Unsure(pet, flag)) return 0;
+                    return pet /*warns*/switch { Cat => 1, Dog => 2 };
+                }
+
+                int Assertion(Pet pet)
+                {
+                    Pets.AssertGrounded(pet);
+                    return pet /*suppressed*/switch { Cat => 1, Dog => 2 };
+                }
+
+                int AssertionThatMightNotThrow(Pet pet, bool strict)
+                {
+                    Pets.AssertMaybe(pet, strict);
+                    return pet /*warns*/switch { Cat => 1, Dog => 2 };
+                }
+
+                int Requirement(Pet pet)
+                {
+                    var cat = Pets.RequireCat(pet);
+                    return pet /*suppressed*/switch { Cat => cat.Name.Length };
+                }
+            }
+            """
+        );
+
+
+    [Fact]
+    public Task Members_that_write_this_through_a_reference() =>
+        Verify.Suppressions("""
+            union Slot(Cat, Dog, Bird)
+            {
+                public bool Sneaky()
+                {
+                    ref Slot self = ref this;
+                    self = new Bird("Polly");
+                    return true;
+                }
+            }
+
+            struct Box
+            {
+                public Pet Pet;
+                public void Touch()
+                {
+                    ref Pet pet = ref Pet;
+                    pet = new Bird("Polly");
+                }
+            }
+
+            static class Generic
+            {
+                public static void AssertNotBird<T>(T value)
+                {
+                    if (value is Bird) throw new InvalidOperationException();
+                }
+
+                public static bool IsNotBird<T>(T value) => value is not Bird;
+            }
+
+            class C
+            {
+                int Union(Slot slot)
+                {
+                    if (slot is Bird) return 0;
+                    /*because*/slot.Sneaky();
+                    return slot /*warns*/switch { Cat => 1, Dog => 2 };
+                }
+
+                int Field(Box box)
+                {
+                    if (box.Pet is Bird) return 0;
+                    /*because*/box.Touch();
+                    return box.Pet /*warns*/switch { Cat => 1, Dog => 2 };
+                }
+
+                // In generic code, `value is Bird` on a T that's a union tests the boxed union, which is never a Bird.
+                int GenericAssertion(Pet pet)
+                {
+                    Generic.AssertNotBird(pet);
+                    return pet /*warns*/switch { Cat => 1, Dog => 2 };
+                }
+
+                int GenericTest(Pet pet)
+                {
+                    if (!Generic.IsNotBird(pet)) return 0;
+                    return pet /*warns*/switch { Cat => 1, Dog => 2 };
                 }
             }
             """

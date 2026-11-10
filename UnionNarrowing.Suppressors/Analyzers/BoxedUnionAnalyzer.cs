@@ -14,8 +14,8 @@ namespace UnionNarrowing.Suppressors.Analyzers;
 /// A union is a struct:
 /// boxing it boxes the union, whose run-time type is the union's, so:
 /// <list type="bullet">
-/// <item>UN0014: a type test against a case (<c>(object)pet is Cat</c>) is never true, a cast to one throws (and <c>as</c> gives null), <c>pet.Equals(cat)</c> is false, and <c>pet.GetType() == typeof(Cat)</c> is false.</item>
-/// <item>UN0015: formatting a union as text gives its type name, since it doesn't override ToString.</item>
+/// <item>UN0014: a type test against a case (<c>(object)pet is Cat</c>) is never true, a cast to one throws (and <c>as</c> gives null), <c>pet.Equals(cat)</c> (or <c>Equals(pet, cat)</c>) is false, and <c>pet.GetType() == typeof(Cat)</c> is false.</item>
+/// <item>UN0015: formatting a union (or a nullable one) as text gives its type name, unless it overrides ToString.</item>
 /// <item>UN0019: a record's generated ToString does the same for each of its public union members.</item>
 /// </list>
 /// </summary>
@@ -38,14 +38,8 @@ public sealed class BoxedUnionAnalyzer : DiagnosticAnalyzer
         var binary = (IBinaryOperation)context.Operation;
         if (binary is { OperatorKind: BinaryOperatorKind.Add, Type.SpecialType: SpecialType.System_String })
         {
-            foreach (var operand in new[] { binary.LeftOperand, binary.RightOperand })
-            {
-                if (BoxedUnion(operand) is { } boxed && !OverridesToString(boxed))
-                {
-                    ReportText(context, operand, ((IConversionOperation)operand).Operand, boxed);
-                }
-            }
-
+            ReportText(context, binary.LeftOperand, binary.LeftOperand);
+            ReportText(context, binary.RightOperand, binary.RightOperand);
             return;
         }
 
@@ -89,23 +83,28 @@ public sealed class BoxedUnionAnalyzer : DiagnosticAnalyzer
 
         var name = Name(union, conversion);
         var what = conversion.IsTryCast
-            ? $"is always null: a boxed {name} is a {name}, not one of its cases. Use a pattern on the union instead."
-            : $"always throws: a boxed {name} is a {name}, not one of its cases. Use a pattern on the union, or cast its Value.";
+            ? $"is always null: a boxed {name} is a {name}, not what it holds. Use a pattern on the union instead."
+            : $"always throws: a boxed {name} is a {name}, not what it holds. Use a pattern on the union, or cast its Value.";
 
         context.ReportDiagnostic(Diagnostic.Create(Descriptors.BoxedUnionTest, conversion.Syntax.GetLocation(), conversion.Syntax.ToString(), what));
     }
 
     /// <summary>
-    /// <c>$"{pet}"</c>
+    /// <c>$"{pet}"</c>, as a string, or through an interpolated string handler (<c>builder.Append($"{pet}")</c>), where each part is a call to the handler's <c>AppendFormatted</c> that takes any value.
     /// </summary>
     private static void AnalyzeInterpolation(OperationAnalysisContext context)
     {
-        var interpolation = (IInterpolationOperation)context.Operation;
-        var expression = interpolation.Expression is IConversionOperation { IsImplicit: true } conversion ? conversion.Operand : interpolation.Expression;
-        
-        if (expression.Type is { IsUnion: true, IsValueType: true } union && !OverridesToString(union))
+        var formatted = context.Operation switch
         {
-            ReportText(context, expression, expression, union);
+            IInterpolationOperation interpolation => interpolation.Expression,
+            IInterpolatedStringAppendOperation { AppendCall: IInvocationOperation { Arguments: { Length: > 0 } arguments } }
+                when arguments[0].Parameter?.OriginalDefinition.Type is ITypeParameterSymbol or { SpecialType: SpecialType.System_Object } => arguments[0].Value,
+            _ => null,
+        };
+
+        if (formatted is not null)
+        {
+            ReportText(context, formatted, formatted);
         }
     }
 
@@ -114,16 +113,9 @@ public sealed class BoxedUnionAnalyzer : DiagnosticAnalyzer
         var invocation = (IInvocationOperation)context.Operation;
         var method = invocation.TargetMethod;
 
-        // `pet.Equals(cat)`: a union only ever equals another of the same union.
-        if (method is { Name: "Equals", Parameters.Length: 1, IsStatic: false }
-            && method.Parameters[0].Type.SpecialType == SpecialType.System_Object
-            && invocation.Instance?.Type is { IsUnion: true, IsValueType: true } union
-            && invocation.Arguments[0].Value is IConversionOperation { Operand.Type: { } argumentType }
-            && !argumentType.IsUnion
-            && argumentType.SpecialType != SpecialType.System_Object
-            && !BoxCanBe(union, argumentType, context.Compilation)
-            && !SymbolEqualityComparer.Default.Equals(argumentType, union)
-        )
+        // `pet.Equals(cat)`, `Equals(pet, cat)`, `EqualityComparer<object>.Default.Equals(pet, cat)`: a union only ever
+        // equals another of the same union.
+        if (method.Name == "Equals" && ComparedForEquality(invocation) is var (union, other) && !BoxCanEqual(union, other, context.Compilation))
         {
             var name = Name(union, invocation);
             context.ReportDiagnostic(Diagnostic.Create(Descriptors.BoxedUnionTest, invocation.Syntax.GetLocation(), invocation.Syntax.ToString(),
@@ -145,18 +137,16 @@ public sealed class BoxedUnionAnalyzer : DiagnosticAnalyzer
         }
 
         // `pet.ToString()`
-        if (method is { Name: "ToString", Parameters.IsEmpty: true }
-            && invocation.Instance is { Type: { IsUnion: true, IsValueType: true } formatted } instance
-            && !OverridesToString(formatted)
-        )
+        if (method is { Name: "ToString", Parameters.IsEmpty: true } && invocation.Instance is { } instance)
         {
-            ReportText(context, invocation, instance, formatted);
+            ReportText(context, invocation, instance);
             return;
         }
 
         // `string.Join(", ", pets)`, `builder.AppendJoin(", ", pets)`: each element's ToString.
-        if (FormatsItsArguments(method) && method.IsGenericMethod && method.TypeArguments[0] is { IsUnion: true, IsValueType: true } elementType && !OverridesToString(elementType))
+        if (FormatsItsArguments(method) && method.IsGenericMethod && ShowsTypeName(method.TypeArguments[0]) is { } elementType)
         {
+            var held = Symbols.UnderlyingOfNullable(method.TypeArguments[0]) is null ? "x.Value" : "x?.Value";
             foreach (var argument in invocation.Arguments)
             {
                 if (argument.Parameter?.OriginalDefinition.Type is INamedTypeSymbol { OriginalDefinition.SpecialType: SpecialType.System_Collections_Generic_IEnumerable_T })
@@ -164,7 +154,7 @@ public sealed class BoxedUnionAnalyzer : DiagnosticAnalyzer
                     var sequence = argument.Value is IConversionOperation { IsImplicit: true } conversion ? conversion.Operand : argument.Value;
 
                     context.ReportDiagnostic(Diagnostic.Create(Descriptors.UnionAsText, sequence.Syntax.GetLocation(), sequence.Syntax.ToString(), Name(elementType, invocation),
-                        $"'{sequence.Syntax}.Select(x => x.Value)'"
+                        Remedy($"format '{sequence.Syntax}.Select(x => {held})' instead", elementType)
                     ));
                 }
             }
@@ -179,10 +169,7 @@ public sealed class BoxedUnionAnalyzer : DiagnosticAnalyzer
             {
                 foreach (var value in argument.Value is IArrayCreationOperation { IsImplicit: true, Initializer: { } parameters } ? parameters.ElementValues : [argument.Value])
                 {
-                    if (BoxedUnion(value) is { } boxed && !OverridesToString(boxed))
-                    {
-                        ReportText(context, value, ((IConversionOperation)value).Operand, boxed);
-                    }
+                    ReportText(context, value, value);
                 }
             }
         }
@@ -212,14 +199,13 @@ public sealed class BoxedUnionAnalyzer : DiagnosticAnalyzer
                 _ => (null, false),
             };
 
-            var union = Symbols.UnderlyingOfNullable(memberType) ?? memberType;
-            if (!printed || union is not { IsUnion: true, IsValueType: true } || OverridesToString(union) || member.Locations.IsEmpty || !member.Locations[0].IsInSource)
+            if (!printed || ShowsTypeName(memberType) is not { } union || member.Locations.IsEmpty || !member.Locations[0].IsInSource)
             {
                 continue;
             }
 
             var name = union.ToDisplayString(SymbolDisplayFormat.MinimallyQualifiedFormat);
-            context.ReportDiagnostic(Diagnostic.Create(Descriptors.RecordPrintsUnion, member.Locations[0], type.Name, member.Name, name));
+            context.ReportDiagnostic(Diagnostic.Create(Descriptors.RecordPrintsUnion, member.Locations[0], type.Name, member.Name, name, Remedy("declare PrintMembers to print its Value", union)));
         }
     }
 
@@ -245,7 +231,7 @@ public sealed class BoxedUnionAnalyzer : DiagnosticAnalyzer
         foreach (var pattern in patterns.Where(p => NeverMatches(p, union, context.Compilation)))
         {
             context.ReportDiagnostic(Diagnostic.Create(Descriptors.BoxedUnionTest, pattern.Syntax.GetLocation(), pattern.Syntax.ToString(),
-                $"never matches: a boxed {name} is a {name}, not one of its cases. Switch on the union itself, without boxing it."
+                $"never matches: a boxed {name} is a {name}, not what it holds. Switch on the union itself, without boxing it."
             ));
         }
     }
@@ -263,7 +249,7 @@ public sealed class BoxedUnionAnalyzer : DiagnosticAnalyzer
         {
             var name = Name(union, context.Operation);
             context.ReportDiagnostic(Diagnostic.Create(Descriptors.BoxedUnionTest, context.Operation.Syntax.GetLocation(), context.Operation.Syntax.ToString(),
-                $"is never true: a boxed {name} is a {name}, not one of its cases. Test the union itself, without boxing it."
+                $"is never true: a boxed {name} is a {name}, not what it holds. Test the union itself, without boxing it."
             ));
         }
     }
@@ -286,6 +272,14 @@ public sealed class BoxedUnionAnalyzer : DiagnosticAnalyzer
     }
 
     /// <summary>
+    /// Whether a boxed <paramref name="union"/> can equal <paramref name="other"/>, a value it's compared with as an object:
+    /// unless that's of a type that's neither a union nor object, and that a boxed union can't be, it might.
+    /// </summary>
+    private static bool BoxCanEqual(ITypeSymbol union, IOperation other, Compilation compilation) =>
+        other is not IConversionOperation { Operand.Type: { IsUnion: false, SpecialType: not SpecialType.System_Object } type }
+        || BoxCanBe(union, type, compilation);
+
+    /// <summary>
     /// For an operation that boxes a struct union (to object, ValueType or an interface), the union's type.
     /// </summary>
     private static ITypeSymbol? BoxedUnion(IOperation operation) =>
@@ -295,8 +289,38 @@ public sealed class BoxedUnionAnalyzer : DiagnosticAnalyzer
             : null;
 
     /// <summary>
+    /// For an <c>Equals</c> call that compares a struct union with another value as objects, which uses the union's own Equals:
+    /// <c>pet.Equals(x)</c>, the static <c>object.Equals(pet, x)</c>, or <c>EqualityComparer&lt;object&gt;.Default.Equals(pet, x)</c> (either way round).
+    /// The union's type, and the other value.
+    /// </summary>
+    private static (ITypeSymbol Union, IOperation Other)? ComparedForEquality(IInvocationOperation invocation)
+    {
+        var method = invocation.TargetMethod;
+        if (method is { IsStatic: false, Parameters.Length: 1 } && method.Parameters[0].Type.SpecialType == SpecialType.System_Object)
+        {
+            return invocation.Instance?.Type is { IsUnion: true, IsValueType: true } union ? (union, invocation.Arguments[0].Value) : null;
+        }
+
+        var objectEquals = method is { IsStatic: true, ContainingType.SpecialType: SpecialType.System_Object };
+        var defaultComparer = invocation.Instance is IPropertyReferenceOperation { Property.Name: "Default", Type: var comparer }
+            && Symbols.Is(comparer, "EqualityComparer", 1, "System", "Collections", "Generic");
+
+        if (!(objectEquals || defaultComparer) || method.Parameters.Length != 2 || !method.Parameters.All(p => p.Type.SpecialType == SpecialType.System_Object))
+        {
+            return null;
+        }
+
+        var (left, right) = (invocation.Arguments[0].Value, invocation.Arguments[1].Value);
+        return BoxedUnion(left) is { } leftUnion
+            ? (leftUnion, right)
+            : BoxedUnion(right) is { } rightUnion
+                ? (rightUnion, left)
+                : null;
+    }
+
+    /// <summary>
     /// The common ways of turning arguments into text:
-    /// Console, TextWriter, StringBuilder, string.Format, string.Concat, string.Join, Debug and Trace.
+    /// Console, TextWriter, StringBuilder, string.Format, string.Concat, string.Join, Convert.ToString, Debug and Trace, and a logger's messages and scopes.
     /// </summary>
     private static bool FormatsItsArguments(IMethodSymbol method)
     {
@@ -313,9 +337,10 @@ public sealed class BoxedUnionAnalyzer : DiagnosticAnalyzer
         {
             ("System", "Console", "Write" or "WriteLine") => true,
             ("System.Text", "StringBuilder", "Append" or "AppendLine" or "Insert" or "AppendFormat" or "AppendJoin") => true,
-            ("Microsoft.Extensions.Logging", "LoggerExtensions", "Log" or "LogTrace" or "LogDebug" or "LogInformation" or "LogWarning" or "LogError" or "LogCritical") => true,
+            ("Microsoft.Extensions.Logging", "LoggerExtensions", "Log" or "LogTrace" or "LogDebug" or "LogInformation" or "LogWarning" or "LogError" or "LogCritical" or "BeginScope") => true,
             ("System", "String", "Format" or "Concat" or "Join") => true,
-            ("System.Diagnostics", "Debug" or "Trace", "Write" or "WriteLine" or "Print" or "WriteIf" or "WriteLineIf") => true,
+            ("System", "Convert", "ToString") => true,
+            ("System.Diagnostics", "Debug" or "Trace", "Write" or "WriteLine" or "Print" or "WriteIf" or "WriteLineIf" or "TraceInformation" or "TraceWarning" or "TraceError") => true,
             _ => false,
         };
     }
@@ -339,11 +364,40 @@ public sealed class BoxedUnionAnalyzer : DiagnosticAnalyzer
             _ => false,
         };
 
-    private static bool OverridesToString(ITypeSymbol union) =>
-        union.GetMembers("ToString").OfType<IMethodSymbol>().Any(m => m is { IsOverride: true, Parameters.IsEmpty: true });
+    /// <summary>
+    /// What to do about a union that shows its type name:
+    /// <paramref name="here"/>, or, for a union declared in this compilation, override its ToString, which fixes it everywhere.
+    /// </summary>
+    private static string Remedy(string here, ITypeSymbol union) =>
+        union.DeclaringSyntaxReferences.IsEmpty ? here : $"{here}, or override ToString in {union.Name}";
 
-    private static void ReportText(OperationAnalysisContext context, IOperation reported, IOperation union, ITypeSymbol unionType) =>
-        context.ReportDiagnostic(Diagnostic.Create(Descriptors.UnionAsText, reported.Syntax.GetLocation(), reported.Syntax.ToString(), Name(unionType, reported), $"'{union.Syntax}.Value'"));
+    /// <summary>
+    /// Reports <paramref name="formatted"/>, a value turned into text (as it is, or boxed on the way), if it's a union that shows its type name.
+    /// </summary>
+    /// <param name="reported">Where to report it: the value, or a call to its ToString.</param>
+    private static void ReportText(OperationAnalysisContext context, IOperation reported, IOperation formatted)
+    {
+        var value = formatted is IConversionOperation { IsImplicit: true } conversion && conversion.GetConversion().IsBoxing ? conversion.Operand : formatted;
+        if (ShowsTypeName(value.Type) is not { } union)
+        {
+            return;
+        }
+
+        var held = Symbols.UnderlyingOfNullable(value.Type) is null ? ".Value" : "?.Value";
+        context.ReportDiagnostic(Diagnostic.Create(Descriptors.UnionAsText, reported.Syntax.GetLocation(), reported.Syntax.ToString(), Name(union, reported),
+            Remedy($"format '{value.Syntax}{held}' instead", union)
+        ));
+    }
+
+    /// <summary>
+    /// The struct union a value of <paramref name="type"/> is (or holds, as a nullable), if formatting it gives the union's type name:
+    /// the union doesn't override ToString.
+    /// </summary>
+    private static ITypeSymbol? ShowsTypeName(ITypeSymbol? type) =>
+        (Symbols.UnderlyingOfNullable(type) ?? type) is { IsUnion: true, IsValueType: true } union
+        && !union.GetMembers("ToString").OfType<IMethodSymbol>().Any(m => m is { IsOverride: true, Parameters.IsEmpty: true })
+            ? union
+            : null;
 
     public override void Initialize(AnalysisContext context)
     {
@@ -354,7 +408,7 @@ public sealed class BoxedUnionAnalyzer : DiagnosticAnalyzer
         context.RegisterOperationAction(AnalyzeConversion, OperationKind.Conversion);
         context.RegisterOperationAction(AnalyzeInvocation, OperationKind.Invocation);
         context.RegisterOperationAction(AnalyzeBinary, OperationKind.Binary);
-        context.RegisterOperationAction(AnalyzeInterpolation, OperationKind.Interpolation);
+        context.RegisterOperationAction(AnalyzeInterpolation, OperationKind.Interpolation, OperationKind.InterpolatedStringAppendFormatted);
         context.RegisterSymbolAction(AnalyzeRecord, SymbolKind.NamedType);
     }
 }

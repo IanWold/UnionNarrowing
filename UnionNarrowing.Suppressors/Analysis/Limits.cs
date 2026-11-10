@@ -23,6 +23,11 @@ internal static class Limits
     public const int Combinations = 4096;
 
     /// <summary>
+    /// How many members of a type its constructors and initializers are followed into, to find what can run while an object is constructed.
+    /// </summary>
+    public const int ConstructionCalls = 32;
+
+    /// <summary>
     /// How many copies back (<c>var b = a; var c = b;</c>) a value is followed, or more generally, how many times one walk starts another (from a copy, a call, an assignment).
     /// </summary>
     public const int Copies = 6;
