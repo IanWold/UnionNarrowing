@@ -11,7 +11,7 @@ Good things to open an issue for:
 
 ## Development setup
 
-You'll need the .NET 11 SDK pinned in [global.json](global.json) (RC 2 or later). The `Microsoft.CodeAnalysis.*` packages come from the `dotnet-tools` feed that [nuget.config](nuget.config) adds, so there's nothing else to set up.
+You'll need the .NET 11 SDK pinned in [global.json](global.json) (`11.0.100` or later). The `Microsoft.CodeAnalysis.*` packages come from the `dotnet-tools` feed that [nuget.config](nuget.config) adds, so there's nothing else to set up.
 
 ```bash
 dotnet build
