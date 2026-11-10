@@ -8,6 +8,8 @@ UnionNarrowing
 
 Roslyn diagnostic fixes to enhance unions in C# 15+
 
+[Tour](#quick-tour) • [Reference](https://github.com/IanWold/UnionNarrowing/wiki)
+
 </div>
 
 ---
