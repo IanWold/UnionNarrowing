@@ -40,7 +40,7 @@ Or add it to the project file yourself:
 
 The package contains only analyzers and is marked as a development dependency. It adds nothing to your build output, and it doesn't become a dependency of your own package.
 
-**Requirements:** C# 15, which means the .NET 11 SDK, RC 2 (`11.0.100-rc.2`) or later. The analyzers are built against that compiler's version of Roslyn, so older compilers can't load them. They run in `dotnet build`, Visual Studio and Rider.
+**Requirements:** C# 15, which means the .NET 11 SDK (`11.0.100`) or later. The analyzers are built against that compiler's version of Roslyn, so older compilers can't load them. They run in `dotnet build`, Visual Studio and Rider.
 
 ## Why does a switch over a union still warn?
 
