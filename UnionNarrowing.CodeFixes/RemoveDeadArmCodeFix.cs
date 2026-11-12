@@ -1,4 +1,16 @@
+using System.Collections.Generic;
 using System.Collections.Immutable;
+using System.Composition;
+using System.Linq;
+using System.Threading;
+using System.Threading.Tasks;
+using Microsoft.CodeAnalysis;
+using Microsoft.CodeAnalysis.CodeActions;
+using Microsoft.CodeAnalysis.CodeFixes;
+using Microsoft.CodeAnalysis.CSharp;
+using Microsoft.CodeAnalysis.CSharp.Syntax;
+using UnionNarrowing.Suppressors.Analyzers;
+using static Microsoft.CodeAnalysis.CSharp.SyntaxFactory;
 
 namespace UnionNarrowing.CodeFixes;
 
@@ -92,12 +104,12 @@ file class Remover : CSharpSyntaxRewriter
         }
 
         var trailingComma = arms.SeparatorCount == arms.Count;
-        if (!trailingComma && list[^1].IsToken && directives.Count == 0)
+        if (!trailingComma && list[list.Count - 1].IsToken && directives.Count == 0)
         {
-            var comma = list[^1].AsToken();
+            var comma = list[list.Count - 1].AsToken();
             list.RemoveAt(list.Count - 1);
             var ending = comma.TrailingTrivia.Any(t => t.IsKind(SyntaxKind.EndOfLineTrivia)) ? comma.TrailingTrivia : arms[arms.Count - 1].GetTrailingTrivia();
-            list[^1] = list[^1].AsNode()!.WithTrailingTrivia(ending);
+            list[list.Count - 1] = list[list.Count - 1].AsNode()!.WithTrailingTrivia(ending);
         }
 
         return visited

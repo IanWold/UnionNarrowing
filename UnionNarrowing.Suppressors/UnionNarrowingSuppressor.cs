@@ -1,4 +1,13 @@
+using System;
 using System.Collections.Immutable;
+using System.Linq;
+using System.Threading;
+using Microsoft.CodeAnalysis;
+using Microsoft.CodeAnalysis.CSharp.Syntax;
+using Microsoft.CodeAnalysis.Diagnostics;
+using Microsoft.CodeAnalysis.Operations;
+using UnionNarrowing.Suppressors.Analysis;
+using UnionNarrowing.Suppressors.Analyzers;
 
 namespace UnionNarrowing.Suppressors;
 
