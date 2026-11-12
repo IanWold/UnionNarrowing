@@ -34,7 +34,7 @@ internal static partial class Narrowing
                 continue;
             }
 
-            if (current is not IInvocationOperation { TargetMethod: var method } invocation)
+            if (current is not IInvocationOperation { TargetMethod: var method } invocation || Functions.IsIntercepted(invocation))
             {
                 break;
             }
@@ -128,6 +128,7 @@ internal static partial class Narrowing
         var operation = Functions.PassedLambda(parameter, context.Start, context.Model, context.CancellationToken);
 
         if (operation?.Parent is not IArgumentOperation { Parameter.Name: var parameterName, Parent: IInvocationOperation invocation }
+            || Functions.IsIntercepted(invocation)
             || Sequences.ElementSource(invocation, parameterName, parameter.Ordinal) is not { } source
             || !SymbolEqualityComparer.Default.Equals(Sequences.ElementType(source), parameter.Type)
         )

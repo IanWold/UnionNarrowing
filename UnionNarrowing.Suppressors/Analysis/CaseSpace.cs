@@ -1,10 +1,4 @@
-using System.Collections.Generic;
 using System.Collections.Immutable;
-using System.Linq;
-using System.Threading;
-using Microsoft.CodeAnalysis;
-using Microsoft.CodeAnalysis.CSharp.Syntax;
-using Microsoft.CodeAnalysis.Operations;
 
 namespace UnionNarrowing.Suppressors.Analysis;
 
@@ -423,6 +417,38 @@ internal class CaseSpace
     /// </summary>
     public ITypeSymbol Interpret(ITypeSymbol type, Compilation compilation) =>
         TypeArguments.Apply(type, compilation);
+
+    /// <summary>
+    /// This space of generic code, as it is at a use of <paramref name="member"/> (a call to the method whose parameter it's the space of):
+    /// its case types (in the same order) and union with what the type parameters stand for there in place.
+    /// </summary>
+    public CaseSpace At(ISymbol member, Compilation compilation)
+    {
+        var typeArguments = TypeArguments.For(member, compilation);
+        if (!IsOfTypes || typeArguments == TypeArguments)
+        {
+            return this;
+        }
+
+        object Constructed(object candidate) =>
+            candidate is ITypeSymbol type ? typeArguments.Apply(type, compilation) : candidate;
+
+        return new CaseSpace(
+            Kind,
+            [.. Cases.Select(Constructed)],
+            NullMatters,
+            Type is null ? null : typeArguments.Apply(Type, compilation),
+            NullOnlyAsNoValue,
+            UnionType is null ? null : typeArguments.Apply(UnionType, compilation),
+            _origins.ToImmutableDictionary(pair => Constructed(pair.Key), pair => typeArguments.Apply(pair.Value, compilation), CaseComparer.Instance)
+        );
+    }
+
+    /// <summary>
+    /// What <paramref name="excluded"/>, in <paramref name="at"/> (this space at a use, see <see cref="At"/>), rules out of this space's cases: those in the same places.
+    /// </summary>
+    public CaseSet FromUse(CaseSet excluded, CaseSpace at) =>
+        at == this ? excluded : CaseSet.Of(Cases.Where((_, i) => excluded.ContainsCase(at.Cases[i])), excluded.IncludesNull);
 
     /// <summary>
     /// This space, for reading the code of <paramref name="member"/> in place of a use of it (a helper's body for a call to it, a method's returns for what a call gives):

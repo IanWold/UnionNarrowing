@@ -16,7 +16,9 @@ namespace UnionNarrowing.Suppressors.Analysis;
 /// </summary>
 /// <param name="followsCallers">Whether what a method's or constructor's callers pass it counts as known about its parameters (see Narrowing).
 /// Local functions and lambdas get what their callers pass either way: those are in plain sight, in the function they're written in.</param>
-internal class Session(AnalyzerConfigOptionsProvider options, bool followsCallers = true)
+/// <param name="followsCallees">Whether what a method returns, or sets an <c>out</c> argument to, counts as known about the value a call gives (see Narrowing).
+/// Local functions count either way, as for <paramref name="followsCallers"/>.</param>
+internal class Session(AnalyzerConfigOptionsProvider options, bool followsCallers = true, bool followsCallees = true)
 {
     /// <summary>
     /// What <see cref="VariableUsage.Analyze"/> depends on:
@@ -57,7 +59,21 @@ internal class Session(AnalyzerConfigOptionsProvider options, bool followsCaller
     public bool FollowsCallers =>
         followsCallers;
 
+    /// <summary>
+    /// Whether what a method returns, or sets an <c>out</c> argument to, counts as known about the value a call to it gives.
+    /// </summary>
+    public bool FollowsCallees =>
+        followsCallees;
+
     private readonly ConcurrentDictionary<UsageKey, VariableUsage?> _usages = new();
+
+    private readonly ConcurrentDictionary<INamedTypeSymbol, bool> _seenBeforeConstructed = new(SymbolEqualityComparer.Default);
+
+    /// <summary>
+    /// Whether code can see an object of the type before its constructors are done (see <see cref="Functions.CanBeSeenBeforeConstructed"/>), worked out once for each type.
+    /// </summary>
+    public bool CanBeSeenBeforeConstructed(INamedTypeSymbol type, Compilation compilation) =>
+        _seenBeforeConstructed.GetOrAdd(type.OriginalDefinition, definition => Functions.CanBeSeenBeforeConstructed(definition, compilation));
 
     private bool ReadFollowsMutableState(SyntaxTree tree) =>
         (options.GetOptions(tree).TryGetValue(FollowMutableStateKey, out var value) || options.GlobalOptions.TryGetValue(FollowMutableStateKey, out value))

@@ -386,4 +386,44 @@ public class LinqTests
             }
             """
         );
+
+    [Fact]
+    public Task Async_sequences_and_parallel_loops() =>
+        Verify.Suppressions("""
+            using System.Collections.Generic;
+            using System.Linq;
+            using System.Threading.Tasks;
+
+            class C
+            {
+                async Task<int> Read(IAsyncEnumerable<Pet> inbox)
+                {
+                    var n = 0;
+                    await foreach (var pet in inbox.TakeWhile(p => p is not Bird))
+                    {
+                        n += pet /*suppressed*/switch { Cat => 1, Dog => 2 };
+                    }
+
+                    return n;
+                }
+
+                IAsyncEnumerable<int> Selected(IAsyncEnumerable<Pet> inbox) =>
+                    inbox.Where(p => p is not Bird).Select(p => p /*suppressed*/switch { Cat => 1, Dog => 2 });
+
+                async Task<int> Unfiltered(IAsyncEnumerable<Pet> inbox)
+                {
+                    var n = 0;
+                    await foreach (var pet in inbox)
+                    {
+                        n += pet /*warns*/switch { Cat => 1, Dog => 2 };
+                    }
+
+                    return n;
+                }
+
+                void Parallel(List<Pet> pets) =>
+                    System.Threading.Tasks.Parallel.ForEach(pets.Where(p => p is not Bird), pet => Console.WriteLine(pet /*suppressed*/switch { Cat => 1, Dog => 2 }));
+            }
+            """
+        );
 }

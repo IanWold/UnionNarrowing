@@ -1,3 +1,4 @@
+using System;
 using System.Collections.Generic;
 using System.Collections.Immutable;
 using System.Linq;
@@ -16,7 +17,7 @@ namespace UnionNarrowing.Suppressors.Analyzers;
 /// <list type="bullet">
 /// <item>UN0003: <c>default(U)</c>, <c>default</c> and <c>new U()</c>.</item>
 /// <item>UN0006: <c>new U[n]</c>, whose elements all start out as the default, and APIs that create, grow, clear or pool arrays.</item>
-/// <item>UN0010: methods that fall back to the default, like <c>FirstOrDefault()</c>, or that say so with <c>T?</c> or <c>[MaybeNull]</c>;
+/// <item>UN0010: methods that fall back to the default, like <c>FirstOrDefault()</c>, or that say so with <c>T?</c>, <c>[MaybeNull]</c> or a <c>Task&lt;T?&gt;</c>;
 /// and a Try method's out value, read when it failed.</item>
 /// <item>UN0018: the default of a struct or tuple with such a union inside it, unless an object initializer (or <c>with</c>) sets every one.</item>
 /// </list>
@@ -24,8 +25,8 @@ namespace UnionNarrowing.Suppressors.Analyzers;
 /// <remarks>
 /// Doesn't report <c>default</c> assigned to an <c>out</c> parameter:
 /// that's how a Try method says "nothing here", and the caller isn't supposed to look.
-/// Nor <c>default!</c>, which says the default is meant;
-/// nor a default that's only ever tested (<c>FirstOrDefault() is Cat c</c>, or a switch with a <c>null</c> or discard arm), or put in a local that's assigned again before it's read.
+/// Nor <c>default!</c> (or <c>new Pet[n]!</c>), which says the default is meant;
+/// nor a default that's only ever tested (<c>FirstOrDefault() is Cat c</c>, or a switch with a <c>null</c> or discard arm), put in a local that's assigned again before it's read, or checked for before every use of it.
 /// </remarks>
 [DiagnosticAnalyzer(LanguageNames.CSharp)]
 public sealed class DefaultUnionAnalyzer : DiagnosticAnalyzer
@@ -40,6 +41,7 @@ public sealed class DefaultUnionAnalyzer : DiagnosticAnalyzer
             || creation.Initializer is not null
             || creation.Type is not IArrayTypeSymbol { ElementType: var elementType }
             || creation.DimensionSizes.All(size => size.ConstantValue is { HasValue: true, Value: 0 })
+            || IsForgiven(creation)
             || FilledRightAway(creation)
         )
         {
@@ -48,7 +50,7 @@ public sealed class DefaultUnionAnalyzer : DiagnosticAnalyzer
 
         if (CaseSpace.DefaultHoldsNoCase(elementType))
         {
-            context.ReportDiagnostic(Diagnostic.Create(Descriptors.DefaultUnionArray, creation.Syntax.GetLocation(), creation.Syntax.ToString(), Display(elementType, creation), "fills the array with"));
+            context.ReportDiagnostic(Diagnostic.Create(Descriptors.DefaultUnionArray, creation.Syntax.GetLocation(), creation.Syntax.ToString(), Display(elementType, creation), "fills the array with", Forgiving(creation)));
         }
         else if (UnionInside(elementType) is { } inside)
         {
@@ -95,7 +97,7 @@ public sealed class DefaultUnionAnalyzer : DiagnosticAnalyzer
         }
 
         context.ReportDiagnostic(direct
-            ? Diagnostic.Create(Descriptors.DefaultUnion, operation.Syntax.GetLocation(), operation.Syntax.ToString(), Display(type!, operation))
+            ? Diagnostic.Create(Descriptors.DefaultUnion, operation.Syntax.GetLocation(), operation.Syntax.ToString(), Display(type!, operation), Forgiving(operation))
             : Diagnostic.Create(Descriptors.DefaultStructWithUnion, operation.Syntax.GetLocation(), operation.Syntax.ToString(), Display(inside!.Value.Union, operation), inside.Value.Path)
         );
     }
@@ -104,7 +106,7 @@ public sealed class DefaultUnionAnalyzer : DiagnosticAnalyzer
     /// Library methods that hand back default unions:
     /// by creating one, by filling (part of) an array with them, or by falling back to one.
     /// </summary>
-    private static void AnalyzeInvocation(OperationAnalysisContext context)
+    private static void AnalyzeInvocation(OperationAnalysisContext context, Session session)
     {
         var invocation = (IInvocationOperation)context.Operation;
         var method = invocation.TargetMethod;
@@ -147,10 +149,10 @@ public sealed class DefaultUnionAnalyzer : DiagnosticAnalyzer
         };
 
         // A generic method of your own that returns `default` for its type parameter, or any generic method that says
-        // it may (`T?`, `[MaybeNull]`).
+        // it may (`T?`, `[MaybeNull]`, `Task<T?>`).
         if (descriptor is null && (ReturnsDefaultOfTypeParameter(method, context.CancellationToken) || MayReturnDefault(method)))
         {
-            (descriptor, unionType, detail) = (Descriptors.DefaultUnionFallback, method.ReturnType, "on some paths");
+            (descriptor, unionType, detail) = (Descriptors.DefaultUnionFallback, TaskResult(method.ReturnType) ?? method.ReturnType, "on some paths");
         }
 
         AnalyzeOutArguments(context, invocation);
@@ -161,16 +163,23 @@ public sealed class DefaultUnionAnalyzer : DiagnosticAnalyzer
             return;
         }
 
-        // Only what the code goes on to use: not a default that's just tested.
-        if (descriptor == Descriptors.DefaultUnionFallback && OnlyTested(invocation))
+        // Only what the code goes on to use: not a fallback that's just tested, or checked for before it's used, nor a
+        // default said to be meant (`ArrayPool<Pet>.Shared.Rent(n)!`).
+        var given = Given(invocation);
+        if (descriptor == Descriptors.DefaultUnionFallback ? OnlyTested(given) || CheckedBeforeUse(given, session, context.CancellationToken) : IsForgiven(invocation))
         {
             return;
         }
 
-        var location = invocation.Syntax.GetLocation();
+        var location = given.Syntax.GetLocation();
         if (CaseSpace.DefaultHoldsNoCase(unionType))
         {
-            context.ReportDiagnostic(Diagnostic.Create(descriptor, location, invocation.Syntax.ToString(), Display(unionType, invocation), detail));
+            var (code, display) = (given.Syntax.ToString(), Display(unionType, invocation));
+            context.ReportDiagnostic(
+                descriptor == Descriptors.DefaultUnion ? Diagnostic.Create(descriptor, location, code, display, Forgiving(invocation))
+                : descriptor == Descriptors.DefaultUnionArray ? Diagnostic.Create(descriptor, location, code, display, detail, Forgiving(invocation))
+                : Diagnostic.Create(descriptor, location, code, display, detail)
+            );
         }
         else if (descriptor != Descriptors.DefaultUnion && UnionInside(unionType) is { } inside)
         {
@@ -264,6 +273,38 @@ public sealed class DefaultUnionAnalyzer : DiagnosticAnalyzer
         }
     }
 
+    /// <summary>
+    /// Whether a pattern on a union declares a variable that holds the union itself (<c>is { } found</c>, <c>is var found</c>), which a default union gets into:
+    /// <c>{ }</c> is always true for a struct.
+    /// </summary>
+    private static bool BindsTheValue(IPatternOperation pattern, ITypeSymbol? type) => CaseSpace.DefaultHoldsNoCase(type) && pattern.DescendantsAndSelf().Any(part => part switch
+    {
+        IDeclarationPatternOperation { DeclaredSymbol: ILocalSymbol local } => SymbolEqualityComparer.Default.Equals(local.Type, type),
+        IRecursivePatternOperation { DeclaredSymbol: ILocalSymbol local } => SymbolEqualityComparer.Default.Equals(local.Type, type),
+        _ => false,
+    });
+
+    /// <summary>
+    /// Whether the default is put in a local whose every use checks for it first (<c>var last = changes.LastOrDefault(); if (last is null) return null;</c>):
+    /// each read of the local only tests it (see <see cref="OnlyTested"/>), is in a condition that tells the default apart (see <see cref="TellsTheDefaultApart"/>), or comes where earlier code rules the default out.
+    /// </summary>
+    private static bool CheckedBeforeUse(IOperation given, Session session, CancellationToken ct)
+    {
+        if (Outermost(given).Parent is not IVariableInitializerOperation { Parent: IVariableDeclaratorOperation { Symbol: var local } declarator }
+            || declarator.Syntax.FirstAncestorOrSelf<BlockSyntax>() is not { } scope
+            || given.SemanticModel is not { } model
+        )
+        {
+            return false;
+        }
+
+        return Symbols.References(local, scope, model, ct)
+            .Where(name => !WriteAnalysis.IsWrite(name, model, ct))
+            .All(name => model.GetOperation(name, ct) is { } read && CaseSpace.Of(read, model, ct) is { } space
+                && (OnlyTested(read) || TellsTheDefaultApart(read, space, session) || Narrowing.ExcludedBefore(read.Syntax, read, space, model, session, ct).IncludesNull)
+            );
+    }
+
     private static string Display(ITypeSymbol type, IOperation operation) =>
         type.ToMinimalDisplayString(operation.SemanticModel!, operation.Syntax.SpanStart);
 
@@ -282,73 +323,113 @@ public sealed class DefaultUnionAnalyzer : DiagnosticAnalyzer
     }
 
     /// <summary>
-    /// Whether a new array put in a local is filled right after:
-    /// by <c>Array.Fill(array, value)</c>, or by a <c>for (var i = 0; i &lt; array.Length; i++)</c> loop whose body starts with <c>array[i] = ...;</c>.
+    /// Whether the first of <paramref name="statements"/> that uses the array named <paramref name="array"/> fills it (see <see cref="Fills"/>).
     /// </summary>
-    private static bool FilledRightAway(IArrayCreationOperation creation)
+    private static bool FilledFirst(IEnumerable<StatementSyntax> statements, string array, string size) =>
+        statements.FirstOrDefault(statement => Mentions(statement, array)) is { } first && Fills(first, array, size);
+
+    /// <summary>
+    /// Whether a new array put in a local is filled before anything reads it:
+    /// the first statement after it that uses the array fills it (see <see cref="Fills"/>).
+    /// </summary>
+    private static bool FilledRightAway(IArrayCreationOperation creation) =>
+        creation.DimensionSizes.Length == 1
+        && Outermost(creation).Parent is IVariableInitializerOperation { Parent: IVariableDeclaratorOperation { Symbol: var local } declarator }
+        && declarator.Syntax.FirstAncestorOrSelf<LocalDeclarationStatementSyntax>() is { Parent: BlockSyntax block } statement
+        && FilledFirst(block.Statements.Skip(block.Statements.IndexOf(statement) + 1), local.Name, creation.DimensionSizes[0].Syntax.ToString());
+
+    /// <summary>
+    /// Whether a statement fills the array named <paramref name="array"/>, of length <paramref name="size"/>, before it reads it:
+    /// <c>Array.Fill(array, value)</c>, <c>array.AsSpan().Fill(value)</c> or <c>new Span&lt;Pet&gt;(array).Fill(value)</c>;
+    /// a copy into it (<c>Array.Copy(source, array, n)</c>, <c>source.CopyTo(array)</c>);
+    /// a <c>for (var i = 0; i &lt; array.Length; i++)</c> loop that sets <c>array[i]</c> before it uses the array any other way, or a <c>foreach</c> loop that sets <c>array[n++]</c> that way;
+    /// or an <c>if</c> each of whose branches fills it.
+    /// </summary>
+    private static bool Fills(StatementSyntax statement, string array, string size)
     {
-        if (creation.DimensionSizes.Length != 1
-            || Outermost(creation).Parent is not IVariableInitializerOperation { Parent: IVariableDeclaratorOperation { Symbol: var local } declarator }
-            || declarator.Syntax.FirstAncestorOrSelf<LocalDeclarationStatementSyntax>() is not { Parent: BlockSyntax block } statement
-        )
+        bool IsTheArray(ExpressionSyntax expression) =>
+            expression is IdentifierNameSyntax { Identifier.ValueText: var name } && name == array;
+
+        bool SetsAnElementFirst(StatementSyntax body, Func<ExpressionSyntax, bool> isTheIndex) =>
+            (body is BlockSyntax block ? block.Statements.FirstOrDefault(s => Mentions(s, array)) : body) is ExpressionStatementSyntax
+            {
+                Expression: AssignmentExpressionSyntax
+                {
+                    RawKind: (int)SyntaxKind.SimpleAssignmentExpression,
+                    Left: ElementAccessExpressionSyntax { Expression: var target, ArgumentList.Arguments: { Count: 1 } indexes },
+                    Right: var value,
+                },
+            }
+            && IsTheArray(target) && isTheIndex(indexes[0].Expression) && !Mentions(value, array);
+
+        switch (statement)
         {
-            return false;
-        }
+            case BlockSyntax block:
+                return FilledFirst(block.Statements, array, size);
 
-        var index = block.Statements.IndexOf(statement);
-        if (index + 1 >= block.Statements.Count)
-        {
-            return false;
-        }
+            case IfStatementSyntax { Else: { } otherwise } ifStatement:
+                return !Mentions(ifStatement.Condition, array) && Fills(ifStatement.Statement, array, size) && Fills(otherwise.Statement, array, size);
 
-        var name = local.Name;
-        var size = creation.DimensionSizes[0].Syntax.ToString();
+            case ExpressionStatementSyntax { Expression: InvocationExpressionSyntax { Expression: MemberAccessExpressionSyntax call, ArgumentList.Arguments: var arguments } }:
+                var destination = (call.Name.Identifier.ValueText, call.Expression.ToString(), arguments.Count) switch
+                {
+                    ("Fill", "Array" or "System.Array", 2) => 0,
+                    ("Copy", "Array" or "System.Array", 3) => 1,
+                    ("Copy" or "ConstrainedCopy", "Array" or "System.Array", 5) => 2,
+                    ("CopyTo", _, 1 or 2) => 0,
+                    _ => (int?)null,
+                };
 
-        switch (block.Statements[index + 1])
-        {
-            // `array.AsSpan().Fill(value)`, `new Span<Pet>(array).Fill(value)`
-            case ExpressionStatementSyntax { Expression: InvocationExpressionSyntax { Expression: MemberAccessExpressionSyntax { Name.Identifier.ValueText: "Fill", Expression: var span } } fillCall }
-                when fillCall.ArgumentList.Arguments.Count == 1
-                    && (span is InvocationExpressionSyntax { Expression: MemberAccessExpressionSyntax { Name.Identifier.ValueText: "AsSpan", Expression: IdentifierNameSyntax { Identifier.ValueText: var spanned } }, ArgumentList.Arguments.Count: 0 } && spanned == name
-                        || span is ObjectCreationExpressionSyntax { ArgumentList.Arguments: { Count: 1 } spanArguments } && spanArguments[0].Expression is IdentifierNameSyntax { Identifier.ValueText: var wrapped } && wrapped == name
-                    ):
-                return true;
+                // `array.AsSpan().Fill(value)`, `new Span<Pet>(array).Fill(value)`
+                var spanFilled = call.Name.Identifier.ValueText == "Fill" && arguments.Count == 1 && call.Expression switch
+                {
+                    InvocationExpressionSyntax { Expression: MemberAccessExpressionSyntax { Name.Identifier.ValueText: "AsSpan", Expression: var spanned }, ArgumentList.Arguments.Count: 0 } => IsTheArray(spanned),
+                    ObjectCreationExpressionSyntax { ArgumentList.Arguments: { Count: 1 } wrapped } => IsTheArray(wrapped[0].Expression),
+                    _ => false,
+                };
 
-            case ExpressionStatementSyntax { Expression: InvocationExpressionSyntax { Expression: MemberAccessExpressionSyntax { Name.Identifier.ValueText: "Fill" } fill } call }
-                when fill.Expression.ToString() is "Array" or "System.Array"
-                    && call.ArgumentList.Arguments.Count == 2
-                    && call.ArgumentList.Arguments[0].Expression is IdentifierNameSyntax { Identifier.ValueText: var filled } && filled == name:
-                return true;
+                return spanFilled && !Mentions(arguments[0], array)
+                    || destination is { } at && IsTheArray(arguments[at].Expression) && !Mentions(call.Expression, array) && arguments.Where((_, i) => i != at).All(a => !Mentions(a, array));
 
             case ForStatementSyntax
             {
                 Declaration.Variables: { Count: 1 } variables,
                 Condition: BinaryExpressionSyntax { RawKind: (int)SyntaxKind.LessThanExpression } condition,
                 Incrementors.Count: 1,
-                Statement: var body,
             } loop when variables[0] is { Initializer.Value: LiteralExpressionSyntax { Token.ValueText: "0" } } counter
                 && condition.Left is IdentifierNameSyntax { Identifier.ValueText: var i } && i == counter.Identifier.ValueText
-                && (condition.Right.ToString() == name + ".Length" || condition.Right.ToString() == size)
+                && (condition.Right.ToString() == array + ".Length" || condition.Right.ToString() == size)
                 && (loop.Incrementors[0] switch
                 {
                     PostfixUnaryExpressionSyntax { RawKind: (int)SyntaxKind.PostIncrementExpression, Operand: IdentifierNameSyntax post } => post.Identifier.ValueText,
                     PrefixUnaryExpressionSyntax { RawKind: (int)SyntaxKind.PreIncrementExpression, Operand: IdentifierNameSyntax pre } => pre.Identifier.ValueText,
                     _ => null,
                 }) == i:
-                var first = body is BlockSyntax { Statements.Count: > 0 } inner ? inner.Statements[0] : body;
-                return first is ExpressionStatementSyntax
-                {
-                    Expression: AssignmentExpressionSyntax
-                    {
-                        RawKind: (int)SyntaxKind.SimpleAssignmentExpression,
-                        Left: ElementAccessExpressionSyntax { Expression: IdentifierNameSyntax { Identifier.ValueText: var array }, ArgumentList.Arguments: { Count: 1 } arguments },
-                    },
-                } && array == name && arguments[0].Expression is IdentifierNameSyntax { Identifier.ValueText: var at } && at == i;
+                return SetsAnElementFirst(loop.Statement, index => index is IdentifierNameSyntax { Identifier.ValueText: var at } && at == i);
+
+            case ForEachStatementSyntax loop when !Mentions(loop.Expression, array):
+                return SetsAnElementFirst(loop.Statement, index => index is PostfixUnaryExpressionSyntax { RawKind: (int)SyntaxKind.PostIncrementExpression, Operand: IdentifierNameSyntax });
 
             default:
                 return false;
         }
     }
+
+    /// <summary>
+    /// What gives a call's result: the call, or for a task that's awaited right there (through <c>ConfigureAwait</c> too), the <c>await</c>.
+    /// </summary>
+    private static IOperation Given(IInvocationOperation invocation)
+    {
+        var task = invocation.Parent is IInvocationOperation { TargetMethod.Name: "ConfigureAwait" } configured && configured.Instance == invocation ? configured : (IOperation)invocation;
+        return TaskResult(invocation.TargetMethod.ReturnType) is not null && task.Parent is IAwaitOperation awaited ? awaited : invocation;
+    }
+
+    /// <summary>
+    /// The end of a message that says how to say the default is meant:
+    /// the null-forgiving operator after what gives it (<c>default!</c>, <c>new Pet[n]!</c>), where that has a value to put it on.
+    /// </summary>
+    private static string Forgiving(IOperation operation) =>
+        operation.Type is { SpecialType: not SpecialType.System_Void } ? $". Write '{operation.Syntax}!' where that's meant" : "";
 
     private static bool IsAssignedToOutParameter(IOperation operation)
     {
@@ -362,7 +443,8 @@ public sealed class DefaultUnionAnalyzer : DiagnosticAnalyzer
 
     /// <summary>
     /// Whether the expression is, on some path through it, the default of <paramref name="typeParameter"/>:
-    /// <c>default(T)</c>, or a <c>default</c> literal where a T is wanted (<c>return default;</c>, <c>value = default!;</c> for a T value, <c>flag ? default : value</c>).
+    /// <c>default(T)</c>, or a <c>default</c> literal where a T is wanted (<c>return default;</c>, <c>value = default!;</c> for a T value, <c>flag ? default : value</c>,
+    /// and <c>value ?? default</c> for a <c>T?</c> value where T is a struct, which is null without one).
     /// </summary>
     private static bool IsDefaultOf(ExpressionSyntax expression, ITypeParameterSymbol typeParameter) =>
         expression switch
@@ -370,6 +452,7 @@ public sealed class DefaultUnionAnalyzer : DiagnosticAnalyzer
             PostfixUnaryExpressionSyntax { RawKind: (int)SyntaxKind.SuppressNullableWarningExpression } suppressed => IsDefaultOf(suppressed.Operand, typeParameter),
             ParenthesizedExpressionSyntax parenthesized => IsDefaultOf(parenthesized.Expression, typeParameter),
             ConditionalExpressionSyntax conditional => IsDefaultOf(conditional.WhenTrue, typeParameter) || IsDefaultOf(conditional.WhenFalse, typeParameter),
+            BinaryExpressionSyntax { RawKind: (int)SyntaxKind.CoalesceExpression } coalesce => typeParameter.HasValueTypeConstraint && IsDefaultOf(coalesce.Right, typeParameter),
             LiteralExpressionSyntax { RawKind: (int)SyntaxKind.DefaultLiteralExpression } => true,
             DefaultExpressionSyntax { Type: IdentifierNameSyntax { Identifier.ValueText: var name } } => name == typeParameter.Name,
             _ => false,
@@ -391,18 +474,13 @@ public sealed class DefaultUnionAnalyzer : DiagnosticAnalyzer
 
     /// <summary>
     /// Whether a generic method says it can return the default for its type parameter:
-    /// a <c>T?</c> return for an unconstrained T, or <c>[return: MaybeNull]</c>.
+    /// a <c>T?</c> return for an unconstrained T, or <c>[return: MaybeNull]</c>, or a task of a <c>T?</c> (<c>Task&lt;T?&gt; GetFromJsonAsync&lt;T&gt;(...)</c>).
     /// Not LINQ's Max, Min, MaxBy and MinBy:
     /// they're annotated for the null they return for an empty sequence of a class, but throw for one of a struct.
     /// </summary>
     private static bool MayReturnDefault(IMethodSymbol method)
     {
         var definition = (method.ReducedFrom ?? method).OriginalDefinition;
-        if (definition.ReturnType is not ITypeParameterSymbol)
-        {
-            return false;
-        }
-
         if (definition.Name is "Max" or "Min" or "MaxBy" or "MinBy"
             && definition.ContainingType is { Name: "Enumerable" or "Queryable" or "ParallelEnumerable" or "ImmutableArrayExtensions" } linq
             && Symbols.Is(linq, linq.Name, 0, "System", "Linq")
@@ -411,9 +489,16 @@ public sealed class DefaultUnionAnalyzer : DiagnosticAnalyzer
             return false;
         }
 
-        return definition.ReturnNullableAnnotation == NullableAnnotation.Annotated
-            || definition.GetReturnTypeAttributes().Any(a => IsCodeAnalysisAttribute(a, "MaybeNullAttribute"));
+        return definition.ReturnType is ITypeParameterSymbol
+            ? definition.ReturnNullableAnnotation == NullableAnnotation.Annotated || definition.GetReturnTypeAttributes().Any(a => IsCodeAnalysisAttribute(a, "MaybeNullAttribute"))
+            : TaskResult(definition.ReturnType) is ITypeParameterSymbol { NullableAnnotation: NullableAnnotation.Annotated };
     }
+
+    /// <summary>
+    /// Whether <paramref name="node"/> names <paramref name="name"/> anywhere in it.
+    /// </summary>
+    private static bool Mentions(SyntaxNode node, string name) =>
+        node.DescendantNodesAndSelf().OfType<IdentifierNameSyntax>().Any(identifier => identifier.Identifier.ValueText == name);
 
     /// <summary>
     /// Whether the default is a local's initial value that nothing reads:
@@ -445,7 +530,7 @@ public sealed class DefaultUnionAnalyzer : DiagnosticAnalyzer
 
     /// <summary>
     /// Whether the default only gets tested, which it's fine for:
-    /// by a type test or pattern (<c>FirstOrDefault() is Cat c</c>), by a switch statement (where no match just does nothing), or by a switch expression with an arm that matches it (<c>null</c>, a discard, <c>var</c>).
+    /// by a type test or pattern (<c>FirstOrDefault() is Cat c</c>, but not <c>is { } found</c>, which puts it in a variable: see <see cref="BindsTheValue"/>), by a switch statement (where no match just does nothing), or by a switch expression with an arm that matches it (<c>null</c>, a discard, <c>var</c>).
     /// </summary>
     private static bool OnlyTested(IOperation operation)
     {
@@ -453,6 +538,8 @@ public sealed class DefaultUnionAnalyzer : DiagnosticAnalyzer
         switch (value.Parent)
         {
             case IIsPatternOperation isPattern when isPattern.Value == value:
+                return !BindsTheValue(isPattern.Pattern, value.Type);
+
             case IIsTypeOperation isType when isType.ValueOperand == value:
             case ISwitchOperation switchStatement when switchStatement.Value == value:
                 return true;
@@ -489,7 +576,9 @@ public sealed class DefaultUnionAnalyzer : DiagnosticAnalyzer
         };
 
     /// <summary>
-    /// Whether the value the call put in <paramref name="local"/> is read in the branch of an <c>if</c> on the call that runs when the call returned <paramref name="result"/> (<c>if (!TryGet(out var x)) { ... x ... }</c>, or the else of <c>if (TryGet(out var x))</c>).
+    /// Whether the value the call put in <paramref name="local"/> is read where the call returned <paramref name="result"/>:
+    /// in the branch of an <c>if</c> on the call that runs then (<c>if (!TryGet(out var x)) { ... x ... }</c>, or the else of <c>if (TryGet(out var x))</c>),
+    /// or after the <c>if</c>, where that branch (if it has one) can get to its end without assigning the local (<c>if (!TryGet(out var x)) { Log(); } ... x ...</c>).
     /// Not where the branch assigns the local before reading it (<c>if (!TryGet(out var x)) x = fallback;</c>).
     /// </summary>
     private static bool ReadWhereCallGave(IInvocationOperation invocation, bool result, ILocalSymbol local, SemanticModel model)
@@ -517,7 +606,19 @@ public sealed class DefaultUnionAnalyzer : DiagnosticAnalyzer
             _ => null,
         };
 
-        return flow is { Succeeded: true } && flow.DataFlowsIn.Contains(local, SymbolEqualityComparer.Default);
+        if (flow is { Succeeded: true } && flow.DataFlowsIn.Contains(local, SymbolEqualityComparer.Default))
+        {
+            return true;
+        }
+
+        var getsPast = branch?.Syntax is not StatementSyntax statementBranch
+            || model.AnalyzeControlFlow(statementBranch) is { Succeeded: true, EndPointIsReachable: true } && flow?.AlwaysAssigned.Contains(local, SymbolEqualityComparer.Default) != true;
+
+        return getsPast
+            && ifStatement.Syntax is IfStatementSyntax { Parent: BlockSyntax block } ifSyntax
+            && block.Statements.IndexOf(ifSyntax) is var index && index < block.Statements.Count - 1
+            && model.AnalyzeDataFlow(block.Statements[index + 1], block.Statements[block.Statements.Count - 1]) is { Succeeded: true } after
+            && after.DataFlowsIn.Contains(local, SymbolEqualityComparer.Default);
     }
 
     /// <summary>
@@ -587,6 +688,43 @@ public sealed class DefaultUnionAnalyzer : DiagnosticAnalyzer
     }
 
     /// <summary>
+    /// For a <c>Task&lt;T&gt;</c> or <c>ValueTask&lt;T&gt;</c>, the T that awaiting it gives.
+    /// </summary>
+    private static ITypeSymbol? TaskResult(ITypeSymbol? type) =>
+        type is INamedTypeSymbol { TypeArguments.Length: 1 } task
+        && (Symbols.Is(task, "Task", 1, "System", "Threading", "Tasks") || Symbols.Is(task, "ValueTask", 1, "System", "Threading", "Tasks"))
+            ? task.TypeArguments[0]
+            : null;
+
+    /// <summary>
+    /// Whether a read of a value is part of a test in an <c>if</c>'s (or <c>?:</c>'s) condition that's sure to be one way for the default, as <see cref="Facts"/> reads it (<c>!top.IsTopLevel</c>, with <c>IsTopLevel =&gt; this is TopLevel</c>):
+    /// a test of the default, not a use of it.
+    /// The test is as much of the condition as is between <c>!</c>, <c>&amp;&amp;</c> and <c>||</c>.
+    /// </summary>
+    private static bool TellsTheDefaultApart(IOperation read, CaseSpace space, Session session)
+    {
+        static bool Combines(IOperation operation) =>
+            operation is IUnaryOperation { OperatorKind: UnaryOperatorKind.Not } or IBinaryOperation { OperatorKind: BinaryOperatorKind.ConditionalAnd or BinaryOperatorKind.ConditionalOr };
+
+        var test = read;
+        while (test.Parent is { } parent && !Combines(parent) && parent is not IConditionalOperation)
+        {
+            test = parent;
+        }
+
+        var condition = test;
+        while (condition.Parent is { } parent && Combines(parent))
+        {
+            condition = parent;
+        }
+
+        return condition.Parent is IConditionalOperation conditional && conditional.Condition == condition
+            && TrackedValue.From(read, session) is { } value
+            && Facts.Of(test, value, space, read.SemanticModel!.Compilation) is var outcome
+            && (outcome.AlwaysTrue.IncludesNull || outcome.AlwaysFalse.IncludesNull);
+    }
+
+    /// <summary>
     /// The type in a <c>typeof(T)</c> first argument.
     /// </summary>
     private static ITypeSymbol? TypeOfArgument(IInvocationOperation invocation) =>
@@ -652,7 +790,11 @@ public sealed class DefaultUnionAnalyzer : DiagnosticAnalyzer
         context.EnableConcurrentExecution();
         context.RegisterOperationAction(AnalyzeDefault, OperationKind.DefaultValue, OperationKind.ObjectCreation);
         context.RegisterOperationAction(AnalyzeArray, OperationKind.ArrayCreation);
-        context.RegisterOperationAction(AnalyzeInvocation, OperationKind.Invocation);
         context.RegisterOperationAction(AnalyzePropertyReference, OperationKind.PropertyReference);
+        context.RegisterCompilationStartAction(start =>
+        {
+            var session = new Session(start.Options.AnalyzerConfigOptionsProvider);
+            start.RegisterOperationAction(c => AnalyzeInvocation(c, session), OperationKind.Invocation);
+        });
     }
 }

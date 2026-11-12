@@ -31,10 +31,20 @@ internal static class Statements
         breakStatement.Ancestors().OfType<StatementSyntax>().FirstOrDefault(a => a is WhileStatementSyntax or DoStatementSyntax or ForStatementSyntax or CommonForEachStatementSyntax or SwitchStatementSyntax);
 
     /// <summary>
-    /// Whether a <c>goto case</c> or <c>goto default</c> could enter a section of the switch statement without its labels matching.
+    /// Whether a <c>goto case</c> or <c>goto default</c>, or a <c>goto</c> to a label in another section, could enter a section of the switch statement without its labels matching.
     /// </summary>
-    public static bool GotosIntoSections(SwitchStatementSyntax switchStatement) =>
-        switchStatement.DescendantNodes().OfType<GotoStatementSyntax>().Any(g => !g.IsKind(SyntaxKind.GotoStatement));
+    public static bool GotosIntoSections(SwitchStatementSyntax switchStatement)
+    {
+        SwitchSectionSyntax? SectionOf(SyntaxNode node) =>
+            node.Ancestors().OfType<SwitchSectionSyntax>().FirstOrDefault(section => section.Parent == switchStatement);
+
+        return switchStatement.DescendantNodes().OfType<GotoStatementSyntax>().Any(jump =>
+            !jump.IsKind(SyntaxKind.GotoStatement)
+            || (jump.Expression is IdentifierNameSyntax target
+                && switchStatement.DescendantNodes().OfType<LabeledStatementSyntax>().Any(label => label.Identifier.ValueText == target.Identifier.ValueText && SectionOf(label) != SectionOf(jump))
+            )
+        );
+    }
 
     /// <summary>
     /// Whether a label of the switch statement is <c>default:</c>.

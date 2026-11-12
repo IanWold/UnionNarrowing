@@ -107,22 +107,26 @@ public sealed class ThrowingDefaultAnalyzer : DiagnosticAnalyzer
     }
 
     /// <summary>
-    /// Reports the cases that reach the default, if any.
+    /// Reports the cases that reach the default, if any, named as the patterns inside them that do where the arms or tests look inside (<c>Err { Error: Invalid }</c>).
     /// Returns whether it did, with what earlier code rules out.
     /// </summary>
     private static bool Report(OperationAnalysisContext context, Handling handling, Location location, string what, string container, out CaseSet excluded)
     {
         var model = context.Operation.SemanticModel!;
+        var ct = context.CancellationToken;
 
-        excluded = handling.Excluded(model, context.CancellationToken);
+        excluded = handling.Excluded(model, ct);
 
         var caught = handling.Caught(excluded);
-        if (caught.Count == 0 || handling.HandledInside(model, context.CancellationToken))
+        if (caught.Count == 0 || handling.HandledInside(model, ct))
         {
             return false;
         }
 
-        var names = MissingPatterns.Names(caught, handling.Space, model, context.Operation.Syntax.SpanStart);
+        var names = handling.CaughtInside(model, ct) is { } inside
+            ? string.Join(", ", inside)
+            : MissingPatterns.Names(caught, handling.Space, model, context.Operation.Syntax.SpanStart);
+
         context.ReportDiagnostic(Diagnostic.Create(Descriptors.ThrowingDefault, location, what, names, container));
         return true;
     }

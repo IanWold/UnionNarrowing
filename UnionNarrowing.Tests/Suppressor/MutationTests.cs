@@ -899,4 +899,198 @@ public class MutationTests
             }
             """
         );
+
+    [Fact]
+    public Task Members_a_use_calls_without_naming_them() =>
+        Verify.Suppressions("""
+            using System.Runtime.CompilerServices;
+            using System.Threading.Tasks;
+
+            union Implicit(Cat, Dog, Bird)
+            {
+                public Enumerator GetEnumerator() { this = new Bird("Polly"); return default; }
+                public int Count { get { this = new Bird("Polly"); return 1; } }
+                public TaskAwaiter GetAwaiter() { this = new Bird("Polly"); return Task.CompletedTask.GetAwaiter(); }
+            }
+
+            struct Enumerator
+            {
+                public bool MoveNext() => false;
+                public int Current => 0;
+            }
+
+            struct Indexed
+            {
+                public Pet Pet;
+                public int Length { get { Pet = new Bird("Polly"); return 1; } }
+                public int this[int i] => i;
+            }
+
+            struct Holder
+            {
+                public Pet Pet;
+            }
+
+            static class RefExtensions
+            {
+                extension(ref Holder h)
+                {
+                    public int Touched { get { h.Pet = new Bird("Polly"); return 1; } }
+                }
+
+                extension(Holder h)
+                {
+                    public int Looked => 1;
+                }
+            }
+
+            class C
+            {
+                int ForEach(Implicit pet)
+                {
+                    if (pet is Bird) return 0;
+                    /*because*/foreach (var _ in pet) { }
+                    return pet /*warns*/switch { Cat => 1, Dog => 2 };
+                }
+
+                int PropertyPattern(Implicit pet)
+                {
+                    if (pet is Bird) return 0;
+                    /*because*/if (pet is { Count: 5 }) return 5;
+                    return pet /*warns*/switch { Cat => 1, Dog => 2 };
+                }
+
+                async Task<int> Await(Implicit pet)
+                {
+                    if (pet is Bird) return 0;
+                    /*because*/await pet;
+                    return pet /*warns*/switch { Cat => 1, Dog => 2 };
+                }
+
+                int IndexFromTheEnd(Indexed box)
+                {
+                    if (box.Pet is Bird) return 0;
+                    /*because*/_ = box[^1];
+                    return box.Pet /*warns*/switch { Cat => 1, Dog => 2 };
+                }
+
+                int RefExtensionProperty(Holder holder)
+                {
+                    if (holder.Pet is Bird) return 0;
+                    /*because*/if (holder is { Touched: 5 }) return 5;
+                    return holder.Pet /*warns*/switch { Cat => 1, Dog => 2 };
+                }
+
+                // An extension that takes its receiver by value gets a copy.
+                int ExtensionProperty(Holder holder)
+                {
+                    if (holder.Pet is Bird) return 0;
+                    if (holder is { Looked: 5 }) return 5;
+                    return holder.Pet /*suppressed*/switch { Cat => 1, Dog => 2 };
+                }
+            }
+            """
+        );
+
+    [Fact]
+    public Task Inline_array_handed_out_as_a_span() =>
+        Verify.Suppressions("""
+            using System.Runtime.CompilerServices;
+
+            [InlineArray(1)]
+            struct OnePet
+            {
+                public Pet Element;
+            }
+
+            class C
+            {
+                static void Replace(ref Pet pet) => pet = new Bird("Polly");
+
+                int Span(Pet start)
+                {
+                    var one = new OnePet { Element = start };
+                    if (one.Element is Bird) return 0;
+                    /*because*/((Span<Pet>)one)[0] = new Bird("Polly");
+                    return one.Element /*warns*/switch { Cat => 1, Dog => 2 };
+                }
+
+                int RefForEach(Pet start)
+                {
+                    var one = new OnePet { Element = start };
+                    if (one.Element is Bird) return 0;
+                    /*because*/foreach (ref var slot in one) slot = new Bird("Polly");
+                    return one.Element /*warns*/switch { Cat => 1, Dog => 2 };
+                }
+
+                int RefElement(Pet start)
+                {
+                    var one = new OnePet { Element = start };
+                    if (one.Element is Bird) return 0;
+                    /*because*/Replace(ref one[0]);
+                    return one.Element /*warns*/switch { Cat => 1, Dog => 2 };
+                }
+
+                int Element(Pet start)
+                {
+                    var one = new OnePet { Element = start };
+                    if (one.Element is Bird) return 0;
+                    /*because*/one[0] = new Bird("Polly");
+                    return one.Element /*warns*/switch { Cat => 1, Dog => 2 };
+                }
+
+                // A foreach that isn't by ref reads through a ReadOnlySpan.
+                int ReadOnly(Pet start)
+                {
+                    var one = new OnePet { Element = start };
+                    if (one.Element is Bird) return 0;
+                    foreach (var slot in one) _ = slot;
+                    return one.Element /*suppressed*/switch { Cat => 1, Dog => 2 };
+                }
+            }
+            """
+        );
+
+    [Fact]
+    public Task Spread_and_ref_extensions_a_use_calls_without_naming_them() =>
+        Verify.Suppressions("""
+            union Implicit(Cat, Dog, Bird)
+            {
+                public Enumerator GetEnumerator() { this = new Bird("Polly"); return default; }
+            }
+
+            struct Enumerator
+            {
+                public bool MoveNext() => false;
+                public int Current => 0;
+            }
+
+            struct Holder
+            {
+                public Pet Pet;
+            }
+
+            static class HolderExtensions
+            {
+                public static Enumerator GetEnumerator(this ref Holder holder) { holder.Pet = new Bird("Polly"); return default; }
+            }
+
+            class C
+            {
+                int Spread(Implicit pet)
+                {
+                    if (pet is Bird) return 0;
+                    /*because*/int[] all = [.. pet];
+                    return pet /*warns*/switch { Cat => 1, Dog => 2 };
+                }
+
+                int RefExtension(Holder holder)
+                {
+                    if (holder.Pet is Bird) return 0;
+                    /*because*/int[] all = [.. holder];
+                    return holder.Pet /*warns*/switch { Cat => 1, Dog => 2 };
+                }
+            }
+            """
+        );
 }

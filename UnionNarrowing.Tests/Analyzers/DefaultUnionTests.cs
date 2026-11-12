@@ -35,8 +35,96 @@ public class DefaultUnionTests
             """
         );
 
-        Assert.Contains("'new Pet[count]' fills the array with default(Pet), which holds none of its cases", diagnostics.Select(d => d.GetMessage()));
+        Assert.Contains("'new Pet[count]' fills the array with default(Pet), which holds none of its cases. Write 'new Pet[count]!' where that's meant", diagnostics.Select(d => d.GetMessage()));
     }
+
+    [Fact]
+    public Task Arrays_filled_before_anything_reads_them() =>
+        Diagnostics("""
+            class C
+            {
+                Pet[] _items = [];
+                int _size;
+
+                Pet[] Copied() { var copy = new Pet[_size]; Array.Copy(_items, copy, _size); return copy; }
+
+                Pet[] CopiedFrom(int head) { var copy = new Pet[_size]; Array.Copy(_items, head, copy, 0, _size); return copy; }
+
+                Pet[] CopiedFromASpan() { var copy = new Pet[_size]; _items.AsSpan(0, _size).CopyTo(copy); return copy; }
+
+                // The runtime's Queue<T>.ToArray.
+                Pet[] Wrapped(int head, int tail)
+                {
+                    Pet[] arr = new Pet[_size];
+                    if (head < tail)
+                    {
+                        Array.Copy(_items, head, arr, 0, _size);
+                    }
+                    else
+                    {
+                        Array.Copy(_items, head, arr, 0, _items.Length - head);
+                        Array.Copy(_items, 0, arr, _items.Length - head, tail);
+                    }
+
+                    return arr;
+                }
+
+                Pet[] Mapped(Func<Pet, Pet> map)
+                {
+                    var result = new Pet[_size];
+                    var i = 0;
+                    foreach (var item in _items.AsSpan(0, _size))
+                    {
+                        result[i++] = map(item);
+                    }
+
+                    return result;
+                }
+
+                Pet[] Swapped()
+                {
+                    var result = new Pet[_size];
+                    for (var i = 0; i < _size; i++)
+                    {
+                        var item = _items[i];
+                        result[i] = item switch { Cat => new Dog("Rex"), _ => new Cat("Tom") };
+                    }
+
+                    return result;
+                }
+
+                Pet ReadFirst(Pet fill) { var arr = /*!UN0006*/new Pet[_size]; var first = arr[0]; Array.Fill(arr, fill); return first; }
+
+                Pet[] CopiedOnlySometimes(bool flag) { var arr = /*!UN0006*/new Pet[_size]; if (flag) Array.Copy(_items, arr, _size); return arr; }
+
+                Pet[] CopiedFromItself() { var arr = /*!UN0006*/new Pet[_size]; Array.Copy(arr, 0, arr, 1, _size - 1); return arr; }
+
+                Pet[] ReadInTheLoop()
+                {
+                    var result = /*!UN0006*/new Pet[_size];
+                    for (var i = 0; i < _size; i++)
+                    {
+                        var previous = result[i];
+                        result[i] = previous;
+                    }
+
+                    return result;
+                }
+
+                Pet[] LoopOverItself()
+                {
+                    var result = /*!UN0006*/new Pet[_size];
+                    var i = 0;
+                    foreach (var item in result)
+                    {
+                        result[i++] = item;
+                    }
+
+                    return result;
+                }
+            }
+            """
+        );
 
     [Fact]
     public Task Custom_union_with_its_own_parameterless_constructor() =>
@@ -74,7 +162,7 @@ public class DefaultUnionTests
             """
         );
 
-        Assert.Equal("default(Pet) holds none of Pet's cases, so a switch over it throws", diagnostics.Single(d => d.GetMessage().StartsWith("default(")).GetMessage());
+        Assert.Equal("default(Pet) holds none of Pet's cases, so a switch over it throws. Write 'default(Pet)!' where that's meant", diagnostics.Single(d => d.GetMessage().StartsWith("default(")).GetMessage());
     }
 
     [Fact]
@@ -87,13 +175,25 @@ public class DefaultUnionTests
                 public Pet Field = default!;
                 public Pet Property { get; set; } = (default)!;
 
-                void M()
+                void M(Pet optional = default!)
                 {
                     Pet a = default!;
                     var b = default(Pet)!;
                     Box c = default!;
                     Pet d = /*!UN0003*/default;
-                    Console.WriteLine($"{a}{b}{c}{d}");
+                    Console.WriteLine($"{a}{b}{c}{d}{optional}");
+                }
+
+                // A ring buffer, which keeps track of which slots hold something.
+                void Buffer(int capacity, Pet[] items, System.Buffers.ArrayPool<Pet> pool)
+                {
+                    var ring = new Pet[capacity]!;
+                    var boxes = new Box[capacity]!;
+                    var rented = pool.Rent(capacity)!;
+                    var allocated = GC.AllocateArray<Pet>(capacity)!;
+                    var created = Activator.CreateInstance<Pet>()!;
+                    items[0] = default!;
+                    Console.WriteLine($"{ring}{boxes}{rented}{allocated}{created}");
                 }
             }
             """
@@ -254,6 +354,127 @@ public class DefaultUnionTests
     }
 
     [Fact]
+    public async Task Generic_methods_that_say_their_task_can_give_the_default()
+    {
+        var diagnostics = await Diagnostics("""
+            using System.Threading.Tasks;
+
+            static class Http
+            {
+                public static Task<T?> GetAsync<T>(string url) => Task.FromResult<T?>(default);
+                public static ValueTask<T?> FirstOrDefaultAsync<T>(IAsyncEnumerable<T> items) => default;
+                public static Task<T> GetRequiredAsync<T>(string url) => throw new NotImplementedException();
+            }
+
+            class C
+            {
+                async Task<int> M(IAsyncEnumerable<Pet> pets)
+                {
+                    var fetched = /*!UN0010*/await Http.GetAsync<Pet>("pets/1");
+                    var configured = /*!UN0010*/await Http.GetAsync<Pet>("pets/2").ConfigureAwait(false);
+                    var first = /*!UN0010*/await Http.FirstOrDefaultAsync(pets);
+                    var task = /*!UN0010*/Http.GetAsync<Pet>("pets/3");
+                    var required = await Http.GetRequiredAsync<Pet>("pets/4");
+                    var tested = await Http.GetAsync<Pet>("pets/5") is Cat;
+                    Console.WriteLine($"{fetched}{configured}{first}{required}{tested}");
+                    return (await task) switch { Cat => 1, _ => 0 };
+                }
+            }
+            """
+        );
+
+        Assert.Contains("'await Http.GetAsync<Pet>(\"pets/1\")' gives default(Pet) on some paths, which holds none of its cases", diagnostics.Select(d => d.GetMessage()));
+    }
+
+    [Fact]
+    public Task Fallbacks_checked_for_before_they_are_used() =>
+        Diagnostics("""
+            union Node(Heading, Paragraph)
+            {
+                public bool IsHeading => this is Heading;
+            }
+
+            record Heading(int Level);
+            record Paragraph(string Text);
+
+            class C
+            {
+                Pet? Last(List<Pet> pets)
+                {
+                    var last = pets.LastOrDefault(p => p is not Bird);
+                    if (last is null) return null;
+                    return last;
+                }
+
+                int LastSwitch(List<Pet> pets)
+                {
+                    var last = pets.LastOrDefault();
+                    if (last is null) return 0;
+                    return last switch { Cat => 1, Dog => 2, Bird => 3 };
+                }
+
+                int TopLevel(List<Node> nodes)
+                {
+                    var top = nodes.LastOrDefault(n => n.IsHeading);
+                    if (!top.IsHeading) return 0;
+                    return top switch { Heading h => h.Level, Paragraph => 0 };
+                }
+
+                // Used before it's checked, checked on only some paths, or put in a variable by a pattern that matches it.
+                int UsedFirst(List<Pet> pets)
+                {
+                    var last = /*!UN0010*/pets.LastOrDefault();
+                    var n = last switch { Cat => 1, Dog => 2, Bird => 3 };
+                    if (last is null) return 0;
+                    return n;
+                }
+
+                int CheckedSometimes(List<Pet> pets, bool flag)
+                {
+                    var last = /*!UN0010*/pets.LastOrDefault();
+                    if (flag && last is null) return 0;
+                    return last switch { Cat => 1, Dog => 2, Bird => 3 };
+                }
+
+                int Found(List<Pet> pets)
+                {
+                    if (/*!UN0010*/pets.FirstOrDefault() is { } found) return found switch { Cat => 1, Dog => 2, Bird => 3 };
+                    return 0;
+                }
+
+                int FoundAnything(List<Pet> pets) => /*!UN0010*/pets.FirstOrDefault() is var found ? found switch { Cat => 1, Dog => 2, Bird => 3 } : 0;
+
+                int FoundACat(List<Pet> pets) => pets.FirstOrDefault() is Cat cat ? cat.Name.Length : 0;
+            }
+            """
+        );
+
+    [Fact]
+    public Task Generic_helper_that_falls_back_to_the_default() =>
+        Diagnostics("""
+            static class Nullables
+            {
+                public static T OrDefault<T>(this T? value) where T : struct => value ?? default;
+                public static T Or<T>(this T? value, T fallback) where T : struct => value ?? fallback;
+
+                // A T? of a struct T is just a T, which isn't null.
+                public static T Unconstrained<T>(T? value) => value ?? default!;
+            }
+
+            class C
+            {
+                void M(Pet? maybe, Pet pet)
+                {
+                    var a = /*!UN0010*/maybe.OrDefault();
+                    var b = maybe.Or(pet);
+                    var c = Nullables.Unconstrained(pet);
+                    Console.WriteLine($"{a}{b}{c}");
+                }
+            }
+            """
+        );
+
+    [Fact]
     public Task Lazy_without_a_factory_and_arrays_filled_through_a_span() =>
         Diagnostics("""
             class C
@@ -306,6 +527,8 @@ public class DefaultUnionTests
         var messages = diagnostics.Select(d => d.GetMessage()).ToList();
         Assert.Contains("'Array.Resize(ref pets, 10)' fills any new elements with default(Pet), which holds none of its cases", messages);
         Assert.Contains("'pets.AsSpan().Clear()' resets the elements to default(Pet), which holds none of its cases", messages);
+        Assert.Contains("'pool.Rent(8)' can return elements set to default(Pet), which holds none of its cases. Write 'pool.Rent(8)!' where that's meant", messages);
+        Assert.Contains("Activator.CreateInstance<Pet>() holds none of Pet's cases, so a switch over it throws. Write 'Activator.CreateInstance<Pet>()!' where that's meant", messages);
     }
 
     [Fact]
@@ -402,6 +625,53 @@ public class DefaultUnionTests
 
         Assert.Contains("'out var ignored' gives default(Pet) when 'TryGetValue' returns false, which holds none of its cases", diagnostics.Select(d => d.GetMessage()));
     }
+
+    [Fact]
+    public Task Out_value_of_a_try_method_that_failed_read_after_the_if() =>
+        Diagnostics("""
+            class C
+            {
+                int Logged(Dictionary<string, Pet> byName)
+                {
+                    if (!byName.TryGetValue("Tom", /*!UN0010*/out var pet))
+                    {
+                        Console.WriteLine("no Tom");
+                    }
+
+                    return pet switch { Cat => 1, Dog => 2, Bird => 3 };
+                }
+
+                int OnlyOnSuccess(Dictionary<string, Pet> byName)
+                {
+                    if (byName.TryGetValue("Rex", /*!UN0010*/out var pet)) Console.WriteLine("found");
+                    return pet switch { Cat => 1, Dog => 2, Bird => 3 };
+                }
+
+                int Exits(Dictionary<string, Pet> byName)
+                {
+                    if (!byName.TryGetValue("Tom", out var pet)) return 0;
+                    return pet switch { Cat => 1, Dog => 2, Bird => 3 };
+                }
+
+                int Replaced(Dictionary<string, Pet> byName)
+                {
+                    if (!byName.TryGetValue("Tom", out var pet))
+                    {
+                        Console.WriteLine("no Tom");
+                        pet = new Cat("Tom");
+                    }
+
+                    return pet switch { Cat => 1, Dog => 2, Bird => 3 };
+                }
+
+                int ReadOnlyOnSuccess(Dictionary<string, Pet> byName)
+                {
+                    if (byName.TryGetValue("Rex", out var pet)) return pet switch { Cat => 1, Dog => 2, Bird => 3 };
+                    return 0;
+                }
+            }
+            """
+        );
 
     [Fact]
     public Task Out_value_of_a_try_method_that_failed_replaced_before_it_is_read() =>

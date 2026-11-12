@@ -1,23 +1,9 @@
 using System.Collections.Immutable;
-using System.Composition;
-using System.Linq;
-using System.Threading;
-using System.Threading.Tasks;
-using Microsoft.CodeAnalysis;
-using Microsoft.CodeAnalysis.CodeActions;
-using Microsoft.CodeAnalysis.CodeFixes;
-using Microsoft.CodeAnalysis.CSharp;
-using Microsoft.CodeAnalysis.CSharp.Syntax;
-using Microsoft.CodeAnalysis.Formatting;
-using Microsoft.CodeAnalysis.Text;
-using UnionNarrowing.Suppressors.Analysis;
-using UnionNarrowing.Suppressors.Analyzers;
-using static Microsoft.CodeAnalysis.CSharp.SyntaxFactory;
 
 namespace UnionNarrowing.CodeFixes;
 
 /// <summary>
-/// For a union formatted as text (UN0015), or a record that prints one (UN0019), where the union is declared in the solution:
+/// For a union formatted as text (UN0015), or one that records print (UN0019), where the union is declared in the solution:
 /// overrides the union's ToString to format what it holds, <c>public override string ToString() =&gt; Value?.ToString() ?? "";</c>.
 /// That fixes every UN0015 and UN0019 for the union at once.
 /// </summary>
@@ -61,10 +47,12 @@ public sealed class OverrideToStringCodeFix : CodeFixProvider
     };
 
     /// <summary>
-    /// For UN0019, the type of the member the record prints.
+    /// For UN0019, the union records print:
+    /// where it's declared in source, it's reported on the union itself, and otherwise on the member a record prints.
     /// </summary>
     private static ITypeSymbol? PrintedType(SyntaxNode root, TextSpan span, SemanticModel model, CancellationToken ct) => model.GetDeclaredSymbol(root.FindNode(span), ct) switch
     {
+        ITypeSymbol union => union,
         IPropertySymbol property => property.Type,
         IFieldSymbol field => field.Type,
         IParameterSymbol parameter => parameter.Type,

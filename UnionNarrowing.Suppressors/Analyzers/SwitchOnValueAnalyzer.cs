@@ -24,17 +24,23 @@ public sealed class SwitchOnValueAnalyzer : DiagnosticAnalyzer
         [Descriptors.SwitchOnValue];
 
     /// <summary>
-    /// Whether the compiler accepts a type test against <paramref name="type"/> on the union:
+    /// Whether the compiler accepts a type test against <paramref name="type"/> on the union, meaning the same as on its Value:
     /// some case type could be one.
+    /// Not a type parameter, which could be the union itself (<c>static bool Is&lt;T&gt;(this Pet pet) =&gt; pet.Value is T;</c>).
     /// </summary>
     private static bool Allowed(ITypeSymbol type, ImmutableArray<ITypeSymbol> caseTypes, CSharpCompilation compilation) =>
-        !type.IsUnion && caseTypes.Any(caseType =>
+        !type.IsUnion && type is not ITypeParameterSymbol && caseTypes.Any(caseType =>
             caseType is ITypeParameterSymbol
-            || type is ITypeParameterSymbol
             || compilation.ClassifyConversion(caseType, type) is { IsIdentity: true } or { IsReference: true } or { IsBoxing: true } or { IsUnboxing: true }
         );
 
-    private static void Analyze(OperationAnalysisContext context, IOperation input, IEnumerable<IPatternOperation> patterns, bool test)
+    /// <summary>
+    /// For the message about a test of a union's Value: what to do instead, and what the compiler then checks.
+    /// </summary>
+    private static readonly (string Instead, string Checks) Test = ("Test", "that it's one of the union's cases");
+
+    /// <param name="message">What to do instead, and what the compiler then checks.</param>
+    private static void Analyze(OperationAnalysisContext context, IOperation input, IEnumerable<IPatternOperation> patterns, (string Instead, string Checks) message)
     {
         if (ValueOfUnion(input) is not var (unionType, access) || context.Operation.SemanticModel is not { } model)
         {
@@ -42,21 +48,16 @@ public sealed class SwitchOnValueAnalyzer : DiagnosticAnalyzer
         }
 
         var compilation = (CSharpCompilation)model.Compilation;
-        if (!patterns.All(pattern => MeansTheSameOnTheUnion(pattern, unionType.UnionCaseTypes, compilation)))
+        if (patterns.All(pattern => MeansTheSameOnTheUnion(pattern, unionType.UnionCaseTypes, compilation)))
         {
-            return;
+            Report(context, access, message);
         }
-
-        context.ReportDiagnostic(test
-            ? Diagnostic.Create(Descriptors.SwitchOnValue, access.GetLocation(), access.Expression.ToString(), "Test", "that it's one of the union's cases")
-            : Diagnostic.Create(Descriptors.SwitchOnValue, access.GetLocation(), access.Expression.ToString(), "Switch on", "that every case is handled")
-        );
     }
 
     private static void AnalyzeSwitchExpression(OperationAnalysisContext context)
     {
         var switchOp = (ISwitchExpressionOperation)context.Operation;
-        Analyze(context, switchOp.Value, switchOp.Arms.Select(arm => arm.Pattern), test: false);
+        Analyze(context, switchOp.Value, switchOp.Arms.Select(arm => arm.Pattern), ("Switch on", "that every case is handled"));
     }
 
     private static void AnalyzeSwitchStatement(OperationAnalysisContext context)
@@ -71,7 +72,7 @@ public sealed class SwitchOnValueAnalyzer : DiagnosticAnalyzer
             return;
         }
 
-        Analyze(context, switchOp.Value, clauses.OfType<IPatternCaseClauseOperation>().Select(c => c.Pattern), test: false);
+        Analyze(context, switchOp.Value, clauses.OfType<IPatternCaseClauseOperation>().Select(c => c.Pattern), ("Switch on", "that each label is for one of the union's cases"));
     }
 
     /// <summary>
@@ -82,14 +83,14 @@ public sealed class SwitchOnValueAnalyzer : DiagnosticAnalyzer
         switch (context.Operation)
         {
             case IIsPatternOperation isPattern:
-                Analyze(context, isPattern.Value, [isPattern.Pattern], test: true);
+                Analyze(context, isPattern.Value, [isPattern.Pattern], Test);
                 break;
 
             // `x is T` with a type, which isn't a pattern: what matters is whether the union allows the type.
             case IIsTypeOperation isType when ValueOfUnion(isType.ValueOperand) is var (union, access)
                 && context.Operation.SemanticModel is { } model
                 && Allowed(isType.TypeOperand, union.UnionCaseTypes, (CSharpCompilation)model.Compilation):
-                context.ReportDiagnostic(Diagnostic.Create(Descriptors.SwitchOnValue, access.GetLocation(), access.Expression.ToString(), "Test", "that it's one of the union's cases"));
+                Report(context, access, Test);
                 break;
         }
     }
@@ -117,6 +118,12 @@ public sealed class SwitchOnValueAnalyzer : DiagnosticAnalyzer
         bool Allowed(ITypeSymbol type) =>
             SwitchOnValueAnalyzer.Allowed(type, caseTypes, compilation);
     }
+
+    /// <summary>
+    /// Reports <paramref name="access"/>, a union's <c>x.Value</c>, with what to do instead and what the compiler then checks.
+    /// </summary>
+    private static void Report(OperationAnalysisContext context, MemberAccessExpressionSyntax access, (string Instead, string Checks) message) =>
+        context.ReportDiagnostic(Diagnostic.Create(Descriptors.SwitchOnValue, access.GetLocation(), access.Expression.ToString(), message.Instead, message.Checks));
 
     /// <summary>
     /// For a struct union's <c>Value</c>, the union type and the <c>x.Value</c> syntax.

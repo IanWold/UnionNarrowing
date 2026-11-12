@@ -266,6 +266,70 @@ public class DeadArmTests
         );
 
     [Fact]
+    public Task Arms_for_cases_a_method_happens_not_to_return() =>
+        Diagnostics("""
+            using System.Threading.Tasks;
+
+            static class PetTests
+            {
+                public static bool IsBird(this Pet pet) => pet is Bird;
+            }
+
+            class Decoder
+            {
+                // Never gives a bird today, but an arm for one still handles what they may give tomorrow.
+                private static Pet Next(bool flag) => flag ? new Cat("Tom") : new Dog("Rex");
+
+                private static async Task<Pet> NextAsync()
+                {
+                    await Task.Yield();
+                    return new Cat("Tom");
+                }
+
+                private static bool TryNext(out Pet pet)
+                {
+                    pet = new Cat("Tom");
+                    return true;
+                }
+
+                int Assigned(bool flag)
+                {
+                    var pet = Next(flag);
+                    return pet switch { Cat => 1, Dog => 2, Bird => 3 };
+                }
+
+                async Task<int> Awaited()
+                {
+                    var pet = await NextAsync();
+                    return pet switch { Cat => 1, Dog => 2, Bird => 3 };
+                }
+
+                int SetAsAnOutArgument()
+                {
+                    if (!TryNext(out var pet)) return 0;
+                    return pet switch { Cat => 1, Dog => 2, Bird => 3 };
+                }
+
+                // A deliberate test, through a helper.
+                int Tested(Pet pet)
+                {
+                    if (pet.IsBird()) return 0;
+                    return pet switch { Cat => 1, Dog => 2, /*!UN0004*/Bird => 3 };
+                }
+
+                // A local function is in plain sight.
+                int Local()
+                {
+                    var pet = Next();
+                    return pet switch { Cat => 1, /*!UN0004*/Dog => 2, /*!UN0004*/Bird => 3 };
+
+                    static Pet Next() => new Cat("Tom");
+                }
+            }
+            """
+        );
+
+    [Fact]
     public Task Tests_in_assertions() =>
         Diagnostics("""
             using System.Diagnostics;

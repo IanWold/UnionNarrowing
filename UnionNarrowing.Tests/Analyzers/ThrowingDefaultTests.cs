@@ -165,8 +165,38 @@ public class ThrowingDefaultTests
                     if (b is Dog) return 2;
                     throw new InvalidOperationException();
                 }
+
+                // Preconditions on both operands.
+                string Plus(Pet left, Pet right)
+                {
+                    if (left is Cat l && right is Cat r) return l.Name + r.Name;
+                    if (left is Dog ld && right is Dog rd) return ld.Name + rd.Name;
+                    throw new InvalidOperationException("Operands must be two cats or two dogs.");
+                }
+
+                string PlusValues(Pet left, Pet right)
+                {
+                    if (left.Value is Cat l && right.Value is Cat r) return l.Name + r.Name;
+                    if (left.Value is Dog ld && right.Value is Dog rd) return ld.Name + rd.Name;
+                    throw new InvalidOperationException("Operands must be two cats or two dogs.");
+                }
+
+                int ElseOnAnotherValue(Pet pet, Pet other)
+                {
+                    if (pet is Cat) return 1;
+                    else if (pet is Dog && other is Bird) return 2;
+                    else throw new InvalidOperationException();
+                }
+
+                // What a pattern matched is part of the value.
+                int MemberOfWhatItMatched(Young young)
+                {
+                    if (young is Kitten k && k.Toy is Ball) return 1;
+                    if (young is Kitten) return 2;
+                    /*!UN0002*/throw new InvalidOperationException();
+                }
             }
-            """
+            """ + Snippets.Toys
         );
 
     [Fact]
@@ -339,8 +369,9 @@ public class ThrowingDefaultTests
     }
 
     [Fact]
-    public Task Throwing_default_after_arms_that_look_inside_the_cases() =>
-        Diagnostics("""
+    public async Task Throwing_default_after_arms_that_look_inside_the_cases()
+    {
+        var diagnostics = await Diagnostics("""
             class C
             {
                 int Missing(Young young) => young /*!UN0002*/switch { Dog => 1, Kitten { Toy: Ball } => 2, _ => throw new InvalidOperationException() };
@@ -365,9 +396,26 @@ public class ThrowingDefaultTests
                     else if (young is Kitten { Toy: Mouse }) return 3;
                     else throw new InvalidOperationException();
                 }
+
+                int Ifs(Young young)
+                {
+                    if (young is Kitten { Toy: Ball }) return 1;
+                    if (young is Dog) return 2;
+                    /*!UN0002*/throw new InvalidOperationException();
+                }
             }
             """ + Snippets.Toys
         );
+
+        Assert.Equal(
+            [
+                "The throwing discard arm catches Kitten { Toy: Mouse }, which the switch doesn't otherwise handle",
+                "The throwing statement after the ifs catches Kitten { Toy: Mouse }, which the chain of ifs doesn't otherwise handle",
+            ],
+            diagnostics.Where(d => d.Id == "UN0002").Select(d => d.GetMessage())
+        );
+        Assert.Equal(Microsoft.CodeAnalysis.DiagnosticSeverity.Info, diagnostics[0].Severity);
+    }
 
     [Fact]
     public async Task Throw_after_a_switch_statement_or_ifs()
@@ -435,6 +483,28 @@ public class ThrowingDefaultTests
                 {
                     if (pet is Cat) return 1;
                     throw new InvalidOperationException();
+                }
+
+                // What's thrown switches on the value again, so the compiler checks it handles every case that gets there.
+                int SwitchesOnItAgain(Pet pet)
+                {
+                    if (pet is Cat) return 1;
+                    if (pet is Dog) return 2;
+                    throw new InvalidOperationException(pet switch { Bird b => b.Name });
+                }
+
+                int ElseSwitchesOnItAgain(Pet pet)
+                {
+                    if (pet is Cat) return 1;
+                    else if (pet is Dog) return 2;
+                    else throw new InvalidOperationException(pet switch { Bird b => b.Name });
+                }
+
+                int SwitchesOnAnotherValue(Pet pet, Pet other)
+                {
+                    if (pet is Cat) return 1;
+                    if (pet is Dog) return 2;
+                    /*!UN0002*/throw new InvalidOperationException(other switch { Cat => "cat", Dog => "dog", Bird => "bird" });
                 }
             }
             """
@@ -559,4 +629,20 @@ public class ThrowingDefaultTests
 
         Assert.Equal("The throwing discard arm catches Dog, Bird, which the switch doesn't otherwise handle", diagnostics.Single().GetMessage());
     }
+
+    [Fact]
+    public Task Cases_split_between_arms_on_a_member() =>
+        Diagnostics("""
+            public record Text(string S);
+            public sealed record Marker(bool Checked);
+            public union Event(Text, Marker);
+
+            class C
+            {
+                int Split(Event e) => e switch { Text => 1, Marker(true) => 2, Marker(false) => 3, /*!UN0016*/_ => throw new InvalidOperationException() };
+
+                int Half(Event e) => e /*!UN0002*/switch { Text => 1, Marker(true) => 2, _ => throw new InvalidOperationException() };
+            }
+            """
+        );
 }

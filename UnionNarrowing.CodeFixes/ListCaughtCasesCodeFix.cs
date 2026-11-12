@@ -1,19 +1,4 @@
-using System.Collections.Generic;
 using System.Collections.Immutable;
-using System.Composition;
-using System.Linq;
-using System.Threading;
-using System.Threading.Tasks;
-using Microsoft.CodeAnalysis;
-using Microsoft.CodeAnalysis.CodeActions;
-using Microsoft.CodeAnalysis.CodeFixes;
-using Microsoft.CodeAnalysis.CSharp;
-using Microsoft.CodeAnalysis.CSharp.Syntax;
-using Microsoft.CodeAnalysis.Formatting;
-using Microsoft.CodeAnalysis.Operations;
-using UnionNarrowing.Suppressors.Analysis;
-using UnionNarrowing.Suppressors.Analyzers;
-using static Microsoft.CodeAnalysis.CSharp.SyntaxFactory;
 
 namespace UnionNarrowing.CodeFixes;
 
@@ -25,6 +10,7 @@ namespace UnionNarrowing.CodeFixes;
 /// For a throw after a switch statement, a section for them is added that throws the same way;
 /// for a throw after a chain of ifs, one more if, for them, before it.
 /// Where the arms or tests look inside the cases, what's caught is named the same way (<c>Kitten { Toy: Mouse }</c>).
+/// For a switch over a tuple, what's named is the combinations, as Add missing arms writes them, unless that's all of them (<c>(_, _)</c>).
 /// </summary>
 [ExportCodeFixProvider(LanguageNames.CSharp, Name = nameof(ListCaughtCasesCodeFix)), Shared]
 public sealed class ListCaughtCasesCodeFix : CodeFixProvider
@@ -32,8 +18,36 @@ public sealed class ListCaughtCasesCodeFix : CodeFixProvider
     public override ImmutableArray<string> FixableDiagnosticIds =>
         [Descriptors.ThrowingDefault.Id];
 
+    /// <summary>
+    /// For a switch over a tuple, the combinations its default catches, as Add missing arms writes them:
+    /// where the arms look inside the cases, what they miss inside them (<c>(Kitten { Toy: Mouse }, _)</c>).
+    /// None where one of them matches anything (<c>(_, _)</c>), since naming that wouldn't change what the default catches.
+    /// </summary>
+    private static List<PatternSyntax> CaughtCombinations(SyntaxNode switchNode, SemanticModel model, Session session, CancellationToken ct)
+    {
+        var switchOperation = model.GetOperation(switchNode, ct);
+        var labels = SwitchLabel.Of(switchOperation);
+        List<SwitchLabel> beforeDefault = switchOperation is ISwitchExpressionOperation ? [.. labels.Take(labels.Count - 1)] : [.. labels.Where(label => !label.IsDefault)];
+
+        var caught = switchOperation switch { ISwitchExpressionOperation expression => expression.Value, ISwitchOperation statement => statement.Value, _ => null } is { } input
+            && NestedCoverage.Missing(input, beforeDefault, switchNode, model, session, ct) is { Count: > 0 } inside
+                ? inside
+                : SwitchCoverage.Of(switchNode, model, session, ct, countGuarded: false, withoutDefault: true) is { OverCases: true, Missing.Count: > 0 } coverage
+                    ? MissingPatterns.Of(coverage, model, switchNode.SpanStart)
+                    : [];
+
+        return caught.Any(MatchesAnything) ? [] : caught;
+    }
+
     private static PatternSyntax Either(IReadOnlyList<PatternSyntax> patterns) =>
         patterns.Skip(1).Aggregate(patterns[0], (left, right) => BinaryPattern(SyntaxKind.OrPattern, left, right));
+
+    /// <summary>
+    /// Whether a pattern matches anything: <c>_</c>, or <c>(_, _)</c>.
+    /// </summary>
+    private static bool MatchesAnything(PatternSyntax pattern) =>
+        pattern is DiscardPatternSyntax
+        || pattern is RecursivePatternSyntax { Type: null, PropertyPatternClause: null, PositionalPatternClause: { } positional } && positional.Subpatterns.All(sub => MatchesAnything(sub.Pattern));
 
     /// <summary>
     /// At the end of a chain of ifs, one more <c>else if</c> for the cases, that does what the else does:
@@ -54,7 +68,8 @@ public sealed class ListCaughtCasesCodeFix : CodeFixProvider
             statement,
             ElseClause(elseKeyword, statement)
         );
-        var newRoot = root!.ReplaceNode(elseClause, elseClause.WithElseKeyword(elseKeyword.WithTrailingTrivia(Space)).WithStatement(test));
+        var newElseKeyword = elseKeyword.WithLeadingTrivia(CodeFixSyntax.Indentation(elseKeyword.LeadingTrivia)).WithTrailingTrivia(Space);
+        var newRoot = root!.ReplaceNode(elseClause, elseClause.WithElseKeyword(newElseKeyword).WithStatement(test));
         return await Formatter.FormatAsync(document.WithSyntaxRoot(newRoot), Formatter.Annotation, cancellationToken: ct).ConfigureAwait(false);
     }
 
@@ -79,7 +94,8 @@ public sealed class ListCaughtCasesCodeFix : CodeFixProvider
             var test = IfStatement(IsPatternExpression(((ExpressionSyntax)input.Syntax).WithoutTrivia(), Either(caught)), thrown)
                 .WithAdditionalAnnotations(Formatter.Annotation);
             var lineBreak = throwStatement.GetFirstToken().GetPreviousToken().TrailingTrivia;
-            newRoot = root!.InsertNodesBefore(throwStatement, [test.WithLeadingTrivia(throwStatement.GetLeadingTrivia()).WithTrailingTrivia(lineBreak)]);
+            var indentation = CodeFixSyntax.Indentation(throwStatement.GetLeadingTrivia());
+            newRoot = root!.InsertNodesBefore(throwStatement, [test.WithLeadingTrivia(indentation).WithTrailingTrivia(lineBreak)]);
         }
 
         return await Formatter.FormatAsync(document.WithSyntaxRoot(newRoot), Formatter.Annotation, cancellationToken: ct).ConfigureAwait(false);
@@ -150,10 +166,8 @@ public sealed class ListCaughtCasesCodeFix : CodeFixProvider
 
         switch (root.FindToken(context.Span.Start).Parent)
         {
-            // Over a tuple: the combinations, as the patterns Add missing arms writes.
             case SwitchExpressionSyntax { Arms.Count: > 1, GoverningExpression: TupleExpressionSyntax } tupleSwitch
-                when SwitchCoverage.Of(tupleSwitch, model, session, ct, countGuarded: false, withoutDefault: true) is { OverCases: true, Missing.Count: > 0 } coverage:
-                var combinations = MissingPatterns.Of(coverage, model, tupleSwitch.SpanStart);
+                when CaughtCombinations(tupleSwitch, model, session, ct) is { Count: > 0 } combinations:
                 context.RegisterCodeFix(
                     CodeAction.Create($"Handle {Names(combinations)} in the throwing arm", ct => NameInArmAsync(context.Document, tupleSwitch, combinations, ct), equivalenceKey: nameof(ListCaughtCasesCodeFix)),
                     context.Diagnostics
@@ -183,6 +197,14 @@ public sealed class ListCaughtCasesCodeFix : CodeFixProvider
                 && chain.Handling.CaughtPatterns(model, ct) is { Count: > 0 } caughtByElse:
                 context.RegisterCodeFix(
                     CodeAction.Create($"Handle {Names(caughtByElse)} before the else", ct => NameBeforeElseAsync(context.Document, elseClause, chain.Handling.Input, caughtByElse, ct), equivalenceKey: nameof(ListCaughtCasesCodeFix)),
+                    context.Diagnostics
+                );
+                break;
+
+            case SwitchStatementSyntax { Expression: TupleExpressionSyntax } tupleStatement
+                when CaughtCombinations(tupleStatement, model, session, ct) is { Count: > 0 } combinations:
+                context.RegisterCodeFix(
+                    CodeAction.Create($"Handle {Names(combinations)} in the default section", ct => NameInSectionAsync(context.Document, tupleStatement, combinations, ct), equivalenceKey: nameof(ListCaughtCasesCodeFix)),
                     context.Diagnostics
                 );
                 break;

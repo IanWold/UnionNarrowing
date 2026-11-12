@@ -205,6 +205,9 @@ internal static partial class Narrowing
             case LabeledStatementSyntax labeled:
                 return FactsAtEndOfAssignment(labeled.Statement, context);
 
+            case BlockSyntax block when DisposesAtEnd(block, context):
+                return CaseSet.Empty;
+
             case BlockSyntax block:
                 var atEnd = CaseSet.Empty;
                 for (var i = block.Statements.Count - 1; i >= 0; i--)
@@ -338,13 +341,18 @@ internal static partial class Narrowing
     private static CaseSet FactsFromDesignation(VariableUsage usage, Context context)
     {
         // `var x` is a var pattern in some places and a declaration pattern with type `var` in others (arms, labels).
-        // A typed designation (`owner is { Pet: not Bird } o`, `x is Owner o`) binds the same object too, unless the
-        // pattern takes a case out of a union.
+        // A typed designation (`owner is { Pet: not Bird } o`, `x is Owner o`) binds the same object too; one that takes
+        // a case out of a union (`r is Err e`) binds what it holds, whose members are the case's.
         if (usage.Writes.Count > 0
             || usage.Declarations.Count != 1
             || usage.Declarations[0] is not SingleVariableDesignationSyntax { Parent: VarPatternSyntax or DeclarationPatternSyntax or RecursivePatternSyntax } designation
-            || (designation.Parent is not (VarPatternSyntax or DeclarationPatternSyntax { Type.IsVar: true }) && !BindsSameValue(designation))
         )
+        {
+            return CaseSet.Empty;
+        }
+
+        var bindsWhole = designation.Parent is VarPatternSyntax or DeclarationPatternSyntax { Type.IsVar: true } || BindsSameValue(designation);
+        if (!bindsWhole && !TakesCase(designation))
         {
             return CaseSet.Empty;
         }
@@ -355,80 +363,124 @@ internal static partial class Narrowing
         var ct = context.CancellationToken;
         var steps = new List<Step>();
         SyntaxNode pattern = designation.Parent!;
-        while (true)
+
+        // The variable is only assigned where the whole pattern matched, so what it's `and`-ed with on the same value
+        // holds for it wherever it's read (`[(Plain or Para) and var head, ..]`).
+        return AndedWith(pattern) | FromSource();
+
+        CaseSet AndedWith(SyntaxNode bound)
         {
-            while (pattern.Parent is ParenthesizedPatternSyntax || pattern.Parent is BinaryPatternSyntax { RawKind: (int)SyntaxKind.AndPattern } || pattern.Parent is UnaryPatternSyntax { RawKind: (int)SyntaxKind.NotPattern })
-            {
-                pattern = pattern.Parent;
-            }
-
-            if (pattern.Parent is not SubpatternSyntax { Parent: { Parent: RecursivePatternSyntax recursiveSyntax } clause } subpattern
-                || model.GetOperation(recursiveSyntax, ct) is not IRecursivePatternOperation recursive
-            )
-            {
-                break;
-            }
-
-            IReadOnlyList<Step> members = clause is PositionalPatternClauseSyntax positional
-                ? Facts.PositionalMember(recursive, positional.Subpatterns.IndexOf(subpattern)) is { } member ? [new MemberStep(member)] : []
-                : model.GetOperation(subpattern, ct) is IPropertySubpatternOperation property ? Facts.MemberChain(property.Member) : [];
-            if (members.Count == 0)
+            if (!context.Value.Steps.IsEmpty || model.GetOperation(bound, ct) is not IPatternOperation { InputType: var boundType })
             {
                 return CaseSet.Empty;
             }
 
-            // The members of a union's case are read from the case it holds.
-            var narrowed = recursive.InputType.IsUnion && !SymbolEqualityComparer.Default.Equals(recursive.MatchedType, recursive.InputType);
-            steps.InsertRange(0, narrowed ? [new CaseStep(recursive.MatchedType), .. members] : members);
-            pattern = recursiveSyntax;
+            var excluded = CaseSet.Empty;
+            for (var inner = bound; inner.Parent is ParenthesizedPatternSyntax or BinaryPatternSyntax { RawKind: (int)SyntaxKind.AndPattern }; inner = inner.Parent)
+            {
+                if (inner.Parent is BinaryPatternSyntax both
+                    && model.GetOperation(Unparenthesized(both.Left == inner ? both.Right : both.Left), ct) is IPatternOperation sibling
+                    && SymbolEqualityComparer.Default.Equals(sibling.InputType, boundType)
+                )
+                {
+                    excluded |= Facts.Of(sibling, context.Space, model.Compilation).AlwaysFalse;
+                }
+            }
+
+            return excluded;
         }
 
-        var (input, region) = pattern.Parent switch
-        {
-            IsPatternExpressionSyntax isPattern => (isPattern.Expression, (SyntaxNode?)isPattern.FirstAncestorOrSelf<StatementSyntax>() ?? Functions.BodyExpression(isPattern)),
-            SwitchExpressionArmSyntax { Parent: SwitchExpressionSyntax outer } arm => (outer.GoverningExpression, arm),
-            CasePatternSwitchLabelSyntax { Parent: SwitchSectionSyntax { Parent: SwitchStatementSyntax switchStatement } section } => (switchStatement.Expression, section),
-            _ => (null, null),
-        };
+        static PatternSyntax Unparenthesized(PatternSyntax pattern) =>
+            pattern is ParenthesizedPatternSyntax parenthesized ? Unparenthesized(parenthesized.Pattern) : pattern;
 
-        // A positional pattern on a tuple literal reads its element: `(a, b) is (var x, _)` binds a.
-        var inputOperation = input is null ? null : model.GetOperation(input, ct);
-        while (inputOperation is IConversionOperation { IsImplicit: true } conversion)
+        CaseSet FromSource()
         {
-            inputOperation = conversion.Operand;
+            while (true)
+            {
+                var narrowedInput = (model.GetOperation(pattern, ct) as IPatternOperation)?.InputType;
+                while (pattern.Parent is ParenthesizedPatternSyntax || pattern.Parent is BinaryPatternSyntax { RawKind: (int)SyntaxKind.AndPattern } || pattern.Parent is UnaryPatternSyntax { RawKind: (int)SyntaxKind.NotPattern })
+                {
+                    pattern = pattern.Parent;
+                }
+
+                // `item is Val and Arr a`, on a union that holds a union: the left of the `and` takes the case out, so the
+                // right reads what that case holds, not what the input does.
+                if (model.GetOperation(pattern, ct) is IPatternOperation { InputType: var outerInput }
+                    && (Symbols.UnderlyingOfNullable(outerInput) ?? outerInput).IsUnion
+                    && !SymbolEqualityComparer.Default.Equals(narrowedInput, outerInput)
+                )
+                {
+                    return CaseSet.Empty;
+                }
+
+                if (pattern.Parent is not SubpatternSyntax { Parent: { Parent: RecursivePatternSyntax recursiveSyntax } clause } subpattern
+                    || model.GetOperation(recursiveSyntax, ct) is not IRecursivePatternOperation recursive
+                )
+                {
+                    break;
+                }
+
+                IReadOnlyList<Step> members = clause is PositionalPatternClauseSyntax positional
+                    ? Facts.PositionalMember(recursive, positional.Subpatterns.IndexOf(subpattern)) is { } member ? [new MemberStep(member)] : []
+                    : model.GetOperation(subpattern, ct) is IPropertySubpatternOperation property ? Facts.MemberChain(property.Member) : [];
+                if (members.Count == 0)
+                {
+                    return CaseSet.Empty;
+                }
+
+                // The members of a union's case are read from the case it holds.
+                var narrowed = recursive.InputType.IsUnion && !SymbolEqualityComparer.Default.Equals(recursive.MatchedType, recursive.InputType);
+                steps.InsertRange(0, narrowed ? [new CaseStep(recursive.MatchedType), .. members] : members);
+                pattern = recursiveSyntax;
+            }
+
+            var (input, region) = pattern.Parent switch
+            {
+                IsPatternExpressionSyntax isPattern => (isPattern.Expression, (SyntaxNode?)isPattern.FirstAncestorOrSelf<StatementSyntax>() ?? Functions.BodyExpression(isPattern)),
+                SwitchExpressionArmSyntax { Parent: SwitchExpressionSyntax outer } arm => (outer.GoverningExpression, arm),
+                CasePatternSwitchLabelSyntax { Parent: SwitchSectionSyntax { Parent: SwitchStatementSyntax switchStatement } section } => (switchStatement.Expression, section),
+                _ => (null, null),
+            };
+
+            // A positional pattern on a tuple literal reads its element: `(a, b) is (var x, _)` binds a.
+            var inputOperation = input is null ? null : model.GetOperation(input, ct);
+            while (inputOperation is IConversionOperation { IsImplicit: true } conversion)
+            {
+                inputOperation = conversion.Operand;
+            }
+
+            if (inputOperation is ITupleOperation tuple && steps.Count > 0
+                && steps[0] is MemberStep { Member: IFieldSymbol { CorrespondingTupleField: { } or { ContainingType.IsTupleType: true } } element }
+            )
+            {
+                inputOperation = Sequences.ElementIndex(tuple, element) is var index and >= 0 ? tuple.Elements[index] : null;
+                steps.RemoveAt(0);
+            }
+
+            if (input is null || region is null || UpTo(region, context.Start) is not { } parts
+                || TrackedValue.From(inputOperation, context.Value.Session) is not { } whole
+                || parts.Any(part => WritesIn(part, whole))
+                || whole.Through(steps, model.Compilation, followsMutableState: false) is not { } source
+                || !IsTrackable(source, context.Start, model, ct)
+            )
+            {
+                return CaseSet.Empty;
+            }
+
+            var excluded = bindsWhole ? Excluded(context.Start, context.Value.WithRoot(source), context.Space, model, ct, onEntry: false, context.Copies + 1) : CaseSet.Empty;
+
+            // `owner is not Shelter shelter` makes shelter owner as a Shelter: what's known about owner's members holds for
+            // shelter's, and so does what's known about them when owner is a Shelter (`owner is Shelter { Pet: Bird }`).
+            if (steps.Count == 0 && !context.Value.Steps.IsEmpty
+                && model.GetDeclaredSymbol(designation, ct) is ILocalSymbol { Type: var bound } && inputOperation?.Type is { } inputType && !SymbolEqualityComparer.Default.Equals(bound, inputType)
+                && context.Value.WithRoot(source.Through([new CaseStep(bound)], model.Compilation, followsMutableState: false)!) is var asBound && IsTrackable(asBound, context.Start, model, ct)
+            )
+            {
+                excluded |= Excluded(context.Start, asBound, context.Space, model, ct, onEntry: false, context.Copies + 1);
+            }
+
+            return excluded;
         }
-
-        if (inputOperation is ITupleOperation tuple && steps.Count > 0
-            && steps[0] is MemberStep { Member: IFieldSymbol { CorrespondingTupleField: { } or { ContainingType.IsTupleType: true } } element }
-        )
-        {
-            inputOperation = Sequences.ElementIndex(tuple, element) is var index and >= 0 ? tuple.Elements[index] : null;
-            steps.RemoveAt(0);
-        }
-
-        if (input is null || region is null || UpTo(region, context.Start) is not { } parts
-            || TrackedValue.From(inputOperation, context.Value.Session) is not { } whole
-            || parts.Any(part => WritesIn(part, whole))
-            || whole.Through(steps, model.Compilation, followsMutableState: false) is not { } source
-            || !IsTrackable(source, context.Start, model, ct)
-        )
-        {
-            return CaseSet.Empty;
-        }
-
-        var excluded = Excluded(context.Start, context.Value.WithRoot(source), context.Space, model, ct, onEntry: false, context.Copies + 1);
-
-        // `owner is not Shelter shelter` makes shelter owner as a Shelter: what's known about owner's members holds for
-        // shelter's, and so does what's known about them when owner is a Shelter (`owner is Shelter { Pet: Bird }`).
-        if (steps.Count == 0 && !context.Value.Steps.IsEmpty
-            && model.GetDeclaredSymbol(designation, ct) is ILocalSymbol { Type: var bound } && inputOperation?.Type is { } inputType && !SymbolEqualityComparer.Default.Equals(bound, inputType)
-            && context.Value.WithRoot(source.Through([new CaseStep(bound)], model.Compilation, followsMutableState: false)!) is var asBound && IsTrackable(asBound, context.Start, model, ct)
-        )
-        {
-            excluded |= Excluded(context.Start, asBound, context.Space, model, ct, onEntry: false, context.Copies + 1);
-        }
-
-        return excluded;
 
         // Where the variable has its value, up to where the walk started: the statement (or arm, or section) that binds it,
         // and for a statement that doesn't hold the start (`if (o is not Shelter shelter) return;`), the statements after
@@ -450,6 +502,12 @@ internal static partial class Narrowing
 
             return from >= 0 && to > from ? [.. statements.Skip(from).Take(to - from + 1)] : null;
         }
+
+        // The pattern's input is a union, and the variable is one of its cases (or a type its cases derive from).
+        bool TakesCase(SingleVariableDesignationSyntax typed) =>
+            context.Model.GetOperation(typed.Parent!, context.CancellationToken) is IPatternOperation { InputType: var input }
+            && (Symbols.UnderlyingOfNullable(input) ?? input).IsUnion
+            && context.Model.GetDeclaredSymbol(typed, context.CancellationToken) is ILocalSymbol { Type.IsUnion: false };
 
         // The pattern's input isn't a union (whose patterns bind its case), and the variable is the input itself, or a
         // reference to the same object.
@@ -512,7 +570,11 @@ internal static partial class Narrowing
                 : null
         ));
 
+        // A write that switches on the variable itself (`state = state switch { Waiting => new Running(), Running r => r,
+        // Done d => d };`) gives what its arms do, for what the variable can be then: what's ruled out everywhere is what
+        // the other writes rule out, and what these keep ruled out, given that it was (by induction over the writes).
         CaseSet? everywhere = null;
+        var steps = new List<ISwitchExpressionOperation>();
         foreach (var value in given)
         {
             if (value is null)
@@ -520,10 +582,62 @@ internal static partial class Narrowing
                 return CaseSet.Empty;
             }
 
+            if (context.Value.Steps.IsEmpty && Unconverted(value) is ISwitchExpressionOperation step && context.Value.IsReadBy(step.Value))
+            {
+                steps.Add(step);
+                continue;
+            }
+
             everywhere = Meet(everywhere, KnownExcluded(value, context.Value.Steps, context.Space, model, context.Value.Session, ct, context.Copies + 1));
         }
 
-        return everywhere ?? CaseSet.Empty;
+        var invariant = everywhere ?? CaseSet.Empty;
+        for (var round = 0; steps.Count > 0 && round <= context.Space.Cases.Length; round++)
+        {
+            var kept = steps.Aggregate(invariant, (excluded, step) => excluded & Stepped(step, invariant));
+            if (kept.Cases.Count == invariant.Cases.Count && kept.IncludesNull == invariant.IncludesNull)
+            {
+                return invariant;
+            }
+
+            invariant = kept;
+        }
+
+        return steps.Count == 0 ? invariant : CaseSet.Empty;
+
+        // What the switch gives, where its input is none of `before`: what every arm that can match a case that's left
+        // gives, and for an arm that gives the input back, the cases that are left and that it can match.
+        CaseSet Stepped(ISwitchExpressionOperation step, CaseSet before)
+        {
+            CaseSet? given = null;
+            var earlier = CaseSet.Empty;
+            foreach (var arm in step.Arms)
+            {
+                var outcome = Facts.Of(arm.Pattern, context.Space, model.Compilation);
+                var left = context.Space.Cases.Cast<object?>().Append(null).Where(c => !before.ContainsCase(c) && !earlier.ContainsCase(c));
+                if (left.All(outcome.AlwaysFalse.ContainsCase) || Facts.IsThrow(arm.Value))
+                {
+                    continue;
+                }
+
+                given = Meet(given, context.Value.IsReadBy(Unconverted(arm.Value))
+                    ? before | earlier | outcome.AlwaysFalse
+                    : KnownExcluded(arm.Value, [], context.Space, model, context.Value.Session, ct, context.Copies + 1));
+
+                if (arm.Guard is null)
+                {
+                    earlier |= outcome.AlwaysTrue;
+                }
+            }
+
+            return given ?? CaseSet.Of(context.Space.Cases, includesNull: true);
+        }
+
+        // Through identity conversions, and a target-typed switch's.
+        static IOperation Unconverted(IOperation operation) =>
+            operation is IConversionOperation { OperatorMethod: null } conversion && (conversion.Conversion.IsIdentity || conversion.GetConversion().IsSwitchExpression)
+                ? Unconverted(conversion.Operand)
+                : operation;
     }
 
     /// <summary>
@@ -598,7 +712,8 @@ internal static partial class Narrowing
             .ToList();
 
         if (outArguments is not { Count: 1 }
-            || outArguments[0].Parent is not IInvocationOperation { TargetMethod: var method }
+            || outArguments[0].Parent is not IInvocationOperation { TargetMethod: var method } call
+            || Functions.IsIntercepted(call)
             || outArguments[0].Parameter is not { } outParameter
             || Symbols.References(local, statement, model, ct).Any(name =>
                 WriteAnalysis.IsWrite(name, model, ct) && !name.Span.IntersectsWith(outArguments[0].Syntax.Span)
@@ -610,7 +725,7 @@ internal static partial class Narrowing
 
         var calleeSpace = context.Space.Reading(method, model.Compilation);
         method = method.OriginalDefinition;
-        if (Functions.OwnDeclaration(method, model.Compilation, ct) is not { } declaration)
+        if ((!value.Session.FollowsCallees && method.MethodKind != MethodKind.LocalFunction) || Functions.OwnDeclaration(method, model.Compilation, ct) is not { } declaration)
         {
             return CaseSet.Empty;
         }
@@ -757,6 +872,10 @@ internal static partial class Narrowing
         {
             switch (expression)
             {
+                // `null` (or `default` of a reference type) holds no case at all.
+                case { ConstantValue: { HasValue: true, Value: null } }:
+                    return CaseSet.Of(space.Cases);
+
                 // A union made from one of its cases (`Pet pet = cat;`, `new Pet(cat)`), or a closed type from one of its
                 // derived types (`Shape shape = new Circle();`).
                 case IConversionOperation { OperatorMethod: IMethodSymbol { MethodKind: MethodKind.Constructor, ContainingType.IsUnion: true } } union:
@@ -801,14 +920,14 @@ internal static partial class Narrowing
                 return Known(coalesce.Value) & Known(coalesce.WhenNull);
 
             // `pets.First(p => p is not Bird)`, `pets.Where(...).Single()`: an element that passed the filters.
-            case IInvocationOperation invocation when Sequences.ElementResult(invocation) is var (sequence, predicate, mayBeDefault):
+            case IInvocationOperation invocation when !Functions.IsIntercepted(invocation) && Sequences.ElementResult(invocation) is var (sequence, predicate, mayBeDefault):
                 var element = FactsFromFilters(sequence, steps, space, model, session, ct, copies)
                     | (predicate is null ? CaseSet.Empty : FilterFacts(predicate, steps, space, model, session))
                     | FirstSkipped(invocation, sequence, steps, space, model, session);
                 return mayBeDefault ? CaseSet.Of(element.Cases) : element;
 
             case IInvocationOperation invocation:
-                return steps.Count == 0 ? FromReturns(invocation.TargetMethod, awaited: false) : CaseSet.Empty;
+                return steps.Count == 0 && !Functions.IsIntercepted(invocation) ? FromReturns(invocation.TargetMethod, awaited: false) : CaseSet.Empty;
 
             // `await MakeCat()` (or `await MakeCat().ConfigureAwait(false)`), for an async method: what its returns are.
             case IAwaitOperation { Operation: var awaitedCall } when steps.Count == 0:
@@ -817,7 +936,7 @@ internal static partial class Narrowing
                     awaitedCall = configured;
                 }
 
-                return awaitedCall is IInvocationOperation awaitedInvocation ? FromReturns(awaitedInvocation.TargetMethod, awaited: true) : CaseSet.Empty;
+                return awaitedCall is IInvocationOperation awaitedInvocation && !Functions.IsIntercepted(awaitedInvocation) ? FromReturns(awaitedInvocation.TargetMethod, awaited: true) : CaseSet.Empty;
 
             // `new Owner(cat).Pet`, `new Owner { Pet = cat }.Pet`, `(owner with { Pet = cat }).Pet`, `owners.First().Pet`
             case IPropertyReferenceOperation or IFieldReferenceOperation when ((IMemberReferenceOperation)expression).Instance is { } instance
@@ -849,12 +968,21 @@ internal static partial class Narrowing
 
         // A value of the operand's static type: not a case none of whose values can be one, and not null if the
         // operand can't be.
-        CaseSet FromCase(IOperation operand) =>
-            operand.Type is not { } type ? CaseSet.Empty
-            : Facts.NotOfType(type, space, model.Compilation)
-                | (type.IsValueType && type.OriginalDefinition.SpecialType != SpecialType.System_Nullable_T
-                    || model.GetTypeInfo(operand.Syntax, ct).Nullability.FlowState == NullableFlowState.NotNull ? CaseSet.Null : CaseSet.Empty
-                );
+        // The object made into a case (`new NotFound(1)` for a union with a closed case type AppError): it's still what it
+        // was before it was converted to the case type.
+        CaseSet FromCase(IOperation operand)
+        {
+            while (operand is IConversionOperation { Conversion: { IsImplicit: true, IsReference: true }, OperatorMethod: null } widened)
+            {
+                operand = widened.Operand;
+            }
+
+            return operand.Type is not { } type ? CaseSet.Empty
+                : Facts.NotOfType(type, space, model.Compilation)
+                    | (type.IsValueType && type.OriginalDefinition.SpecialType != SpecialType.System_Nullable_T
+                        || model.GetTypeInfo(operand.Syntax, ct).Nullability.FlowState == NullableFlowState.NotNull ? CaseSet.Null : CaseSet.Empty
+                    );
+        }
 
         // What every return of a method declared in this compilation (that the call can't be dispatched away from) is,
         // each one another walk (and a method can return a call to itself). An awaited call is to an async method, whose
@@ -863,7 +991,7 @@ internal static partial class Narrowing
         {
             var calleeSpace = space.Reading(method, model.Compilation);
             method = method.OriginalDefinition;
-            if (method.IsAsync != awaited || Functions.OwnDeclaration(method, model.Compilation, ct) is not { } declaration)
+            if (method.IsAsync != awaited || (!session.FollowsCallees && method.MethodKind != MethodKind.LocalFunction) || Functions.OwnDeclaration(method, model.Compilation, ct) is not { } declaration)
             {
                 return CaseSet.Empty;
             }

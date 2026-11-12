@@ -11,6 +11,7 @@ using Microsoft.CodeAnalysis.CSharp.Syntax;
 using Microsoft.CodeAnalysis.Diagnostics;
 using Microsoft.CodeAnalysis.Text;
 using UnionNarrowing.Suppressors;
+using UnionNarrowing.Suppressors.Analyzers;
 
 namespace UnionNarrowing.Tests;
 
@@ -29,6 +30,28 @@ file class EditorConfig(IReadOnlyDictionary<string, string> values) : AnalyzerCo
 
     public override AnalyzerConfigOptions GetOptions(AdditionalText textFile) =>
         _options;
+}
+
+/// <summary>
+/// The severities that .editorconfig settings like <c>dotnet_diagnostic.UN0020.severity = none</c> give, the same for every file, which the compiler applies itself rather than handing them to analyzers.
+/// Only <c>none</c> is read.
+/// </summary>
+file class DiagnosticSeverities(IReadOnlyDictionary<string, string> values) : SyntaxTreeOptionsProvider
+{
+    public override GeneratedKind IsGenerated(SyntaxTree tree, CancellationToken cancellationToken) =>
+        GeneratedKind.Unknown;
+
+    public override bool TryGetDiagnosticValue(SyntaxTree tree, string diagnosticId, CancellationToken cancellationToken, out ReportDiagnostic severity)
+    {
+        severity = ReportDiagnostic.Suppress;
+        return values.TryGetValue($"dotnet_diagnostic.{diagnosticId}.severity", out var value) && value == "none";
+    }
+
+    public override bool TryGetGlobalDiagnosticValue(string diagnosticId, CancellationToken cancellationToken, out ReportDiagnostic severity)
+    {
+        severity = ReportDiagnostic.Default;
+        return false;
+    }
 }
 
 /// <summary>
@@ -59,6 +82,17 @@ file class Options(IReadOnlyDictionary<string, string> values) : AnalyzerConfigO
 internal static partial class Verify
 {
     private const string BecauseMarker = "/*because*/";
+
+    /// <summary>
+    /// UN0020, which reports what a switch misses instead of the compiler, where earlier code rules some of it out.
+    /// </summary>
+    private const string ReportedInstead = "UN0020";
+
+    /// <summary>
+    /// The suppressions of CS8509 and CS8846 on a switch that UN0020 is reported on instead.
+    /// </summary>
+    private static readonly string[] SuppressedForReportedInstead = ["UN0021", "UN0022"];
+
     private const string SuppressedMarker = "/*suppressed*/";
 
     /// <summary>
@@ -107,12 +141,12 @@ internal static partial class Verify
         IdePopulateSwitchAnalyzers[1];
 
     /// <summary>
-    /// Every diagnostic, from the compiler and <paramref name="analyzer"/>, with the suppressor's suppressions.
+    /// Every diagnostic, from the compiler and <paramref name="analyzer"/>, with the suppressor's suppressions, and UN0020 where it's reported instead of a suppressed CS8509.
     /// </summary>
     private static async Task<ImmutableArray<Diagnostic>> AfterTheSuppressor(Document document, DiagnosticAnalyzer? analyzer, CancellationToken ct)
     {
-        var analyzers = ImmutableArray.Create<DiagnosticAnalyzer>(new UnionNarrowingSuppressor());
-        if (analyzer is not null)
+        var analyzers = ImmutableArray.Create<DiagnosticAnalyzer>(new UnionNarrowingSuppressor(), analyzer as MissingCasesAnalyzer ?? new MissingCasesAnalyzer());
+        if (analyzer is not null and not MissingCasesAnalyzer)
         {
             analyzers = analyzers.Add(analyzer);
         }
@@ -180,19 +214,20 @@ internal static partial class Verify
         IEnumerable<MetadataReference>? references,
         string assemblyName = "Test",
         IEnumerable<string>? disabledWarnings = null,
-        IEnumerable<string>? enabled = null
+        IEnumerable<string>? enabled = null,
+        IReadOnlyDictionary<string, string>? editorConfig = null,
+        string? generated = null,
+        IReadOnlyDictionary<string, ReportDiagnostic>? diagnosticOptions = null,
+        ReportDiagnostic generalOption = ReportDiagnostic.Default
     )
     {
-        var tree = CSharpSyntaxTree.ParseText(
-            text,
-            new CSharpParseOptions(LanguageVersion.Latest),
-            path: "Test.cs",
-            cancellationToken: TestContext.Current.CancellationToken
-        );
+        var trees = new[] { (Path: "Test.cs", Text: text), (Path: "Test.g.cs", Text: generated) }
+            .Where(file => file.Text is not null)
+            .Select(file => CSharpSyntaxTree.ParseText(file.Text!, new CSharpParseOptions(LanguageVersion.Latest), path: file.Path, cancellationToken: TestContext.Current.CancellationToken));
 
         return CSharpCompilation.Create(
             assemblyName,
-            [tree],
+            trees,
             FrameworkReferences.AddRange(references ?? []),
             new CSharpCompilationOptions(
                 outputKind,
@@ -200,7 +235,9 @@ internal static partial class Verify
                 allowUnsafe: allowUnsafe,
                 specificDiagnosticOptions: (disabledWarnings ?? []).Select(id => KeyValuePair.Create(id, ReportDiagnostic.Suppress))
                     .Concat((enabled ?? []).Select(id => KeyValuePair.Create(id, ReportDiagnostic.Info)))
-            )
+                    .Concat(diagnosticOptions ?? new Dictionary<string, ReportDiagnostic>()),
+                generalDiagnosticOption: generalOption
+            ).WithSyntaxTreeOptionsProvider(editorConfig is null ? null : new DiagnosticSeverities(editorConfig))
         );
     }
 
@@ -291,14 +328,16 @@ internal static partial class Verify
         bool topLevelStatements,
         string diagnosticId,
         IEnumerable<string>? disabledWarnings,
-        IReadOnlyDictionary<string, string>? editorConfig
+        IReadOnlyDictionary<string, string>? editorConfig,
+        IReadOnlyDictionary<string, ReportDiagnostic>? diagnosticOptions,
+        ReportDiagnostic generalOption
     )
     {
         var outputKind = topLevelStatements ? OutputKind.ConsoleApplication : OutputKind.DynamicallyLinkedLibrary;
-        var compilation = Compile(text, outputKind, allowUnsafe, references, disabledWarnings: disabledWarnings);
+        var compilation = Compile(text, outputKind, allowUnsafe, references, disabledWarnings: disabledWarnings, editorConfig: editorConfig, diagnosticOptions: diagnosticOptions, generalOption: generalOption);
         var tree = compilation.SyntaxTrees[0];
 
-        var errors = compilation.GetDiagnostics().Where(d => d.Severity == DiagnosticSeverity.Error).ToList();
+        var errors = compilation.GetDiagnostics().Where(d => d.Severity == DiagnosticSeverity.Error && !d.IsWarningAsError).ToList();
         if (errors.Count > 0)
         {
             return "The snippet doesn't compile:\n" + string.Join("\n", errors);
@@ -318,7 +357,7 @@ internal static partial class Verify
             logAnalyzerExecutionTime: false,
             reportSuppressedDiagnostics: true
         );
-        var analyzers = ImmutableArray.Create<DiagnosticAnalyzer>(new UnionNarrowingSuppressor());
+        var analyzers = ImmutableArray.Create<DiagnosticAnalyzer>(new UnionNarrowingSuppressor(), new MissingCasesAnalyzer());
         if (diagnosticId.StartsWith("IDE", StringComparison.Ordinal))
         {
             analyzers = analyzers.AddRange(IdePopulateSwitchAnalyzers);
@@ -341,6 +380,9 @@ internal static partial class Verify
 
         var problems = new StringBuilder();
         var reported = diagnostics.Where(d => d.Id == diagnosticId).ToDictionary(d => SwitchKeywordAt(d.Location));
+        var reportedInstead = diagnostics.Where(d => d.Id == ReportedInstead && !d.IsSuppressed && d.Severity >= DiagnosticSeverity.Warning)
+            .GroupBy(d => SwitchKeywordAt(d.Location))
+            .ToDictionary(reports => reports.Key, reports => reports.Max(d => d.Severity));
 
         foreach (var (position, shouldSuppress) in expected.OrderBy(e => e.Key))
         {
@@ -348,10 +390,27 @@ internal static partial class Verify
             if (!reported.TryGetValue(position, out var diagnostic))
             {
                 problems.AppendLine($"{where}: expected {diagnosticId} here, but it wasn't reported (the test proves nothing)");
+                continue;
             }
-            else if (diagnostic.IsSuppressed != shouldSuppress)
+
+            var replaced = diagnostic.IsSuppressed
+                && diagnostic.GetSuppressionInfo(compilation)!.ProgrammaticSuppressions.All(s => SuppressedForReportedInstead.Contains(s.Descriptor.Id));
+            var standsIn = reportedInstead.TryGetValue(position, out var insteadSeverity) && insteadSeverity >= diagnostic.Severity;
+            
+            if (replaced != standsIn)
             {
-                problems.AppendLine($"{where}: expected {diagnosticId} to be {(shouldSuppress ? "suppressed" : "left in place")}, but it was {(diagnostic.IsSuppressed ? "suppressed" : "left in place")}");
+                problems.AppendLine(replaced
+                    ? $"{where}: {diagnosticId} was suppressed for {ReportedInstead} to be reported instead, but {ReportedInstead} wasn't reported"
+                    : $"{where}: {ReportedInstead} was reported, but {diagnosticId} was {(diagnostic.IsSuppressed ? "suppressed" : "left in place")} as well"
+                );
+            }
+
+            var silenced = diagnostic.IsSuppressed && !replaced;
+            if (silenced != shouldSuppress)
+            {
+                problems.AppendLine($"{where}: expected {diagnosticId} to be {(shouldSuppress ? "suppressed" : $"left in place (or reported as {ReportedInstead})")}, "
+                    + $"but it was {(silenced ? "suppressed" : replaced ? $"reported as {ReportedInstead}" : "left in place")}"
+                );
             }
         }
 
@@ -515,11 +574,16 @@ internal static partial class Verify
     /// Returns the diagnostics in the order they appear, for checking messages.
     /// </summary>
     /// <param name="enabled">Rules that are off by default, turned on.</param>
-    public static async Task<IReadOnlyList<Diagnostic>> Diagnostics(DiagnosticAnalyzer analyzer, string source, bool topLevelStatements = false, IEnumerable<string>? enabled = null)
+    /// <param name="references">Assemblies the snippet uses, from <see cref="CompileToMetadata"/>.</param>
+    /// <param name="generated">A second file, of generated code (<c>Test.g.cs</c>), which can't have markers: nothing may be reported in it.</param>
+    public static async Task<IReadOnlyList<Diagnostic>> Diagnostics(
+        DiagnosticAnalyzer analyzer, string source, bool topLevelStatements = false, IEnumerable<string>? enabled = null, IEnumerable<MetadataReference>? references = null,
+        string? generated = null
+    )
     {
         var text = Usings + source + Types;
         var outputKind = topLevelStatements ? OutputKind.ConsoleApplication : OutputKind.DynamicallyLinkedLibrary;
-        var compilation = Compile(text, outputKind, allowUnsafe: false, references: null, enabled: enabled);
+        var compilation = Compile(text, outputKind, allowUnsafe: false, references, enabled: enabled, generated: generated);
         var tree = compilation.SyntaxTrees[0];
 
         var errors = compilation.GetDiagnostics().Where(d => d.Severity == DiagnosticSeverity.Error).ToList();
@@ -552,7 +616,11 @@ internal static partial class Verify
 
         foreach (var diagnostic in reported)
         {
-            if (!expected.TryGetValue(diagnostic.Location.SourceSpan.Start, out var id) || id != diagnostic.Id)
+            if (diagnostic.Location.SourceTree != tree)
+            {
+                problems.AppendLine($"{diagnostic.Location.GetLineSpan()}: unexpected {diagnostic.Id} in generated code: {diagnostic.GetMessage()}");
+            }
+            else if (!expected.TryGetValue(diagnostic.Location.SourceSpan.Start, out var id) || id != diagnostic.Id)
             {
                 problems.AppendLine($"{Where(tree, diagnostic.Location.SourceSpan.Start)}: unexpected {diagnostic.Id}: {diagnostic.GetMessage()}");
             }
@@ -595,9 +663,10 @@ internal static partial class Verify
     /// Compiles a snippet with and without the suppressor and checks every <paramref name="diagnosticId"/> against a marker written immediately before the <c>switch</c> keyword of its switch:
     /// <list type="bullet">
     /// <item><c>/*suppressed*/switch</c>: the compiler reports it here and the suppressor silences it.</item>
-    /// <item><c>/*warns*/switch</c>: the compiler reports it here and it stays.</item>
+    /// <item><c>/*warns*/switch</c>: the compiler reports it here and it stays, or the switch gets UN0020 instead, which names what it misses where earlier code rules some of the rest out (and nothing else may suppress it).</item>
     /// </list>
     /// Every marker must have its diagnostic (so a test can't pass because the compiler was already happy), every diagnostic must have a marker, the snippet must compile, and the suppressor must not throw.
+    /// UN0020 has to be reported on exactly the switches whose diagnostic is suppressed for it.
     /// (Roslyn itself rejects a suppression of any diagnostic other than the descriptor's.)
     /// <para>
     /// <c>/*because*/</c>, written immediately before a statement, says that statement is why the <c>/*warns*/</c> switches in the same member warn.
@@ -605,6 +674,9 @@ internal static partial class Verify
     /// </para>
     /// </summary>
     /// <param name="disabledWarnings">Warnings turned off for the compilation, as NoWarn would.</param>
+    /// <param name="diagnosticOptions">Severities set for the compilation by ID, as WarningsAsErrors (<see cref="ReportDiagnostic.Error"/>) and WarningsNotAsErrors (<see cref="ReportDiagnostic.Default"/>) do.</param>
+    /// <param name="generalOption">The severity for every warning, as TreatWarningsAsErrors (<see cref="ReportDiagnostic.Error"/>) sets it.</param>
+    /// <param name="editorConfig">.editorconfig settings for every file, which the compiler reads where they turn a diagnostic off (<c>dotnet_diagnostic.UN0020.severity = none</c>).</param>
     /// <param name="diagnosticId">What the markers are about:
     /// CS8509 from the compiler (or CS8846, CS8655, CS8847), or IDE0072 or IDE0010 from the IDE's populate-switch analyzers, which are run too.
     /// Each is matched to the <c>switch</c> keyword of its switch.</param>
@@ -615,11 +687,13 @@ internal static partial class Verify
         bool topLevelStatements = false,
         string diagnosticId = "CS8509",
         IEnumerable<string>? disabledWarnings = null,
-        IReadOnlyDictionary<string, string>? editorConfig = null
+        IReadOnlyDictionary<string, string>? editorConfig = null,
+        IReadOnlyDictionary<string, ReportDiagnostic>? diagnosticOptions = null,
+        ReportDiagnostic generalOption = ReportDiagnostic.Default
     )
     {
         var text = Usings + source + Types;
-        var problems = await SuppressionProblems(text, allowUnsafe, references, topLevelStatements, diagnosticId, disabledWarnings, editorConfig);
+        var problems = await SuppressionProblems(text, allowUnsafe, references, topLevelStatements, diagnosticId, disabledWarnings, editorConfig, diagnosticOptions, generalOption);
         Assert.True(problems.Length == 0, problems);
 
         if (!text.Contains(BecauseMarker, StringComparison.Ordinal))
@@ -627,7 +701,7 @@ internal static partial class Verify
             return;
         }
 
-        problems = await SuppressionProblems(WithoutTheReasons(text), allowUnsafe, references, topLevelStatements, diagnosticId, disabledWarnings, editorConfig);
+        problems = await SuppressionProblems(WithoutTheReasons(text), allowUnsafe, references, topLevelStatements, diagnosticId, disabledWarnings, editorConfig, diagnosticOptions, generalOption);
         Assert.True(problems.Length == 0, $"With the {BecauseMarker} statements taken out, the switches they're the reason for should be suppressed:\n{problems}");
     }
 }

@@ -205,6 +205,33 @@ public class CallTests
         );
 
     [Fact]
+    public Task Custom_union_constructors_are_called_by_conversions() =>
+        Verify.Suppressions("""
+            using System.Runtime.CompilerServices;
+            """ + Snippets.Shapes + """
+
+            [Union]
+            sealed class Drawn : IUnion
+            {
+                public Drawn(Shape shape)
+                {
+                    Sides = shape /*warns*/switch { Circle => 0, Square => 4 };
+                    Value = shape;
+                }
+
+                public int Sides { get; }
+                public object? Value { get; }
+            }
+
+            class C
+            {
+                Drawn Circle() => new Drawn(new Circle(1));
+                Drawn Any(Triangle t) => (Shape)t;
+            }
+            """
+        );
+
+    [Fact]
     public Task Local_function_called_only_after_guards() =>
         Verify.Suppressions("""
             class C
@@ -334,6 +361,42 @@ public class CallTests
                 int Flock(Bird bird) => new Flock { bird } is { } ? 0 : 1;
                 void Log(Bird bird) => Handle($"{bird}");
                 void Handle(PetHandler handler) { }
+            }
+            """
+        );
+
+    [Fact]
+    public Task Generic_private_method_called_after_a_guard() =>
+        Verify.Suppressions("""
+            sealed record Some<T>(T Value);
+            sealed record None;
+            union Option<T>(Some<T>, None);
+
+            closed record Step<T>;
+            sealed record Start<T>(T Value) : Step<T>;
+            sealed record Next<T>(T Value) : Step<T>;
+            sealed record Stop<T> : Step<T>;
+
+            class C
+            {
+                public int Concrete(Option<int> o)
+                {
+                    if (o is None) return 0;
+                    return Value(o);
+                }
+
+                static int Value<T>(Option<T> o) => o /*suppressed*/switch { Some<T> => 1 };
+
+                // A generic caller excludes a generic case.
+                public int Generic<T>(Step<T> s) => s switch { Start<T> => 1, _ => Rest(s) };
+
+                static int Rest<T>(Step<T> s) => s /*suppressed*/switch { Next<T> => 2, Stop<T> => 3 };
+
+                // One caller doesn't rule None out.
+                public int Unguarded(Option<string> o) => Either(o);
+                public int Guarded(Option<string> o) => o is None ? 0 : Either(o);
+
+                static int Either<T>(Option<T> o) => o /*warns*/switch { Some<T> => 1 };
             }
             """
         );

@@ -45,6 +45,7 @@ public sealed class UnassignedUnionMemberAnalyzer : DiagnosticAnalyzer
         }
 
         var assignments = new ConcurrentDictionary<IMethodSymbol, (ImmutableHashSet<ISymbol> Assigned, IMethodSymbol? Chained)>(SymbolEqualityComparer.Default);
+        var creating = new ConcurrentDictionary<IMethodSymbol, bool>(SymbolEqualityComparer.Default);
 
         context.RegisterOperationBlockAction(block =>
         {
@@ -57,6 +58,17 @@ public sealed class UnassignedUnionMemberAnalyzer : DiagnosticAnalyzer
             }
         });
 
+        context.RegisterOperationAction(
+            creation =>
+            {
+                if (((IObjectCreationOperation)creation.Operation).Constructor is { } constructor)
+                {
+                    creating[constructor.OriginalDefinition] = true;
+                }
+            },
+            OperationKind.ObjectCreation
+        );
+
         context.RegisterSymbolEndAction(end =>
         {
             foreach (var member in candidates)
@@ -65,7 +77,7 @@ public sealed class UnassignedUnionMemberAnalyzer : DiagnosticAnalyzer
                 {
                     { IsStatic: true } => (type.StaticConstructors, "an initializer or the static constructor"),
                     IFieldSymbol { IsRequired: true } or IPropertySymbol { IsRequired: true } => ([.. type.InstanceConstructors.Where(SetsRequiredMembers)], "every constructor with [SetsRequiredMembers]"),
-                    _ => ([.. type.InstanceConstructors.Where(c => !IsRecordCopyConstructor(c))], "every constructor"),
+                    _ => ([.. type.InstanceConstructors.Where(c => !IsRecordCopyConstructor(c) && !OnlyCalledFromOutside(c, creating, end.Compilation))], "every constructor"),
                 };
 
                 // Nothing assigns a static member if there's no static constructor; nothing has to assign a required one if
@@ -82,7 +94,12 @@ public sealed class UnassignedUnionMemberAnalyzer : DiagnosticAnalyzer
                     ? $"default({Display(memberType)}), with default({Display(union)}) in {path}"
                     : $"default({Display(memberType)})";
 
-                end.ReportDiagnostic(Diagnostic.Create(Descriptors.UnassignedUnionMember, member.Locations[0], member.Name, by, leftAs));
+                // An initializer, even `= default!`, only runs on one thread (CA2019).
+                var perThread = Symbols.HasAttribute(member, "ThreadStaticAttribute", "System")
+                    ? $". A [ThreadStatic] field starts out as the default on every thread that doesn't set it, so make it a '{Display(memberType)}?'"
+                    : "";
+
+                end.ReportDiagnostic(Diagnostic.Create(Descriptors.UnassignedUnionMember, member.Locations[0], member.Name, by, leftAs, perThread));
             }
         });
 
@@ -97,6 +114,18 @@ public sealed class UnassignedUnionMemberAnalyzer : DiagnosticAnalyzer
     private static bool IsRecordCopyConstructor(IMethodSymbol constructor) =>
         constructor is { IsImplicitlyDeclared: true, ContainingType.IsRecord: true, Parameters.Length: 1 }
         && SymbolEqualityComparer.Default.Equals(constructor.Parameters[0].Type, constructor.ContainingType);
+
+    /// <summary>
+    /// Whether a constructor is one that only something outside the source calls, as an ORM like EF Core does to materialize an object (<c>protected Order() { }</c>):
+    /// it's written, parameterless, and private or protected, the type's members don't create an object with it, and the type has no nested types, which could, nor types that derive from it, whose constructors could call it.
+    /// </summary>
+    /// <param name="creating">The constructors that the type's members create objects with.</param>
+    private static bool OnlyCalledFromOutside(IMethodSymbol constructor, IReadOnlyDictionary<IMethodSymbol, bool> creating, Compilation compilation) =>
+        constructor is { Parameters.IsEmpty: true, IsImplicitlyDeclared: false, DeclaredAccessibility: Accessibility.Private or Accessibility.Protected or Accessibility.ProtectedAndInternal }
+        && !creating.ContainsKey(constructor)
+        && constructor.ContainingType.GetTypeMembers().IsEmpty
+        && !BoxedUnionAnalyzer.TypesIn(compilation.Assembly.GlobalNamespace)
+            .Any(type => SymbolEqualityComparer.Default.Equals(type.BaseType?.OriginalDefinition, constructor.ContainingType.OriginalDefinition));
 
     /// <summary>
     /// The names a <c>[MemberNotNull]</c> method gives for the members it assigns.
@@ -191,6 +220,33 @@ public sealed class UnassignedUnionMemberAnalyzer : DiagnosticAnalyzer
     }
 
     /// <summary>
+    /// Whether a branch is the way past a switch on a bool that neither <c>case true:</c> nor <c>case false:</c> matched, which nothing takes, as the compiler's definite assignment knows:
+    /// it's taken when a test of a value against one bool fails, where that test is only reached when a test of the same value against the other one failed.
+    /// </summary>
+    private static bool PastBothBoolCases(ControlFlowBranch branch)
+    {
+        static (CaptureId Value, bool Constant)? BoolTest(BasicBlock block) =>
+            block is
+            {
+                ConditionKind: ControlFlowConditionKind.WhenFalse,
+                BranchValue: IBinaryOperation
+                {
+                    OperatorKind: BinaryOperatorKind.Equals,
+                    LeftOperand: IFlowCaptureReferenceOperation { Type.SpecialType: SpecialType.System_Boolean, Id: var value },
+                    RightOperand.ConstantValue: { HasValue: true, Value: bool constant },
+                },
+            }
+                ? (value, constant)
+                : null;
+
+        return branch is { IsConditionalSuccessor: true, Source: { Predecessors.Length: 1 } source }
+            && source.Predecessors[0] is { IsConditionalSuccessor: true } way
+            && BoolTest(source) is var (value, constant)
+            && BoolTest(way.Source) is var (earlierValue, earlierConstant)
+            && value.Equals(earlierValue) && constant != earlierConstant;
+    }
+
+    /// <summary>
     /// The members of <paramref name="type"/> a constructor assigns on every way through it that gets to its end (a way that throws doesn't), from its control flow graph;
     /// and the constructor of the type it chains to with <c>: this(...)</c>, which assigns the rest.
     /// </summary>
@@ -219,7 +275,8 @@ public sealed class UnassignedUnionMemberAnalyzer : DiagnosticAnalyzer
             ? null
             : block.Predecessors.IsEmpty
                 ? None
-                : block.Predecessors.Select(p => after[p.Source.Ordinal]).OfType<ImmutableHashSet<ISymbol>>().Aggregate((ImmutableHashSet<ISymbol>?)null, (all, each) => all?.Intersect(each) ?? each);
+                : block.Predecessors.Where(p => !PastBothBoolCases(p)).Select(p => after[p.Source.Ordinal]).OfType<ImmutableHashSet<ISymbol>>()
+                    .Aggregate((ImmutableHashSet<ISymbol>?)null, (all, each) => all?.Intersect(each) ?? each);
 
         for (var changed = true; changed;)
         {
@@ -246,9 +303,12 @@ public sealed class UnassignedUnionMemberAnalyzer : DiagnosticAnalyzer
         return (atEnd, chained?.TargetMethod);
     }
 
+    /// <remarks>
+    /// Generated code is analyzed, since a generated part of a class can have the constructor that assigns a member, but nothing is reported in it.
+    /// </remarks>
     public override void Initialize(AnalysisContext context)
     {
-        context.ConfigureGeneratedCodeAnalysis(GeneratedCodeAnalysisFlags.None);
+        context.ConfigureGeneratedCodeAnalysis(GeneratedCodeAnalysisFlags.Analyze);
         context.EnableConcurrentExecution();
         context.RegisterSymbolStartAction(AnalyzeType, SymbolKind.NamedType);
     }

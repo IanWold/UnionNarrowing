@@ -1,17 +1,4 @@
-using System.Collections.Generic;
 using System.Collections.Immutable;
-using System.Composition;
-using System.Linq;
-using System.Threading;
-using System.Threading.Tasks;
-using Microsoft.CodeAnalysis;
-using Microsoft.CodeAnalysis.CodeActions;
-using Microsoft.CodeAnalysis.CodeFixes;
-using Microsoft.CodeAnalysis.CSharp;
-using Microsoft.CodeAnalysis.CSharp.Syntax;
-using Microsoft.CodeAnalysis.Operations;
-using UnionNarrowing.Suppressors.Analysis;
-using static Microsoft.CodeAnalysis.CSharp.SyntaxFactory;
 
 namespace UnionNarrowing.CodeFixes;
 
@@ -29,28 +16,18 @@ namespace UnionNarrowing.CodeFixes;
 public sealed class AddMissingArmsCodeFix : CodeFixProvider
 {
     public override ImmutableArray<string> FixableDiagnosticIds =>
-        ["CS8509", "CS8846", "CS8655", "CS8847"];
+        ["CS8509", "CS8846", "CS8655", "CS8847", "UN0020"];
 
     private static async Task<Document> AddArmsAsync(Document document, IReadOnlyDictionary<SwitchExpressionSyntax, List<PatternSyntax>> missing, CancellationToken ct)
     {
         var root = await document.GetSyntaxRootAsync(ct).ConfigureAwait(false);
-        var newRoot = root!.ReplaceNodes(missing.Keys, (original, current) => WithArms(current, missing[original]));
+        var options = await document.GetOptionsAsync(ct).ConfigureAwait(false);
+        var newRoot = root!.ReplaceNodes(missing.Keys, (original, current) => original.Arms.Count == 0 ? WithFirstArms(original, current, missing[original], options) : WithArms(current, missing[original]));
         return await CodeFixSyntax.ShortenNamesAsync(document.WithSyntaxRoot(newRoot), ct).ConfigureAwait(false);
     }
 
     private static SyntaxToken Comma(SyntaxTriviaList trailing) =>
         Token(SyntaxTriviaList.Empty, SyntaxKind.CommaToken, trailing);
-
-    /// <summary>
-    /// The whitespace the arm's line starts with.
-    /// </summary>
-    private static SyntaxTriviaList IndentationOf(SwitchExpressionArmSyntax arm)
-    {
-        var leading = arm.GetLeadingTrivia();
-        var lineStart = leading.Count - leading.Reverse().TakeWhile(t => !t.IsKind(SyntaxKind.EndOfLineTrivia) && !t.IsDirective).Count();
-
-        return TriviaList(leading.Skip(lineStart).TakeWhile(t => t.IsKind(SyntaxKind.WhitespaceTrivia)));
-    }
 
     /// <summary>
     /// For each switch the diagnostics are on, and the fix is offered for, patterns for what it misses:
@@ -70,7 +47,7 @@ public sealed class AddMissingArmsCodeFix : CodeFixProvider
         var session = new Session(document.Project.AnalyzerOptions.AnalyzerConfigOptionsProvider);
         foreach (var diagnostic in diagnostics)
         {
-            if (root.FindToken(diagnostic.Location.SourceSpan.Start).Parent is not SwitchExpressionSyntax { Arms.Count: > 0 } switchExpr
+            if (root.FindToken(diagnostic.Location.SourceSpan.Start).Parent is not SwitchExpressionSyntax switchExpr
                 || missing.ContainsKey(switchExpr)
                 || switchExpr.DescendantTrivia().Any(t => t.IsKind(SyntaxKind.DisabledTextTrivia))
             )
@@ -104,7 +81,7 @@ public sealed class AddMissingArmsCodeFix : CodeFixProvider
     );
 
     /// <summary>
-    /// The switch with arms for the cases after its last one, laid out like the existing ones:
+    /// The switch with arms for the cases after its last one, laid out like the existing ones (an empty switch gets <see cref="WithFirstArms"/> instead):
     /// each on a line of its own, indented like the first arm and with the same line breaks, if the arms start on a line of their own, and otherwise inline.
     /// Whatever ends the last arm's line (a comment, say) stays there.
     /// </summary>
@@ -112,7 +89,7 @@ public sealed class AddMissingArmsCodeFix : CodeFixProvider
     {
         var lineBreak = switchExpr.OpenBraceToken.TrailingTrivia.FirstOrDefault(t => t.IsKind(SyntaxKind.EndOfLineTrivia));
         var multiline = lineBreak.IsKind(SyntaxKind.EndOfLineTrivia);
-        var indentation = multiline ? IndentationOf(switchExpr.Arms[0]) : SyntaxTriviaList.Empty;
+        var indentation = multiline ? CodeFixSyntax.Indentation(switchExpr.Arms[0].GetLeadingTrivia()) : SyntaxTriviaList.Empty;
         var separator = multiline ? TriviaList(lineBreak) : TriviaList(Space);
 
         var elements = switchExpr.Arms.GetWithSeparators();
@@ -143,6 +120,31 @@ public sealed class AddMissingArmsCodeFix : CodeFixProvider
         }
 
         return switchExpr.WithArms(SeparatedList<SwitchExpressionArmSyntax>(list));
+    }
+
+    /// <summary>
+    /// An empty switch (<paramref name="current"/> is <paramref name="original"/> as it is so far) with arms for the cases, one per line, each with a comma after it, and the <c>}</c> on a line of its own:
+    /// indented one level past the line the <c>{</c> is on, as the IDE's formatting would.
+    /// A level is a tab where that line is indented with tabs, and otherwise what the document's options say, and the line breaks are that line's.
+    /// </summary>
+    private static SwitchExpressionSyntax WithFirstArms(SwitchExpressionSyntax original, SwitchExpressionSyntax current, IReadOnlyList<PatternSyntax> cases, DocumentOptionSet options)
+    {
+        var text = original.SyntaxTree.GetText();
+        var line = text.Lines.GetLineFromPosition(original.OpenBraceToken.SpanStart);
+        var lineIndentation = new string(line.ToString().TakeWhile(c => c is ' ' or '\t').ToArray());
+        var level = lineIndentation.IndexOf('\t') >= 0 || options.GetOption(FormattingOptions.UseTabs) ? "\t" : new string(' ', options.GetOption(FormattingOptions.IndentationSize));
+        var lineBreak = EndOfLine(line.EndIncludingLineBreak > line.End ? text.ToString(TextSpan.FromBounds(line.End, line.EndIncludingLineBreak)) : options.GetOption(FormattingOptions.NewLine));
+        var open = current.OpenBraceToken;
+        var close = current.CloseBraceToken;
+        var onOneLine = !open.TrailingTrivia.Any(t => t.IsKind(SyntaxKind.EndOfLineTrivia));
+        var arms = cases.Select(pattern => NewArm(pattern).WithLeadingTrivia(Whitespace(lineIndentation + level)));
+        var withArms = current.WithArms(SeparatedList(arms, cases.Select(_ => Comma(TriviaList(lineBreak)))));
+
+        return onOneLine
+            ? withArms
+                .WithOpenBraceToken(open.WithTrailingTrivia(TriviaList(open.TrailingTrivia.Reverse().SkipWhile(t => t.IsKind(SyntaxKind.WhitespaceTrivia)).Reverse()).Add(lineBreak)))
+                .WithCloseBraceToken(close.WithLeadingTrivia(close.LeadingTrivia.Where(t => !t.IsKind(SyntaxKind.WhitespaceTrivia)).Prepend(Whitespace(lineIndentation))))
+            : withArms;
     }
 
     public override FixAllProvider GetFixAllProvider() =>

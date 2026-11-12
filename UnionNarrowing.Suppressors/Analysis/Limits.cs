@@ -56,7 +56,7 @@ internal static class Limits
     public const int InputDepth = 4;
 
     /// <summary>
-    /// How many steps deep a nested pattern is followed.
+    /// How many members deep a nested pattern is followed (<c>A { B: C { D: E } }</c> is two).
     /// </summary>
     public const int NestedDepth = 4;
 

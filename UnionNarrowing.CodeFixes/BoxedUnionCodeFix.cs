@@ -1,20 +1,11 @@
 using System.Collections.Immutable;
-using System.Composition;
-using System.Linq;
-using System.Threading.Tasks;
-using Microsoft.CodeAnalysis;
-using Microsoft.CodeAnalysis.CodeActions;
-using Microsoft.CodeAnalysis.CodeFixes;
-using Microsoft.CodeAnalysis.CSharp;
-using Microsoft.CodeAnalysis.CSharp.Syntax;
-using UnionNarrowing.Suppressors.Analyzers;
-using static Microsoft.CodeAnalysis.CSharp.SyntaxFactory;
 
 namespace UnionNarrowing.CodeFixes;
 
 /// <summary>
 /// Looks at what a union holds instead of the boxed union (UN0014):
-/// <c>(object)pet is Cat</c> becomes <c>pet is Cat</c>, <c>(object)pet as Cat</c> becomes <c>pet.Value as Cat</c>, <c>(Cat)(object)pet</c> becomes <c>(Cat)pet.Value!</c>, <c>pet.Equals(cat)</c> becomes <c>object.Equals(pet.Value, cat)</c>, and <c>pet.GetType()</c> becomes <c>pet.Value?.GetType()</c>.
+/// <c>(object)pet is Cat</c> becomes <c>pet is Cat</c>, <c>(object)pet as Cat</c> becomes <c>pet.Value as Cat</c>, <c>(Cat)(object)pet</c> becomes <c>(Cat)pet.Value!</c>, <c>pet.Equals(cat)</c> becomes <c>object.Equals(pet.Value, cat)</c> (in a conditional access, <c>owner?.Pet.Value?.Equals(cat)</c>), and <c>pet.GetType()</c> becomes <c>pet.Value?.GetType()</c>.
+/// Not offered where that doesn't compile: in a lambda that's an expression tree, which can't have <c>?.</c>, or a pattern on a union (<c>pet is Cat</c>).
 /// </summary>
 [ExportCodeFixProvider(LanguageNames.CSharp, Name = nameof(BoxedUnionCodeFix)), Shared]
 public sealed class BoxedUnionCodeFix : CodeFixProvider
@@ -40,12 +31,14 @@ public sealed class BoxedUnionCodeFix : CodeFixProvider
             case CastExpressionSyntax { Expression: var boxed } cast when Unboxed(boxed) is { } union:
                 return cast.WithExpression(PostfixUnaryExpression(SyntaxKind.SuppressNullableWarningExpression, CodeFixSyntax.ValueOf(union)));
 
-            // `pet.Equals(cat)`
-            case InvocationExpressionSyntax { Expression: MemberAccessExpressionSyntax { Name.Identifier.ValueText: "Equals" } equals, ArgumentList.Arguments: { Count: 1 } arguments }:
-                return InvocationExpression(
-                    MemberAccessExpression(SyntaxKind.SimpleMemberAccessExpression, PredefinedType(Token(SyntaxKind.ObjectKeyword)), IdentifierName("Equals")),
-                    ArgumentList(SeparatedList([Argument(CodeFixSyntax.ValueOf(equals.Expression)), arguments[0]]))
-                );
+            // `pet.Equals(cat)`, or in a conditional access, `owner?.Pet.Equals(cat)`
+            case InvocationExpressionSyntax { Expression: MemberAccessExpressionSyntax { Name.Identifier.ValueText: "Equals" } equals, ArgumentList.Arguments: { Count: 1 } arguments } call:
+                return CodeFixSyntax.InConditionalAccess(call)
+                    ? ConditionalAccessExpression(CodeFixSyntax.ValueOf(equals.Expression), call.WithExpression(MemberBindingExpression(equals.Name)))
+                    : InvocationExpression(
+                        MemberAccessExpression(SyntaxKind.SimpleMemberAccessExpression, PredefinedType(Token(SyntaxKind.ObjectKeyword)), IdentifierName("Equals")),
+                        ArgumentList(SeparatedList([Argument(CodeFixSyntax.ValueOf(equals.Expression)), arguments[0]]))
+                    );
 
             // `pet.GetType() == typeof(Cat)`
             case BinaryExpressionSyntax comparison when comparison.IsKind(SyntaxKind.EqualsExpression) || comparison.IsKind(SyntaxKind.NotEqualsExpression):
@@ -110,7 +103,9 @@ public sealed class BoxedUnionCodeFix : CodeFixProvider
         }
 
         var expression = node.AncestorsAndSelf().OfType<ExpressionSyntax>().FirstOrDefault(e => e.Span == context.Span) ?? node;
-        if (Replacement(expression) is not { } replacement)
+        if (Replacement(expression) is not { } replacement
+            || !await CodeFixSyntax.CompilesAsync(context.Document, expression, replacement.WithTriviaFrom(expression), context.CancellationToken).ConfigureAwait(false)
+        )
         {
             return;
         }

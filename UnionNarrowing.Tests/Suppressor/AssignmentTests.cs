@@ -99,6 +99,40 @@ public class AssignmentTests
             """
         );
 
+    /// <summary>
+    /// A union whose case type is a closed type, made from one of its derived types, holds that derived type.
+    /// </summary>
+    [Fact]
+    public Task Assigned_from_a_type_derived_from_a_case() =>
+        Verify.Suppressions("""
+            public closed record AppError;
+            public sealed record NotFound(int Id) : AppError;
+            public sealed record Forbidden : AppError;
+            public sealed record Done;
+            public union Result(Done, AppError);
+
+            class C
+            {
+                static Result Find(int id) => id > 0 ? new Done() : new NotFound(id);
+                static AppError Fail(int id) => id > 0 ? new NotFound(id) : new Forbidden();
+
+                int Local()
+                {
+                    Result result = new NotFound(1);
+                    return result /*suppressed*/switch { NotFound => 1 };
+                }
+
+                int Returned(int id) => Find(id) /*suppressed*/switch { Done => 0, NotFound => 1 };
+
+                int FromTheCaseType(int id)
+                {
+                    Result result = Fail(id);
+                    return result /*warns*/switch { NotFound => 1 };
+                }
+            }
+            """
+        );
+
     [Fact]
     public Task Assigned_in_a_switch_statement() =>
         Verify.Suppressions("""

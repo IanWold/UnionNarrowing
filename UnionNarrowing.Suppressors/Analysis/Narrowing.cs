@@ -70,7 +70,11 @@ internal static partial class Narrowing
         /// </summary>
         private IOperation? Flag(ILocalSymbol local)
         {
-            if (value.Variable is not null && usage is not { NeverChanges: true })
+            // A chain from `this` or a static member, or what something else could change, mustn't be written anywhere in
+            // the function either: the local was set to what it held then.
+            if ((value.Variable is not null && usage is not { NeverChanges: true })
+                || ((value.Variable is null || value.IsExternallyMutable) && Functions.EnclosingFunction(start) is { } function && FunctionBody(function).Any(Writes))
+            )
             {
                 return null;
             }
@@ -96,6 +100,27 @@ internal static partial class Narrowing
                 && !WriteAnalysis.Writes(assignment.Right, value, model, ct)
                     ? model.GetOperation(assignment.Right, ct)
                     : null;
+        }
+
+        /// <summary>
+        /// The code of a function: a member's or local function's body (or expression body), a lambda's, or the program's top-level statements.
+        /// </summary>
+        private static IEnumerable<SyntaxNode> FunctionBody(SyntaxNode function)
+        {
+            SyntaxNode? body = function switch
+            {
+                BaseMethodDeclarationSyntax method => (SyntaxNode?)method.Body ?? method.ExpressionBody?.Expression,
+                AccessorDeclarationSyntax accessor => (SyntaxNode?)accessor.Body ?? accessor.ExpressionBody?.Expression,
+                PropertyDeclarationSyntax { ExpressionBody.Expression: var getter } => getter,
+                LocalFunctionStatementSyntax local => (SyntaxNode?)local.Body ?? local.ExpressionBody?.Expression,
+                AnonymousFunctionExpressionSyntax lambda => lambda.Body,
+                CompilationUnitSyntax => null,
+                _ => function,
+            };
+
+            return function is CompilationUnitSyntax unit ? unit.Members.OfType<GlobalStatementSyntax>().Select(global => global.Statement)
+                : body is null ? []
+                : [body];
         }
 
         /// <summary>
@@ -206,7 +231,7 @@ internal static partial class Narrowing
         {
             IPatternCaseClauseOperation patternClause => PatternOn(input, patternClause.Pattern),
             _ when value.IsReadBy(input) => Facts.Of(clause, space, model.Compilation),
-            ISingleValueCaseClauseOperation single => Facts.OfConstantOnDiscriminant(input, single, value, space, model.Compilation) ?? Outcome.Unknown,
+            ISingleValueCaseClauseOperation single => Facts.OfConstantOnDiscriminant(input, single, value, space, model.Compilation, Flag) ?? Outcome.Unknown,
             _ => Outcome.Unknown, // a `default:` label is tried last, wherever it is
         };
 
@@ -233,7 +258,7 @@ internal static partial class Narrowing
         public bool Exits(StatementSyntax statement) => statement switch
         {
             _ when model.AnalyzeControlFlow(statement) is { Succeeded: true, EndPointIsReachable: false } => true,
-            ExpressionStatementSyntax expression => model.GetOperation(expression.Expression, ct) is IInvocationOperation { TargetMethod: var method } && Functions.NeverReturns(method),
+            ExpressionStatementSyntax expression => model.GetOperation(expression.Expression, ct) is { } call && Facts.IsThrow(call),
             BlockSyntax block => block.Statements.Count > 0 && Exits(block.Statements[block.Statements.Count - 1]),
             LabeledStatementSyntax labeled => Exits(labeled.Statement),
             IfStatementSyntax { Else: { } elseClause } ifStatement => Exits(ifStatement.Statement) && Exits(elseClause.Statement),
@@ -248,7 +273,7 @@ internal static partial class Narrowing
             value.IsReadBy(input)
             || (TrackedValue.From(input, value.Session) is { } owner && owner.IsPrefixOf(value))
             || (input is ITupleOperation tuple && tuple.Elements.Any(Follows))
-            || Facts.ReadsDiscriminant(input, value, space, model.Compilation);
+            || Facts.ReadsDiscriminant(input, value, space, model.Compilation, Flag);
 
         /// <summary>
         /// What an arm's (or label's) <c>when</c> clause says about the value, also through what its pattern binds the input to (see <see cref="Facts.OfGuard"/>).
@@ -284,7 +309,7 @@ internal static partial class Narrowing
                 }
             }
 
-            return Facts.OfPatternOn(input, pattern, value, space, model.Compilation) ?? Outcome.Unknown;
+            return Facts.OfPatternOn(input, pattern, value, space, model.Compilation, Flag) ?? Outcome.Unknown;
         }
 
         /// <summary>
@@ -306,12 +331,17 @@ internal static partial class Narrowing
                 return false;
             }
 
+            // On the right, for a value something else could change, only what runs before the switch reads it counts (its
+            // arms run after).
             var expression = child is ExpressionStatementSyntax statement ? statement.Expression : child as ExpressionSyntax;
             if (expression is AssignmentExpressionSyntax assignment && assignment.Right.Span.Contains(start.Span)
                 && !start.Ancestors().TakeWhile(a => a != assignment).Any(Functions.IsFunction)
             )
             {
-                return WritesWhileLocating(assignment.Left) || Writes(assignment.Right);
+                return WritesWhileLocating(assignment.Left)
+                    || (value.IsExternallyMutable || value.Variable is null
+                        ? WriteAnalysis.Writes(WriteAnalysis.WithoutParentheses(assignment.Right), value, model, before: start.SpanStart, ct)
+                        : Writes(assignment.Right));
             }
 
             // A switch statement's sections only run once it has matched, and control never comes back around to it
@@ -321,9 +351,9 @@ internal static partial class Narrowing
                 return Writes(switchStatement.Expression);
             }
 
-            // For a value something else could change, what runs after it's read doesn't matter, unless control can come
-            // back around to it (a loop, or a goto).
-            if (value.IsExternallyMutable
+            // For a value something else could change (or a chain from `this` that construction can still set), what runs
+            // after it's read doesn't matter, unless control can come back around to it (a loop, or a goto).
+            if ((value.IsExternallyMutable || value.Variable is null)
                 && child.Span.Contains(start.Span)
                 && child is not (WhileStatementSyntax or DoStatementSyntax or ForStatementSyntax or CommonForEachStatementSyntax)
                 && !start.Ancestors().TakeWhile(a => a != child).Any(a => a is WhileStatementSyntax or DoStatementSyntax or ForStatementSyntax or CommonForEachStatementSyntax)
@@ -333,8 +363,24 @@ internal static partial class Narrowing
                 return WriteAnalysis.Writes(child, value, model, before: start.SpanStart, ct);
             }
 
+            // In a block (a branch's, say) with no loop around where the walk started, and no goto or function that could
+            // run code from later on before it, what comes after the statement that holds it runs after it.
+            if (child is BlockSyntax && child.Span.Contains(start.Span)
+                && !start.Ancestors().TakeWhile(a => a != child).Any(a => a is WhileStatementSyntax or DoStatementSyntax or ForStatementSyntax or CommonForEachStatementSyntax)
+                && !child.DescendantNodes().Any(n => n is GotoStatementSyntax || Functions.IsFunction(n))
+            )
+            {
+                return WritesUpToStart(child);
+            }
+
             return Writes(child);
         }
+
+        private bool WritesUpToStart(SyntaxNode node) =>
+            node is BlockSyntax block
+                ? block.Statements.TakeWhile(s => !s.Span.Contains(start.Span)).Any(Writes)
+                    || (block.Statements.FirstOrDefault(s => s.Span.Contains(start.Span)) is { } holding && WritesUpToStart(holding))
+                : Writes(node);
     }
 
     /// <summary>
@@ -540,9 +586,9 @@ internal static partial class Narrowing
             case DoStatementSyntax loop when child == loop.Statement:
                 return AddDoBody(loop, child, context, ref excluded);
 
-            // In a foreach over a LINQ chain, what its Where filters say about the elements that get through. (Not for
-            // what only something else could change, which could change after the filter.)
-            case ForEachStatementSyntax { AwaitKeyword.RawKind: 0 } loop when child == loop.Statement
+            // In a foreach (or await foreach) over a LINQ chain, what its Where filters say about the elements that get
+            // through. (Not for what only something else could change, which could change after the filter.)
+            case ForEachStatementSyntax loop when child == loop.Statement
                 && !context.Value.IsExternallyMutable
                 && context.Value.Variable is ILocalSymbol { IsForEach: true } iteration
                 && SymbolEqualityComparer.Default.Equals(context.Model.GetDeclaredSymbol(loop, context.CancellationToken), iteration)
@@ -627,9 +673,14 @@ internal static partial class Narrowing
             .Where(jump => jump.IsKind(SyntaxKind.GotoStatement) && jump.Expression is IdentifierNameSyntax target && target.Identifier.ValueText == label.Identifier.ValueText)
             .ToList();
 
+        // A `goto` out of a `try` with a `finally` runs the finally on the way, and, for a value something else could change,
+        // one out of a `using` (or a block with a `using` declaration) or a `foreach` disposes something.
         if (jumps.Count == 0
             || jumps.Any(jump => jump.SpanStart > label.SpanStart
-                || jump.Ancestors().TakeWhile(a => !a.Span.Contains(label.Span)).OfType<TryStatementSyntax>().Any(t => t.Finally is not null)
+                || jump.Ancestors().TakeWhile(a => !a.Span.Contains(label.Span)).Any(left =>
+                    left is TryStatementSyntax { Finally: not null }
+                    || (context.Value.IsExternallyMutable && (left is UsingStatementSyntax or CommonForEachStatementSyntax || left is BlockSyntax block && DisposesAtEnd(block, context)))
+                )
             )
         )
         {
@@ -740,6 +791,9 @@ internal static partial class Narrowing
 
                 return Meet(ifTrue, ifFalse) ?? CaseSet.Empty;
 
+            case BlockSyntax block when DisposesAtEnd(block, context):
+                return CaseSet.Empty;
+
             case BlockSyntax block:
                 var atEnd = CaseSet.Empty;
 
@@ -794,6 +848,13 @@ internal static partial class Narrowing
                 return CaseSet.Empty;
         }
     }
+
+    /// <summary>
+    /// Whether the end of the block runs code that could change a value something else could change:
+    /// a <c>using</c> declaration in it disposes there, after everything else in it.
+    /// </summary>
+    private static bool DisposesAtEnd(BlockSyntax block, Context context) =>
+        context.Value.IsExternallyMutable && block.Statements.Any(s => s is LocalDeclarationStatementSyntax { UsingKeyword.RawKind: not 0 });
 
     /// <summary>
     /// What's ruled out once a loop ends:
@@ -1081,7 +1142,7 @@ internal static partial class Narrowing
 
             // `Guard.IsTrue(x is not Bird)`, with `[DoesNotReturnIf(false)] bool condition`: it doesn't return when the
             // condition is false. And `AssertSettled(x)`, a helper of one's own that throws for some cases.
-            case IInvocationOperation { TargetMethod: var method } invocation when !Symbols.HasAttribute(method, "ConditionalAttribute", "System", "Diagnostics"):
+            case IInvocationOperation { TargetMethod: var method } invocation when !Symbols.HasAttribute(method, "ConditionalAttribute", "System", "Diagnostics") && !Functions.IsIntercepted(invocation):
                 var throwing = Facts.ThrowsWhenCalled(invocation, context.Value, context.Space, context.Model.Compilation);
                 foreach (var argument in invocation.Arguments)
                 {

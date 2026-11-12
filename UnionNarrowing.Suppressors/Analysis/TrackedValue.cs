@@ -269,24 +269,68 @@ internal class TrackedValue : IEquatable<TrackedValue>
         }
 
         var owner = member.IsStatic ? Starting(session, Start.Static) : From(instance, depth, session);
+        if (owner is not null && !isExternallyMutable && member is IPropertySymbol property && Returned(property, reference.SemanticModel?.Compilation, depth, session) is { } returned)
+        {
+            return returned.Aggregate(owner, (value, step) => value.With(step));
+        }
+
         return owner?.With(new MemberStep(member), isExternallyMutable);
+    }
+
+    /// <summary>
+    /// For a property whose getter just returns other members of the object (<c>Child =&gt; Input;</c>, <c>Input =&gt; _input;</c>):
+    /// the steps to what it returns, which reading the property is the same as reading.
+    /// </summary>
+    private static IReadOnlyList<Step>? Returned(IPropertySymbol property, Compilation? compilation, int depth, Session session)
+    {
+        property = property.PartialImplementationPart ?? property;
+        if (compilation is null || depth >= Limits.GetterDepth || property.IsStatic || property.ContainingType.IsValueType
+            || property.DeclaringSyntaxReferences is not { Length: 1 } references
+            || references[0].GetSyntax() switch
+            {
+                PropertyDeclarationSyntax { ExpressionBody.Expression: var body } => body,
+                PropertyDeclarationSyntax { AccessorList.Accessors: var accessors } when accessors.FirstOrDefault(a => a.IsKind(SyntaxKind.GetAccessorDeclaration)) is { } getter =>
+                    getter.ExpressionBody?.Expression ?? (getter.Body is { Statements: { Count: 1 } statements } && statements[0] is ReturnStatementSyntax { Expression: { } value } ? value : null),
+                _ => null,
+            } is not { } returned
+            || !compilation.SyntaxTrees.Contains(returned.SyntaxTree)
+            || From(compilation.GetSemanticModel(returned.SyntaxTree).GetOperation(returned), depth + 1, session) is not { _start: Start.This, Steps.IsEmpty: false, IsExternallyMutable: false } read
+        )
+        {
+            return null;
+        }
+
+        return read.Steps;
     }
 
     /// <summary>
     /// Whether reading the member can be followed, and if so, whether only something else could change what it gives (see <see cref="IsExternallyMutable"/>):
     /// null if it can't be followed.
-    /// A readonly field, a field of a struct (which only changes when the struct does), and a property that can't change are followed;
-    /// a field that isn't readonly or a settable auto-property only when asked to.
+    /// A member that's set for good (see <see cref="IsSetForGood"/>) is followed;
+    /// any other field, or auto-property, only when asked to.
     /// </summary>
     private static bool? ReadsMutableState(ISymbol member, Compilation? compilation, int depth, bool followsMutableState, Session session) => member switch
     {
-        IFieldSymbol { IsReadOnly: true } => false,
-        IFieldSymbol { IsStatic: false, ContainingType.IsValueType: true } => false,
-        IPropertySymbol property when CantChange(property, compilation, depth, session) => false,
+        _ when IsSetForGood(member, compilation, depth, session) => false,
         IFieldSymbol { IsConst: false } when followsMutableState => true,
         IPropertySymbol { IsIndexer: false, IsVirtual: false, IsAbstract: false, IsOverride: false } property when followsMutableState && Symbols.IsAutoProperty(property) => true,
         _ => null,
     };
+
+    /// <summary>
+    /// Whether the member always reads the same once the object (or, for a static one, the type) is constructed, and nothing but construction can read it before then:
+    /// a readonly field, a field of a struct (which only changes when the struct does), or a property that can't change, of a type whose construction doesn't hand the object to other code first (see <see cref="Functions.CanBeSeenBeforeConstructed"/>).
+    /// (In a class that lays its fields out explicitly, writing another field can change a readonly one.)
+    /// </summary>
+    private static bool IsSetForGood(ISymbol member, Compilation? compilation, int depth, Session session) =>
+        member switch
+        {
+            IFieldSymbol { IsReadOnly: true, ContainingType: var type } => !Symbols.HasExplicitLayout(type),
+            IFieldSymbol { IsStatic: false, ContainingType.IsValueType: true } => true,
+            IPropertySymbol property => !Symbols.HasExplicitLayout(property.ContainingType) && CantChange(property, compilation, depth, session),
+            _ => false,
+        }
+        && (member.IsStatic || compilation is null || !session.CanBeSeenBeforeConstructed(member.ContainingType, compilation));
 
     private bool SameStart(TrackedValue other) =>
         _start == other._start && SymbolEqualityComparer.Default.Equals(_startSymbol, other._startSymbol);
@@ -341,6 +385,15 @@ internal class TrackedValue : IEquatable<TrackedValue>
     /// </summary>
     public bool IsPrefixOf(TrackedValue other) =>
         SameStart(other) && Steps.Length <= other.Steps.Length && Steps.SequenceEqual(other.Steps.Take(Steps.Length));
+
+    /// <summary>
+    /// How many of this value's steps <paramref name="operation"/> has read, if it reads what the value is read from, or the value itself:
+    /// 1 for <c>owner</c> with <c>owner.Pet</c>, and 0 for <c>this</c> in a struct's helper member with the value it stands for there.
+    /// </summary>
+    public int? PrefixReadBy(IOperation operation) =>
+        _start == Start.StructThisInHelper
+            ? operation is IInstanceReferenceOperation { ReferenceKind: InstanceReferenceKind.ContainingTypeInstance } self && SymbolEqualityComparer.Default.Equals(self.Type, _startSymbol) ? 0 : null
+            : From(operation, Session) is { } owner && owner.IsPrefixOf(this) ? owner.Steps.Length : null;
 
     /// <summary>
     /// Whether <paramref name="operation"/> reads this value.

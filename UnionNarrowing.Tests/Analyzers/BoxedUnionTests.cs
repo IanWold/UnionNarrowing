@@ -38,6 +38,34 @@ public class BoxedUnionTests
     }
 
     [Fact]
+    public async Task Equals_the_other_way_round_and_types_as_keys()
+    {
+        var diagnostics = await Diagnostics("""
+            class C
+            {
+                void M(Pet pet, Pet other, Cat cat, object any, Dictionary<Type, int> handlers)
+                {
+                    // Reported on the union, since the Look at what it holds fix rewrites a call as though the union came first.
+                    var a = cat.Equals(/*!UN0014*/pet);
+                    var b = handlers.TryGetValue(/*!UN0014*/pet.GetType(), out var handler);
+                    var c = handlers[/*!UN0014*/pet.GetType()];
+
+                    var d = other.Equals(pet);
+                    var e = any.Equals(pet);
+                    var f = handlers.TryGetValue(pet.Value!.GetType(), out var found);
+                    var g = handlers.ContainsKey(typeof(Pet));
+                    Console.WriteLine($"{a}{b}{c}{d}{e}{f}{g}{handler}{found}");
+                }
+            }
+            """
+        );
+
+        var messages = diagnostics.Select(d => d.GetMessage().Replace("/*!UN0014*/", "")).ToList();
+        Assert.Contains("'cat.Equals(pet)' is never true: a Pet only ever equals another Pet. Compare with a Pet made from it, or compare its Value.", messages);
+        Assert.Contains("'pet.GetType()' is always typeof(Pet), so it never finds what's keyed by the type of what a Pet holds. Look up the type of its Value instead.", messages);
+    }
+
+    [Fact]
     public Task Equals_through_object_or_the_default_comparer() =>
         Diagnostics("""
             class C
@@ -60,38 +88,80 @@ public class BoxedUnionTests
         );
 
     [Fact]
-    public async Task Record_that_prints_a_union_member()
+    public async Task Records_that_print_a_union_from_another_assembly()
+    {
+        var diagnostics = await Verify.Diagnostics(new BoxedUnionAnalyzer(), """
+            record Owner(Shape /*!UN0019*/Shape, Shape? Other);
+            record Keeper(Shape /*!UN0019*/Shape);
+            """, references: [Verify.CompileToMetadata("""
+                public record Circle;
+                public record Square;
+                public union Shape(Circle, Square);
+                """)]
+        );
+
+        Assert.Equal("Owner prints 'Shape' as its type name in ToString: declare PrintMembers to print its Value", diagnostics[0].GetMessage());
+        Assert.Single(diagnostics[0].AdditionalLocations);
+    }
+
+    [Fact]
+    public async Task Union_that_records_print()
     {
         var diagnostics = await Diagnostics("""
-            record Owner(Pet /*!UN0019*/Pet, int Age);
+            record Owner(Status Status, int Age);
             record class Keeper
             {
-                public Pet? /*!UN0019*/Favourite { get; init; }
-                private Pet Hidden { get; init; }
+                public Status? Favourite { get; init; }
+                private Status Hidden { get; init; }
             }
-            record Described(Pet Pet)
+            record Described(Status Status)
             {
                 protected virtual bool PrintMembers(System.Text.StringBuilder builder)
                 {
-                    builder.Append($"Pet = {Pet.Value}");
+                    builder.Append($"Status = {Status.Value}");
                     return true;
                 }
             }
-            record struct Entry(Pet /*!UN0019*/Pet);
-            record Shown(Pet Pet)
+            record struct Entry(Status Status, Status Previous);
+            record Shown(Status Status)
             {
-                public override string ToString() => $"Shown {{ Pet = {Pet.Value} }}";
+                public override string ToString() => $"Shown {{ Status = {Status.Value} }}";
             }
 
-            union ShownPet(Cat, Dog)
+            // Records derived from one that seals ToString don't generate their own.
+            abstract record Audited
+            {
+                public sealed override string ToString() => GetType().Name;
+            }
+            record StatusAudited(Status Status) : Audited;
+            record StatusAuditedAgain(Status Again) : StatusAudited(Again);
+
+            record Pending;
+            record Done;
+            union /*!UN0019*/Status(Pending, Done);
+
+            union ShownStatus(Pending, Done)
             {
                 public override string ToString() => Value?.ToString() ?? "";
             }
-            record HoldsShownPet(ShownPet Pet, ShownPet? Maybe);
+            record HoldsShownStatus(ShownStatus Status, ShownStatus? Maybe);
+
+            union /*!UN0019*/Phase(Pending, Done);
+            record First(Phase Phase);
+            record Second(Phase Phase);
+            record Third(Phase Phase);
+            record Fourth(Phase Phase);
             """
         );
 
-        Assert.Contains("'Owner' prints its Pet as 'Pet', the union's type name, in ToString: declare PrintMembers to print its Value, or override ToString in Pet", diagnostics.Select(d => d.GetMessage()));
+        Assert.Equal(
+            [
+                "Owner, Keeper and Entry print 'Status' as its type name in ToString: declare PrintMembers to print its Value, or override ToString in Status",
+                "First, Second and 2 more print 'Phase' as its type name in ToString: declare PrintMembers to print its Value, or override ToString in Phase",
+            ],
+            diagnostics.Select(d => d.GetMessage())
+        );
+        Assert.Equal(4, diagnostics[0].AdditionalLocations.Count);
     }
 
     [Fact]
@@ -139,6 +209,7 @@ public class BoxedUnionTests
                     var c = /*!UN0014*/(object)pet is Cat { Name: "Tom" } kitty;
                     var d = /*!UN0014*/(Cat)(object)pet;
                     var e = /*!UN0014*/(object)pet as Cat;
+                    var l = /*!UN0014*/(object)pet is not Cat;
 
                     // What a boxed union can be.
                     var f = (object)pet is Pet;
@@ -147,13 +218,15 @@ public class BoxedUnionTests
                     var i = (object)pet is Cat or null;
                     var j = pet is Cat;
                     var k = pet.Value is Cat;
-                    Console.WriteLine($"{a}{b}{c}{d}{e}{f}{g}{h}{i}{j}{k}");
+                    var m = (object)pet is not Pet;
+                    Console.WriteLine($"{a}{b}{c}{d}{e}{f}{g}{h}{i}{j}{k}{l}{m}");
                 }
             }
             """
         );
 
         Assert.Contains("'(object)pet is Cat' is never true: a boxed Pet is a Pet, not what it holds. Test the union itself, without boxing it.", diagnostics.Select(d => d.GetMessage()));
+        Assert.Contains("'(object)pet is not Cat' is always true: a boxed Pet is a Pet, not what it holds. Test the union itself, without boxing it.", diagnostics.Select(d => d.GetMessage()));
         Assert.Contains("'(Cat)(object)pet' always throws: a boxed Pet is a Pet, not what it holds. Use a pattern on the union, or cast its Value.", diagnostics.Select(d => d.GetMessage()));
     }
 
@@ -300,5 +373,81 @@ public class BoxedUnionTests
         );
 
         Assert.Contains("'pets' shows the union's type name, 'Pet', not what it holds: format 'pets.Select(x => x.Value)' instead, or override ToString in Pet", diagnostics.Select(d => d.GetMessage()));
+    }
+
+    [Fact]
+    public async Task Unions_logged_through_generated_and_template_methods_tags_and_exceptions()
+    {
+        var diagnostics = await Diagnostics("""
+            using System.Diagnostics;
+            using Microsoft.Extensions.Logging;
+
+            namespace Serilog.Core
+            {
+                [AttributeUsage(AttributeTargets.Method)]
+                public sealed class MessageTemplateFormatMethodAttribute(string messageTemplateParameterName) : Attribute;
+            }
+
+            namespace JetBrains.Annotations
+            {
+                [AttributeUsage(AttributeTargets.Parameter)]
+                public sealed class StructuredMessageTemplateAttribute : Attribute;
+            }
+
+            static class Log
+            {
+                [Serilog.Core.MessageTemplateFormatMethod("messageTemplate")]
+                public static void Information<T>(string messageTemplate, T propertyValue) { }
+            }
+
+            static class Templated
+            {
+                public static void Info([JetBrains.Annotations.StructuredMessageTemplate] string message, params object?[] args) { }
+            }
+
+            class Owner
+            {
+                public Pet Pet { get; init; } = new Cat("Tom");
+            }
+
+            partial class C
+            {
+                static readonly Action<ILogger, int, Pet, Exception?> s_changed = LoggerMessage.Define<int, Pet>(LogLevel.Information, new EventId(1), "Pet {Id} is {Pet}");
+
+                [LoggerMessage(Level = LogLevel.Information, Message = "Pet is {Pet}")]
+                static partial void LogPet(ILogger logger, Pet pet);
+
+                [LoggerMessage(Level = LogLevel.Warning, Message = "Pet is {Pet}")]
+                partial void LogPetHere(Pet pet);
+
+                void M(ILogger logger, Pet pet, Activity activity, Owner? owner)
+                {
+                    LogPet(logger, /*!UN0015*/pet);
+                    LogPetHere(/*!UN0015*/pet);
+                    s_changed(logger, 1, /*!UN0015*/pet, null);
+                    Log.Information("{Pet}", /*!UN0015*/pet);
+                    Templated.Info("{Pet}", /*!UN0015*/pet);
+                    activity.SetTag("pet", /*!UN0015*/pet);
+                    using var scope = logger.BeginScope(new List<KeyValuePair<string, object>> { new("Pet", /*!UN0015*/pet) });
+                    using var dictionaryScope = logger.BeginScope(new Dictionary<string, object> { ["Pet"] = /*!UN0015*/pet });
+                    var name = /*!UN0015*/pet.GetType().Name;
+                    var outOfRange = new ArgumentOutOfRangeException(nameof(pet), /*!UN0015*/pet, "no birds");
+                    var text = owner?/*!UN0015*/.Pet.ToString();
+
+                    // What it holds.
+                    Log.Information("{Pet}", pet.Value);
+                    activity.SetTag("pet", pet.Value);
+                    using var heldScope = logger.BeginScope(new List<KeyValuePair<string, object?>> { new("Pet", pet.Value) });
+                    var held = pet.Value?.GetType().Name;
+                    var argument = new ArgumentException("no birds", nameof(pet));
+                    Console.WriteLine($"{name}{outOfRange}{text}{held}{argument}");
+                }
+            }
+            """
+        );
+
+        var messages = diagnostics.Select(d => d.GetMessage().Replace("/*!UN0015*/", "")).ToList();
+        Assert.Contains("'pet.GetType().Name' shows the union's type name, 'Pet', not what it holds: use 'pet.Value?.GetType().Name' instead", messages);
+        Assert.Contains("'owner?.Pet.ToString()' shows the union's type name, 'Pet', not what it holds: format 'owner?.Pet.Value' instead, or override ToString in Pet", messages);
     }
 }

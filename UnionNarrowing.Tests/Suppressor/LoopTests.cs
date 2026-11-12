@@ -544,4 +544,40 @@ public class LoopTests
             }
             """
         );
+
+    [Fact]
+    public Task Accumulator_whose_arms_pass_the_state_on() =>
+        Verify.Suppressions("""
+            public record Waiting;
+            public record Running(int Step);
+            public record Failed(string Error);
+            public union Job(Waiting, Running, Failed);
+
+            class C
+            {
+                // It starts Waiting, and never becomes Failed: each step only gives back what it had.
+                int Run(int steps)
+                {
+                    Job job = new Waiting();
+                    for (var i = 0; i < steps; i++)
+                    {
+                        job = job switch { Waiting => new Running(0), Running r => new Running(r.Step + 1), Failed f => f };
+                    }
+
+                    return job /*suppressed*/switch { Waiting => 0, Running r => r.Step };
+                }
+
+                int Other(int steps)
+                {
+                    Job job = new Waiting();
+                    for (var i = 0; i < steps; i++)
+                    {
+                        job = job switch { Waiting => new Running(0), Running r => r.Step > 3 ? new Failed("") : r, var other => other };
+                    }
+
+                    return job /*warns*/switch { Waiting => 0, Running r => r.Step };
+                }
+            }
+            """
+        );
 }

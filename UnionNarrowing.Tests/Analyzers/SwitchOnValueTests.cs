@@ -90,7 +90,13 @@ public class SwitchOnValueTests
             """
         );
 
-        Assert.Equal("Switch on 'pet' instead of 'pet.Value', so the compiler checks that every case is handled", diagnostics[0].GetMessage());
+        Assert.Equal(
+            [
+                "Switch on 'pet' instead of 'pet.Value', so the compiler checks that every case is handled",
+                "Switch on 'pet' instead of 'pet.Value', so the compiler checks that each label is for one of the union's cases",
+            ],
+            diagnostics.Select(d => d.GetMessage())
+        );
     }
 
     [Fact]
@@ -112,6 +118,11 @@ public class SwitchOnValueTests
                     var g = pet.Value is string;
                     Console.WriteLine($"{a}{b}{c}{d}{e}{f}{g}");
                 }
+
+                // T could be the union itself, which its Value never is.
+                static bool Is<T>(Pet pet) => pet.Value is T;
+                static bool IsNamed<T>(Pet pet) => pet.Value is T named && named.ToString() != "";
+                static int Which<T>(Pet pet) => pet.Value switch { T => 1, _ => 0 };
             }
             """
         );

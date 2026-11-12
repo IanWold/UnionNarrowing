@@ -315,6 +315,160 @@ public class MutableStateTests
 
 
     [Fact]
+    public Task Switch_result_assigned_back_where_its_arms_run_code() =>
+        Verify.Suppressions("""
+            class C
+            {
+                Pet _pet = new Cat("Tom");
+
+                Pet Make() => new Dog("Rex");
+
+                void Created()
+                {
+                    if (_pet is Bird) return;
+                    _pet = _pet /*suppressed*/switch { Cat => new Dog("Rex"), Dog => Make() };
+                }
+
+                static void Passed(ref Pet pet)
+                {
+                    if (pet is Bird) return;
+                    pet = pet /*suppressed*/switch { Cat => new Dog("Rex"), Dog => new Cat("Tom") };
+                }
+
+                // A call before the switch reads it still counts.
+                void Before()
+                {
+                    if (_pet is Bird) return;
+                    _pet = (Make() is var made ? _pet : made) /*warns*/switch { Cat => new Dog("Rex"), Dog => made };
+                }
+            }
+            """, editorConfig: FollowMutableState
+        );
+
+    [Fact]
+    public Task Disposal_at_the_end_of_a_block() =>
+        Verify.Suppressions("""
+            using System.Threading.Tasks;
+
+            class Lease : IDisposable, IAsyncDisposable
+            {
+                public void Dispose() { }
+                public ValueTask DisposeAsync() => default;
+            }
+
+            class C
+            {
+                Pet _pet = new Cat("Tom");
+
+                // Dispose runs at the end of the block, after the guard and before the switch.
+                int Sync()
+                {
+                    {
+                        using var lease = new Lease();
+                        if (_pet is Bird) return 0;
+                    }
+
+                    return _pet /*warns*/switch { Cat => 1, Dog => 2 };
+                }
+
+                async Task<int> Async()
+                {
+                    {
+                        await using var lease = new Lease();
+                        if (_pet is Bird) return 0;
+                    }
+
+                    return _pet /*warns*/switch { Cat => 1, Dog => 2 };
+                }
+
+                // A goto out of the block disposes the lease too.
+                int Goto()
+                {
+                    {
+                        using var lease = new Lease();
+                        if (_pet is Bird) return 0;
+                        goto done;
+                    }
+
+                    done:
+                    return _pet /*warns*/switch { Cat => 1, Dog => 2 };
+                }
+
+                // Here it runs after the switch.
+                int Inside()
+                {
+                    using var lease = new Lease();
+                    if (_pet is Bird) return 0;
+                    return _pet /*suppressed*/switch { Cat => 1, Dog => 2 };
+                }
+            }
+            """, editorConfig: FollowMutableState
+        );
+
+    /// <summary>
+    /// Taking a lock waits for other threads to be done with it, and whatever they wrote meanwhile shows; so does anything after it's released.
+    /// </summary>
+    [Fact]
+    public Task Locks_in_between() =>
+        Verify.Suppressions("""
+            using System.Threading;
+
+            class C
+            {
+                private readonly object _gate = new();
+                private readonly Lock _lock = new();
+                private Pet _state;
+
+                int Taken()
+                {
+                    if (_state is Bird) return 0;
+                    lock (_gate)
+                    {
+                        return _state /*warns*/switch { Cat => 1, Dog => 2 };
+                    }
+                }
+
+                int TakenWithALock()
+                {
+                    if (_state is Bird) return 0;
+                    lock (_lock)
+                    {
+                        return _state /*warns*/switch { Cat => 1, Dog => 2 };
+                    }
+                }
+
+                int Released()
+                {
+                    lock (_gate)
+                    {
+                        if (_state is Bird) return 0;
+                    }
+
+                    return _state /*warns*/switch { Cat => 1, Dog => 2 };
+                }
+
+                int Inside()
+                {
+                    lock (_gate)
+                    {
+                        if (_state is Bird) return 0;
+                        return _state /*suppressed*/switch { Cat => 1, Dog => 2 };
+                    }
+                }
+
+                int Local(Pet pet)
+                {
+                    if (pet is Bird) return 0;
+                    lock (_gate)
+                    {
+                        return pet /*suppressed*/switch { Cat => 1, Dog => 2 };
+                    }
+                }
+            }
+            """, editorConfig: FollowMutableState
+        );
+
+    [Fact]
     public Task Mutable_members_of_a_local_whose_every_write_is_known() =>
         Verify.Suppressions("""
             class Owner { public Pet Pet { get; set; } = new Cat("Tom"); }

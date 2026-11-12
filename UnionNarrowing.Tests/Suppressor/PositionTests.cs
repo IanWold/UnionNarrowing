@@ -188,6 +188,55 @@ public class PositionTests
             """
         );
 
+    /// <summary>
+    /// A write later in the branch runs after the switch, unless a loop, a goto or a function can bring it back around.
+    /// </summary>
+    [Fact]
+    public Task If_branch_that_writes_after_the_switch() =>
+        Verify.Suppressions("""
+            class C
+            {
+                static Pet Next() => new Cat("Tom");
+
+                int ReadThenAdvance(Pet pet)
+                {
+                    if (pet is Cat or Dog)
+                    {
+                        var legs = pet /*suppressed*/switch { Cat => 4, Dog => 4 };
+                        pet = Next();
+                        return legs;
+                    }
+                    return 0;
+                }
+
+                int InALoop(Pet pet, int times)
+                {
+                    var legs = 0;
+                    if (pet is Cat or Dog)
+                    {
+                        for (var i = 0; i < times; i++)
+                        {
+                            legs += pet /*warns*/switch { Cat => 4, Dog => 4 };
+                            pet = new Bird("Polly");
+                        }
+                    }
+                    return legs;
+                }
+
+                int ThroughALocalFunction(Pet pet)
+                {
+                    if (pet is Cat or Dog)
+                    {
+                        Advance();
+                        return pet /*warns*/switch { Cat => 4, Dog => 4 };
+                        void Advance() => pet = new Bird("Polly");
+                    }
+                    return 0;
+                }
+            }
+            """
+        );
+
     [Fact]
     public Task If_branches() =>
         Verify.Suppressions("""

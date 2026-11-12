@@ -412,4 +412,19 @@ public class TupleTests
             }
             """
         );
+
+    /// <summary>
+    /// The compiler reports CS8509 on some tuple switches that handle every combination, where wildcards sit in different places in different arms.
+    /// </summary>
+    [Fact]
+    public Task Combinations_the_compiler_misses() =>
+        Verify.Suppressions("""
+            class C
+            {
+                int Complete(Pet a, Pet b) => (a, b) /*suppressed*/switch { (Cat, Cat) => 1, (_, Dog) => 2, (_, Bird) => 3, (Dog or Bird, _) => 4 };
+
+                int Missing(Pet a, Pet b) => (a, b) /*warns*/switch { (Cat, Cat) => 1, (_, Dog) => 2, (Dog or Bird, _) => 4 };
+            }
+            """
+        );
 }

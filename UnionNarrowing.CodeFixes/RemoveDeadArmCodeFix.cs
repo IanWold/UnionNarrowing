@@ -1,73 +1,114 @@
-using System.Collections.Generic;
 using System.Collections.Immutable;
-using System.Composition;
-using System.Linq;
-using System.Threading;
-using System.Threading.Tasks;
-using Microsoft.CodeAnalysis;
-using Microsoft.CodeAnalysis.CodeActions;
-using Microsoft.CodeAnalysis.CodeFixes;
-using Microsoft.CodeAnalysis.CSharp;
-using Microsoft.CodeAnalysis.CSharp.Syntax;
-using UnionNarrowing.Suppressors.Analyzers;
-using static Microsoft.CodeAnalysis.CSharp.SyntaxFactory;
 
 namespace UnionNarrowing.CodeFixes;
 
 /// <summary>
 /// Takes arms and case labels out of their switches, all at once, innermost switch first.
+/// The directives before each one stay, with any inactive code between them, before whatever comes next.
 /// </summary>
 file class Remover : CSharpSyntaxRewriter
 {
     private static readonly SyntaxAnnotation Dead = new(nameof(Remover));
 
     /// <summary>
-    /// Whether <paramref name="section"/> declares locals, which other sections can use (a switch block is one scope).
+    /// <paramref name="node"/>, after the <paramref name="directives"/> from what was taken out before it.
     /// </summary>
-    public static bool DeclaresLocals(SwitchSectionSyntax section) =>
-        section.Statements.Any(s => s is LocalDeclarationStatementSyntax or LocalFunctionStatementSyntax);
+    private static T After<T>(SyntaxTriviaList directives, T node) where T : SyntaxNode =>
+        directives.Count == 0 ? node : node.WithLeadingTrivia(directives.AddRange(node.GetLeadingTrivia()));
 
     /// <summary>
-    /// Removes the arms and case labels among <paramref name="nodes"/>.
+    /// The directives before a node that's taken out, which stay: its leading trivia up to its last directive, with what's between them.
+    /// </summary>
+    private static SyntaxTriviaList DirectivesBefore(SyntaxNode node)
+    {
+        var leading = node.GetLeadingTrivia();
+        return TriviaList(leading.Take(leading.Count - leading.Reverse().TakeWhile(t => !t.IsDirective).Count()));
+    }
+
+    /// <summary>
+    /// Whether there are directives in <paramref name="node"/> past its leading trivia, which the code after it could depend on.
+    /// </summary>
+    private static bool HasDirectivesInside(SyntaxNode node) =>
+        node.WithoutLeadingTrivia().ContainsDirectives;
+
+    /// <summary>
+    /// Whether <paramref name="section"/> has to stay even when none of its labels can match:
+    /// it declares locals other sections can use (a switch block is one scope), or has directives inside.
+    /// Then it keeps one label, as fixing its labels one at a time would.
+    /// </summary>
+    private static bool MustStay(SwitchSectionSyntax section) =>
+        section.Statements.Any(s => s is LocalDeclarationStatementSyntax or LocalFunctionStatementSyntax) || HasDirectivesInside(section);
+
+    /// <summary>
+    /// Whether an arm or case label can be taken out (with its section, if it's the section's only label):
+    /// not if that would take out directives inside it, or a section that <see cref="MustStay">has to stay</see>.
+    /// </summary>
+    public static bool CanRemove(SyntaxNode node) =>
+        node is SwitchLabelSyntax { Parent: SwitchSectionSyntax { Labels.Count: 1 } section }
+            ? !MustStay(section)
+            : node is SwitchExpressionArmSyntax or SwitchLabelSyntax && !HasDirectivesInside(node);
+
+    /// <summary>
+    /// Removes the arms and case labels among <paramref name="nodes"/> that <see cref="CanRemove">can be taken out</see>.
     /// </summary>
     public static SyntaxNode Remove(SyntaxNode root, IEnumerable<SyntaxNode> nodes)
     {
-        var dead = nodes.Where(n => n is SwitchExpressionArmSyntax or SwitchLabelSyntax).ToList();
+        var dead = nodes.Where(CanRemove).ToList();
         return dead.Count == 0 ? root : new Remover().Visit(root.ReplaceNodes(dead, (_, node) => node.WithAdditionalAnnotations(Dead)));
     }
 
+    /// <summary>
+    /// Each arm that's kept keeps the comma after it, except that the last one only has a comma if the switch ended in one.
+    /// Without one, the last arm ends with what followed its comma where that ends the line (a comment, say), and otherwise with what followed the old last arm.
+    /// It keeps its comma when directives from the arms after it are left before the closing brace, since they can bring in arms of their own.
+    /// </summary>
     public override SyntaxNode? VisitSwitchExpression(SwitchExpressionSyntax node)
     {
         var visited = (SwitchExpressionSyntax)base.VisitSwitchExpression(node)!;
         var arms = visited.Arms;
-        var kept = arms.Where(arm => !arm.HasAnnotation(Dead)).ToList();
-        if (kept.Count == arms.Count || kept.Count == 0)
+        if (!arms.Any(arm => arm.HasAnnotation(Dead)) || arms.All(arm => arm.HasAnnotation(Dead)))
         {
             return visited;
         }
 
-        // Each arm that's kept keeps the comma after it, except that the last one only has a comma if the switch
-        // ended in one. Without one, the last arm gets what followed the old last arm: the space or line break
-        // before the closing brace.
-        var trailingComma = arms.SeparatorCount == arms.Count;
         var list = new List<SyntaxNodeOrToken>();
-        for (var i = 0; i < kept.Count; i++)
+        var directives = SyntaxTriviaList.Empty;
+
+        for (var i = 0; i < arms.Count; i++)
         {
-            var index = arms.IndexOf(kept[i]);
-            if (i < kept.Count - 1 || trailingComma)
+            if (arms[i].HasAnnotation(Dead))
             {
-                list.Add(kept[i]);
-                list.Add(arms.GetSeparator(index));
+                directives = directives.AddRange(DirectivesBefore(arms[i]));
+                continue;
             }
-            else
+
+            list.Add(After(directives, arms[i]));
+            directives = SyntaxTriviaList.Empty;
+
+            if (i < arms.SeparatorCount)
             {
-                list.Add(index == arms.Count - 1 ? kept[i] : kept[i].WithTrailingTrivia(arms[arms.Count - 1].GetTrailingTrivia()));
+                list.Add(arms.GetSeparator(i));
             }
         }
 
-        return visited.WithArms(SeparatedList<SwitchExpressionArmSyntax>(list));
+        var trailingComma = arms.SeparatorCount == arms.Count;
+        if (!trailingComma && list[^1].IsToken && directives.Count == 0)
+        {
+            var comma = list[^1].AsToken();
+            list.RemoveAt(list.Count - 1);
+            var ending = comma.TrailingTrivia.Any(t => t.IsKind(SyntaxKind.EndOfLineTrivia)) ? comma.TrailingTrivia : arms[arms.Count - 1].GetTrailingTrivia();
+            list[^1] = list[^1].AsNode()!.WithTrailingTrivia(ending);
+        }
+
+        return visited
+            .WithArms(SeparatedList<SwitchExpressionArmSyntax>(list))
+            .WithCloseBraceToken(visited.CloseBraceToken.WithLeadingTrivia(directives.AddRange(visited.CloseBraceToken.LeadingTrivia)));
     }
 
+    /// <summary>
+    /// A section none of whose labels can match goes, unless it <see cref="MustStay">has to stay</see>.
+    /// The directives before a label that goes are left before the next label, or before the section's statements if it was the last.
+    /// </summary>
     public override SyntaxNode? VisitSwitchStatement(SwitchStatementSyntax node)
     {
         var visited = (SwitchStatementSyntax)base.VisitSwitchStatement(node)!;
@@ -77,27 +118,38 @@ file class Remover : CSharpSyntaxRewriter
         }
 
         var sections = new List<SwitchSectionSyntax>();
+        var directives = SyntaxTriviaList.Empty;
         foreach (var section in visited.Sections)
         {
-            var kept = section.Labels.Where(label => !label.HasAnnotation(Dead)).ToList();
-            if (kept.Count == section.Labels.Count)
+            var allDead = section.Labels.All(label => label.HasAnnotation(Dead));
+            if (allDead && !MustStay(section))
             {
-                sections.Add(section);
-            }
-            else if (kept.Count > 0)
-            {
-                sections.Add(section.WithLabels(List(kept)));
+                directives = directives.AddRange(DirectivesBefore(section));
+                continue;
             }
 
-            // A section none of whose labels can match goes, unless it declares locals other sections can use.
-            // Then it keeps one label, as fixing its labels one at a time would.
-            else if (DeclaresLocals(section))
+            var labels = new List<SwitchLabelSyntax>();
+            for (var i = 0; i < section.Labels.Count; i++)
             {
-                sections.Add(section.WithLabels(SingletonList(section.Labels.Last())));
+                var label = section.Labels[i];
+                if (label.HasAnnotation(Dead) && !(allDead && i == section.Labels.Count - 1))
+                {
+                    directives = directives.AddRange(DirectivesBefore(label));
+                    continue;
+                }
+
+                labels.Add(After(directives, label));
+                directives = SyntaxTriviaList.Empty;
             }
+
+            var statements = section.Statements;
+            sections.Add(section.WithLabels(List(labels)).WithStatements(statements.Count == 0 ? statements : statements.Replace(statements[0], After(directives, statements[0]))));
+            directives = SyntaxTriviaList.Empty;
         }
 
-        return visited.WithSections(List(sections));
+        return visited
+            .WithSections(List(sections))
+            .WithCloseBraceToken(visited.CloseBraceToken.WithLeadingTrivia(directives.AddRange(visited.CloseBraceToken.LeadingTrivia)));
     }
 }
 
@@ -130,30 +182,12 @@ public sealed class RemoveDeadArmCodeFix : CodeFixProvider
     public override async Task RegisterCodeFixesAsync(CodeFixContext context)
     {
         var root = await context.Document.GetSyntaxRootAsync(context.CancellationToken).ConfigureAwait(false);
-        switch (root?.FindNode(context.Span))
+        if (root?.FindNode(context.Span) is { } node && Remover.CanRemove(node))
         {
-            case SwitchExpressionArmSyntax arm:
-                context.RegisterCodeFix(
-                    CodeAction.Create("Remove the arm", ct => RemoveAsync(context.Document, arm, ct), equivalenceKey: nameof(RemoveDeadArmCodeFix)),
-                    context.Diagnostics
-                );
-                break;
-
-            case SwitchLabelSyntax { Parent: SwitchSectionSyntax section } label when section.Labels.Count > 1:
-                context.RegisterCodeFix(
-                    CodeAction.Create("Remove the case", ct => RemoveAsync(context.Document, label, ct), equivalenceKey: nameof(RemoveDeadArmCodeFix)),
-                    context.Diagnostics
-                );
-                break;
-
-            // The section's only label: the section can't run either. Unless it declares locals, which other sections
-            // can use (a switch block is one scope).
-            case SwitchLabelSyntax { Parent: SwitchSectionSyntax { Parent: SwitchStatementSyntax } section } label when !Remover.DeclaresLocals(section):
-                context.RegisterCodeFix(
-                    CodeAction.Create("Remove the case", ct => RemoveAsync(context.Document, label, ct), equivalenceKey: nameof(RemoveDeadArmCodeFix)),
-                    context.Diagnostics
-                );
-                break;
+            context.RegisterCodeFix(
+                CodeAction.Create(node is SwitchExpressionArmSyntax ? "Remove the arm" : "Remove the case", ct => RemoveAsync(context.Document, node, ct), equivalenceKey: nameof(RemoveDeadArmCodeFix)),
+                context.Diagnostics
+            );
         }
     }
 }

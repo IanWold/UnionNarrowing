@@ -115,6 +115,12 @@ internal static class Sequences
             };
         }
 
+        // `Parallel.ForEach(source, body)`, which hands each element to body.
+        if (parameterName == "body" && ordinal == 0 && method.Name is "ForEach" or "ForEachAsync" && Symbols.Is(method.ContainingType, "Parallel", 0, "System", "Threading", "Tasks"))
+        {
+            return invocation.ArgumentFor("source");
+        }
+
         // List<T> and Array methods that hand each element to a delegate.
         if (parameterName is "action" or "match" or "converter" && ordinal == 0)
         {
@@ -163,14 +169,21 @@ internal static class Sequences
     /// </summary>
     public static ITypeSymbol? ElementType(IOperation sequence) =>
         Unconverted(sequence).Type is { } type
-            ? (type is INamedTypeSymbol { OriginalDefinition.SpecialType: SpecialType.System_Collections_Generic_IEnumerable_T } named ? named : type.AllInterfaces.FirstOrDefault(i => i.OriginalDefinition.SpecialType == SpecialType.System_Collections_Generic_IEnumerable_T))?.TypeArguments.FirstOrDefault()
+            ? (IsSequenceInterface(type) ? (INamedTypeSymbol)type : type.AllInterfaces.FirstOrDefault(IsSequenceInterface))?.TypeArguments.FirstOrDefault()
             : null;
 
     /// <summary>
-    /// Methods of LINQ (to objects, parallel, or over an ImmutableArray), which behave as documented.
+    /// Whether the type is <c>IEnumerable&lt;T&gt;</c> or <c>IAsyncEnumerable&lt;T&gt;</c>.
+    /// </summary>
+    private static bool IsSequenceInterface(ITypeSymbol type) =>
+        type is INamedTypeSymbol { OriginalDefinition.SpecialType: SpecialType.System_Collections_Generic_IEnumerable_T }
+        || Symbols.Is(type.OriginalDefinition, "IAsyncEnumerable", 1, "System", "Collections", "Generic");
+
+    /// <summary>
+    /// Methods of LINQ (to objects, async sequences, parallel, or over an ImmutableArray), which behave as documented.
     /// </summary>
     public static bool IsEnumerableMethod(IMethodSymbol method) =>
-        method.ContainingType is { Name: "Enumerable" or "ParallelEnumerable" or "ImmutableArrayExtensions" } type && Symbols.Is(type, type.Name, 0, "System", "Linq");
+        method.ContainingType is { Name: "Enumerable" or "AsyncEnumerable" or "ParallelEnumerable" or "ImmutableArrayExtensions" } type && Symbols.Is(type, type.Name, 0, "System", "Linq");
 
     /// <summary>
     /// Collections whose elements never change once made.

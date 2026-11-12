@@ -1,20 +1,4 @@
-using System.Collections.Generic;
 using System.Collections.Immutable;
-using System.Composition;
-using System.Linq;
-using System.Threading;
-using System.Threading.Tasks;
-using Microsoft.CodeAnalysis;
-using Microsoft.CodeAnalysis.CodeActions;
-using Microsoft.CodeAnalysis.CodeFixes;
-using Microsoft.CodeAnalysis.CSharp;
-using Microsoft.CodeAnalysis.CSharp.Syntax;
-using Microsoft.CodeAnalysis.FlowAnalysis;
-using Microsoft.CodeAnalysis.Operations;
-using Microsoft.CodeAnalysis.Simplification;
-using UnionNarrowing.Suppressors.Analysis;
-using UnionNarrowing.Suppressors.Analyzers;
-using static Microsoft.CodeAnalysis.CSharp.SyntaxFactory;
 
 namespace UnionNarrowing.CodeFixes;
 
@@ -47,7 +31,7 @@ public sealed class AddRequiredCodeFix : CodeFixProvider
         {
             var leading = constructor.GetLeadingTrivia();
             var indentation = leading.Count > 0 && leading.Last().IsKind(SyntaxKind.WhitespaceTrivia) ? TriviaList(leading.Last()) : TriviaList();
-            var attribute = AttributeList(SingletonSeparatedList(Attribute(ParseName("System.Diagnostics.CodeAnalysis.SetsRequiredMembers").WithAdditionalAnnotations(Simplifier.Annotation))))
+            var attribute = AttributeList(SingletonSeparatedList(Attribute(CodeFixSyntax.FullName("System.Diagnostics.CodeAnalysis.SetsRequiredMembers"))))
                 .WithLeadingTrivia(leading)
                 .WithTrailingTrivia(lineBreak.IsKind(SyntaxKind.EndOfLineTrivia) ? lineBreak : ElasticCarriageReturnLineFeed);
             var indented = constructor.WithLeadingTrivia(indentation);
@@ -56,15 +40,61 @@ public sealed class AddRequiredCodeFix : CodeFixProvider
         }
 
         var newRoot = root.ReplaceNodes(setters.Append<SyntaxNode>(member), (original, _) => original == member ? updated : SetsRequiredMembers((ConstructorDeclarationSyntax)original));
-        return await Simplifier.ReduceAsync(document.WithSyntaxRoot(newRoot), Simplifier.Annotation, cancellationToken: ct).ConfigureAwait(false);
+        return await CodeFixSyntax.ShortenNamesAsync(document.WithSyntaxRoot(newRoot), ct).ConfigureAwait(false);
     }
 
     /// <summary>
-    /// The constructors that assign <paramref name="member"/>, themselves or through one they chain to, and don't say they set the required members:
-    /// once it's required, they need <c>[SetsRequiredMembers]</c>, or their callers would have to set it as well.
-    /// Null where one of them can't say that, because it doesn't assign every other required member (or one is in another file).
+    /// Whether code in the solution would stop compiling once <paramref name="member"/> is required:
+    /// a class that derives from <paramref name="type"/>,
+    /// a <c>new</c> that doesn't set it with one of the <paramref name="constructors"/> that leave it to their callers,
+    /// or <paramref name="type"/> as a type argument for a <c>new()</c> constraint, which a type with required members doesn't meet.
     /// </summary>
-    private static List<ConstructorDeclarationSyntax>? ConstructorsThatSetIt(ISymbol member, INamedTypeSymbol type, SemanticModel model, CancellationToken ct)
+    private static async Task<bool> BreaksCodeAsync(Solution solution, ISymbol member, INamedTypeSymbol type, IEnumerable<IMethodSymbol> constructors, CancellationToken ct)
+    {
+        if ((await SymbolFinder.FindDerivedClassesAsync(type, solution, transitive: false, cancellationToken: ct).ConfigureAwait(false)).Any())
+        {
+            return true;
+        }
+
+        foreach (var constructor in constructors)
+        {
+            foreach (var (node, _) in await ReferencesAsync(constructor, solution, ct).ConfigureAwait(false))
+            {
+                switch (node.FirstAncestorOrSelf<SyntaxNode>(n => n is BaseObjectCreationExpressionSyntax or ConstructorInitializerSyntax))
+                {
+                    case ConstructorInitializerSyntax:
+                        continue;
+
+                    case BaseObjectCreationExpressionSyntax { Initializer: { } initializer }
+                        when initializer.Expressions.Any(e => e is AssignmentExpressionSyntax { Left: IdentifierNameSyntax name } && name.Identifier.ValueText == member.Name):
+                        continue;
+
+                    default:
+                        return true;
+                }
+            }
+        }
+
+        foreach (var (node, model) in await ReferencesAsync(type, solution, ct).ConfigureAwait(false))
+        {
+            if (node.AncestorsAndSelf().TakeWhile(n => n is TypeSyntax).LastOrDefault() is TypeSyntax { Parent: TypeArgumentListSyntax { Parent: GenericNameSyntax generic } arguments } written
+                && model.GetSymbolInfo(generic, ct).Symbol switch { IMethodSymbol method => method.TypeParameters, INamedTypeSymbol named => named.TypeParameters, _ => [] } is var parameters
+                && parameters.ElementAtOrDefault(arguments.Arguments.IndexOf(written)) is { HasConstructorConstraint: true }
+            )
+            {
+                return true;
+            }
+        }
+
+        return false;
+    }
+
+    /// <summary>
+    /// The type's constructors that need <c>[SetsRequiredMembers]</c> once <paramref name="member"/> is required, and the ones that leave it to their callers.
+    /// The ones that assign it (themselves, or through one they chain to) and don't say they set the required members need the attribute, or their callers would have to set it as well.
+    /// Null where one of them can't say that, because it doesn't assign every other required member (or it's in another file).
+    /// </summary>
+    private static (List<ConstructorDeclarationSyntax> Setters, List<IMethodSymbol> LeavingIt)? Constructors(ISymbol member, INamedTypeSymbol type, SemanticModel model, CancellationToken ct)
     {
         static bool IsRequired(ISymbol symbol) =>
             symbol is IFieldSymbol { IsRequired: true } or IPropertySymbol { IsRequired: true };
@@ -72,16 +102,15 @@ public sealed class AddRequiredCodeFix : CodeFixProvider
         static bool SaysItSetsThem(IMethodSymbol constructor) =>
             Symbols.HasAttribute(constructor, "SetsRequiredMembersAttribute", "System", "Diagnostics", "CodeAnalysis");
 
-        var declared = type.InstanceConstructors
-            .Select(constructor => (Symbol: constructor, Syntax: constructor.DeclaringSyntaxReferences.FirstOrDefault()?.GetSyntax(ct) as ConstructorDeclarationSyntax))
-            .Where(constructor => constructor.Syntax is not null)
-            .ToList();
-
+        var declared = new Dictionary<IMethodSymbol, ConstructorDeclarationSyntax>(SymbolEqualityComparer.Default);
         var assignments = new Dictionary<IMethodSymbol, (ImmutableHashSet<ISymbol> Assigned, IMethodSymbol? Chained)>(SymbolEqualityComparer.Default);
-        foreach (var (constructor, syntax) in declared)
+        foreach (var constructor in type.InstanceConstructors)
         {
-            if (Functions.SemanticModelFor(syntax!, model).GetOperation(syntax!, ct) is IConstructorBodyOperation body)
+            if (constructor.DeclaringSyntaxReferences.FirstOrDefault()?.GetSyntax(ct) is ConstructorDeclarationSyntax syntax
+                && Functions.SemanticModelFor(syntax, model).GetOperation(syntax, ct) is IConstructorBodyOperation body
+            )
             {
+                declared[constructor] = syntax;
                 assignments[constructor] = UnassignedUnionMemberAnalyzer.Assignments(ControlFlowGraph.Create(body, ct), type);
             }
         }
@@ -95,23 +124,43 @@ public sealed class AddRequiredCodeFix : CodeFixProvider
         }
 
         var setters = new List<ConstructorDeclarationSyntax>();
-        foreach (var (constructor, syntax) in declared)
+        var leavingIt = new List<IMethodSymbol>();
+        foreach (var constructor in type.InstanceConstructors.Where(constructor => !SaysItSetsThem(constructor)))
         {
             var assigned = UnassignedUnionMemberAnalyzer.AssignedBy(constructor, assignments);
-            if (!assigned.Contains(member) || SaysItSetsThem(constructor))
+            if (!assigned.Contains(member))
             {
-                continue;
+                leavingIt.Add(constructor);
             }
-
-            if (inheritsRequired || !otherRequired.All(assigned.Contains) || syntax!.SyntaxTree != model.SyntaxTree)
+            else if (inheritsRequired || !otherRequired.All(assigned.Contains) || declared[constructor].SyntaxTree != model.SyntaxTree)
             {
                 return null;
             }
-
-            setters.Add(syntax);
+            else
+            {
+                setters.Add(declared[constructor]);
+            }
         }
 
-        return setters;
+        return (setters, leavingIt);
+    }
+
+    /// <summary>
+    /// Where the solution refers to <paramref name="symbol"/>, with the semantic model of each place.
+    /// </summary>
+    private static async Task<List<(SyntaxNode Node, SemanticModel Model)>> ReferencesAsync(ISymbol symbol, Solution solution, CancellationToken ct)
+    {
+        var references = new List<(SyntaxNode, SemanticModel)>();
+
+        foreach (var location in (await SymbolFinder.FindReferencesAsync(symbol, solution, ct).ConfigureAwait(false)).SelectMany(reference => reference.Locations))
+        {
+            var root = await location.Document.GetSyntaxRootAsync(ct).ConfigureAwait(false);
+            var model = await location.Document.GetSemanticModelAsync(ct).ConfigureAwait(false);
+
+            references.Add((root!.FindNode(location.Location.SourceSpan, getInnermostNodeForTie: true), model!));
+        }
+
+        return references;
     }
 
     public override FixAllProvider GetFixAllProvider() =>
@@ -143,14 +192,16 @@ public sealed class AddRequiredCodeFix : CodeFixProvider
             || model.GetDeclaredSymbol(token.Parent, ct) is not { IsStatic: false, ContainingType: { } type } symbol
             || symbol.DeclaredAccessibility < type.DeclaredAccessibility
             || symbol is IPropertySymbol { SetMethod: { } setter } && setter.DeclaredAccessibility < type.DeclaredAccessibility
-            || ConstructorsThatSetIt(symbol, type, model, ct) is not { } setters
+            || Symbols.HasAttribute(symbol, "ObsoleteAttribute", "System")
+            || Constructors(symbol, type, model, ct) is not { } constructors
+            || await BreaksCodeAsync(context.Document.Project.Solution, symbol, type, constructors.LeavingIt, ct).ConfigureAwait(false)
         )
         {
             return;
         }
 
         context.RegisterCodeFix(
-            CodeAction.Create("Make it required", ct => AddRequiredAsync(context.Document, member, setters, ct), equivalenceKey: nameof(AddRequiredCodeFix)),
+            CodeAction.Create("Make it required", ct => AddRequiredAsync(context.Document, member, constructors.Setters, ct), equivalenceKey: nameof(AddRequiredCodeFix)),
             context.Diagnostics
         );
     }

@@ -1,3 +1,4 @@
+using System;
 using System.Collections.Generic;
 using System.Linq;
 using System.Threading;
@@ -16,6 +17,14 @@ internal static class Symbols
     /// </summary>
     public static bool HasAttribute(ISymbol symbol, string name, params string[] namespaceParts) =>
         symbol.GetAttributes().Any(attribute => IsAttribute(attribute, name, namespaceParts));
+
+    /// <summary>
+    /// Whether the type lays its fields out explicitly (<c>[StructLayout(LayoutKind.Explicit)]</c>), where writing one field can change another that shares its bytes.
+    /// </summary>
+    public static bool HasExplicitLayout(ITypeSymbol type) =>
+        type.GetAttributes().Any(attribute => IsAttribute(attribute, "StructLayoutAttribute", "System", "Runtime", "InteropServices")
+            && attribute.ConstructorArguments.Length == 1 && Convert.ToInt32(attribute.ConstructorArguments[0].Value) == 2 // LayoutKind.Explicit
+        );
 
     /// <summary>
     /// Whether the type inherits from <c>System.<paramref name="systemName"/></c>.

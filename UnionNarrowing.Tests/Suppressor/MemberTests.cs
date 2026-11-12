@@ -606,6 +606,234 @@ public class MemberTests
 
 
     [Fact]
+    public Task Getters_that_return_another_member() =>
+        Verify.Suppressions("""
+            class Filter
+            {
+                private readonly Pet _input;
+
+                public Filter(Pet input)
+                {
+                    if (input is Bird) throw new ArgumentException();
+                    _input = input;
+                }
+
+                public Pet Input => _input;
+                public Pet Child { get { return Input; } }
+
+                public int Legs() => Input /*suppressed*/switch { Cat => 4, Dog => 4 };
+            }
+
+            class C
+            {
+                int Guarded(Filter f)
+                {
+                    if (f.Input is Dog) return 0;
+                    return f.Child /*suppressed*/switch { Cat => 1, Bird => 2 };
+                }
+
+                int Unguarded(Filter f) => f.Child /*warns*/switch { Cat => 1, Bird => 2 };
+            }
+            """
+        );
+
+    [Fact]
+    public Task Code_construction_starts_that_waits() =>
+        Verify.Suppressions("""
+            using System.Collections.Generic;
+            using System.Runtime.InteropServices;
+            using System.Threading.Tasks;
+
+            class Connection
+            {
+                public static TaskCompletionSource Gate = new();
+                private readonly Pet _pet;
+                private readonly Task<int> _pump;
+                private readonly IEnumerator<int> _steps;
+
+                // Both start running before _pet is set, and carry on after.
+                public Connection(Pet pet)
+                {
+                    _pump = PumpAsync();
+                    _steps = Steps();
+                    _steps.MoveNext();
+                    _pet = pet;
+                }
+
+                async Task<int> PumpAsync()
+                {
+                    if (_pet is Bird) return 0;
+                    /*because*/await Gate.Task;
+                    return _pet /*warns*/switch { Cat => 1, Dog => 2 };
+                }
+
+                IEnumerator<int> Steps()
+                {
+                    if (_pet is Bird) yield break;
+                    /*because*/yield return 0;
+                    yield return _pet /*warns*/switch { Cat => 1, Dog => 2 };
+                }
+
+                // Construction doesn't start this one.
+                public async Task<int> LaterAsync()
+                {
+                    if (_pet is Bird) return 0;
+                    await Gate.Task;
+                    return _pet /*suppressed*/switch { Cat => 1, Dog => 2 };
+                }
+            }
+
+            // Writing one field of a class that lays its fields out explicitly can change another.
+            [StructLayout(LayoutKind.Explicit)]
+            class Overlap
+            {
+                [FieldOffset(0)] public readonly Pet Fixed;
+                [FieldOffset(0)] public Pet Loose;
+
+                public Overlap(Pet pet) => Fixed = pet;
+
+                public int M()
+                {
+                    if (Fixed is Bird) return 0;
+                    Loose = new Bird("Polly");
+                    return Fixed /*warns*/switch { Cat => 1, Dog => 2 };
+                }
+            }
+            """
+        );
+
+    /// <summary>
+    /// Objects whose construction hands them to other code before their readonly members are set:
+    /// code anywhere (another thread, or code that waits meanwhile) can read a member before and after it's set.
+    /// </summary>
+    [Fact]
+    public Task Readonly_members_of_objects_handed_out_while_constructed() =>
+        Verify.Suppressions("""
+            using System.Collections.Generic;
+            using System.Threading.Tasks;
+
+            class Registry
+            {
+                public readonly TaskCompletionSource<Node> Added = new();
+                public void Add(Node node) => Added.TrySetResult(node);
+            }
+
+            class Node
+            {
+                public readonly Pet Pet;
+                private readonly Pet _pet;
+                public Node(Registry registry, Pet pet) { registry.Add(this); Pet = pet; _pet = pet; }
+                public Pet Held => _pet;
+            }
+
+            class Settled
+            {
+                public readonly Pet Pet;
+                public Settled(Pet pet) => Pet = pet;
+            }
+
+            class Poller
+            {
+                private readonly Pet _pet;
+                public readonly Task<int> Loop;
+
+                public Poller(Pet pet)
+                {
+                    Loop = Task.Run(Tick);
+                    _pet = pet;
+                }
+
+                int Tick()
+                {
+                    if (_pet is Bird) return 0;
+                    Wait();
+                    return _pet /*warns*/switch { Cat => 1, Dog => 2 };
+                }
+
+                static void Wait() { }
+            }
+
+            abstract class Service
+            {
+                protected Service() => Running = Task.Run(Execute);
+                public Task<int> Running { get; }
+                protected abstract int Execute();
+            }
+
+            sealed class Worker : Service
+            {
+                private readonly Pet _pet;
+                public Worker(Pet pet) => _pet = pet;
+
+                protected override int Execute()
+                {
+                    if (_pet is Bird) return 0;
+                    return _pet /*warns*/switch { Cat => 1, Dog => 2 };
+                }
+            }
+
+            class Announced
+            {
+                public static event Func<Announced, Task>? Created;
+                public required Pet Pet { get; init; }
+                public Announced() => Created?.Invoke(this);
+            }
+
+            static class Defaults
+            {
+                public static readonly Pet Pet;
+                static Defaults() { Loader.Start(); Pet = new Cat("Tom"); }
+            }
+
+            static class Loader
+            {
+                public static TaskCompletionSource Gate = new();
+                public static Task<int>? Running;
+                public static void Start() => Running = Read();
+
+                static async Task<int> Read()
+                {
+                    if (Defaults.Pet is Bird) return 0;
+                    /*because*/await Gate.Task;
+                    return Defaults.Pet /*warns*/switch { Cat => 1, Dog => 2 };
+                }
+            }
+
+            class C
+            {
+                async Task<int> Watch(Registry registry, Task gate)
+                {
+                    var node = await registry.Added.Task;
+                    if (node.Pet is Bird) return 0;
+                    await gate;
+                    return node.Pet /*warns*/switch { Cat => 1, Dog => 2 };
+                }
+
+                async Task<int> WatchGetter(Registry registry, Task gate)
+                {
+                    var node = await registry.Added.Task;
+                    if (node.Held is Bird) return 0;
+                    await gate;
+                    return node.Held /*warns*/switch { Cat => 1, Dog => 2 };
+                }
+
+                async Task<int> OnCreated(Announced announced, Task gate)
+                {
+                    if (announced.Pet is Bird) return 0;
+                    await gate;
+                    return announced.Pet /*warns*/switch { Cat => 1, Dog => 2 };
+                }
+
+                int Plain(Settled settled)
+                {
+                    if (settled.Pet is Bird) return 0;
+                    return settled.Pet /*suppressed*/switch { Cat => 1, Dog => 2 };
+                }
+            }
+            """
+        );
+
+    [Fact]
     public Task Lambdas_made_while_the_object_is_constructed_in_other_ways() =>
         Verify.Suppressions("""
             static class Other
@@ -733,6 +961,33 @@ public class MemberTests
                 {
                     if (Defaults.Pet is Bird) return 0;
                     return Defaults.Pet /*suppressed*/switch { Cat => 1, Dog => 2 };
+                }
+            }
+            """
+        );
+
+    [Fact]
+    public Task Async_local_function_a_constructor_starts() =>
+        Verify.Suppressions("""
+            using System.Threading.Tasks;
+
+            class Connection
+            {
+                public static TaskCompletionSource Gate = new();
+                private readonly Pet _pet;
+                public readonly Task<int> Pump;
+
+                public Connection(Pet pet)
+                {
+                    Pump = Local();
+                    _pet = pet;
+
+                    async Task<int> Local()
+                    {
+                        if (_pet is Bird) return 0;
+                        /*because*/await Gate.Task;
+                        return _pet /*warns*/switch { Cat => 1, Dog => 2 };
+                    }
                 }
             }
             """

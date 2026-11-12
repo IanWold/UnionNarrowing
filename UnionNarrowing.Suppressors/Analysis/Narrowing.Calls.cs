@@ -48,10 +48,10 @@ internal static partial class Narrowing
 
         foreach (var (call, callModel) in calls)
         {
-            var arguments = callModel.GetOperation(call, ct) switch
+            var (arguments, called) = callModel.GetOperation(call, ct) switch
             {
-                IInvocationOperation invocation => invocation.Arguments,
-                IObjectCreationOperation creation => creation.Arguments,
+                IInvocationOperation invocation => (invocation.Arguments, (ISymbol)invocation.TargetMethod),
+                IObjectCreationOperation { Constructor: { } constructor } creation => (creation.Arguments, constructor),
                 _ => default,
             };
 
@@ -62,19 +62,20 @@ internal static partial class Narrowing
 
             // What's ruled out for a followed argument there (with the whole path the value is reached by, steps into a
             // union's case included), or what anything else passed is known not to be: a new case, a call to a method of
-            // one's own, ...
+            // one's own, ... For a generic function, that's in its space as it is there, with the call's type arguments.
+            var space = context.Space.At(called, model.Compilation);
             var atCall = TrackedValue.From(argument.Value, context.Value.Session) is { } passed
                 ? IsTrackable(passed, argument.Value.Syntax, callModel, ct)
-                    ? Excluded(argument.Value.Syntax, context.Value.WithRoot(passed), context.Space, callModel, ct, onEntry: false, context.Copies + 1)
+                    ? Excluded(argument.Value.Syntax, context.Value.WithRoot(passed), space, callModel, ct, onEntry: false, context.Copies + 1)
                     : CaseSet.Empty
-                : KnownExcluded(argument.Value, context.Value.Steps, context.Space, callModel, context.Value.Session, ct, context.Copies + 1);
+                : KnownExcluded(argument.Value, context.Value.Steps, space, callModel, context.Value.Session, ct, context.Copies + 1);
 
             if (NotNullThere(argument.Value, context.Space, callModel, ct))
             {
                 atCall |= CaseSet.Null;
             }
 
-            atEntry = Meet(atEntry, atCall);
+            atEntry = Meet(atEntry, context.Space.FromUse(atCall, space));
         }
 
         return atEntry ?? CaseSet.Empty;
@@ -182,7 +183,7 @@ internal static partial class Narrowing
         List<(IOperation, IOperation)>? HelperArguments(IInvocationOperation call, IParameterSymbol delegateParameter)
         {
             var method = call.TargetMethod.OriginalDefinition;
-            if (Functions.OwnDeclaration(method, model.Compilation, ct) is not { } declaration)
+            if (Functions.IsIntercepted(call) || Functions.OwnDeclaration(method, model.Compilation, ct) is not { } declaration)
             {
                 return null;
             }

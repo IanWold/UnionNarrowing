@@ -133,17 +133,24 @@ public class ArmTests
         Verify.Suppressions("""
             class C
             {
-                // `Name.Length: _` also needs Name not to be null.
+                // `Name.Length: _` also needs Name not to be null, which the compiler (as nullable warnings do) takes it
+                // not to be: it's declared that way.
                 int M(Pet pet)
                 {
                     if (pet is Bird) return 0;
-                    return pet /*warns*/switch { Cat => 1, Dog { Name.Length: _ } => 2 };
+                    return pet /*suppressed*/switch { Cat => 1, Dog { Name.Length: _ } => 2 };
                 }
 
                 int N(Pet pet)
                 {
                     if (pet is Bird) return 0;
-                    return pet /*warns*/switch { Cat => 1, Dog { Name: { } } => 2 };
+                    return pet /*suppressed*/switch { Cat => 1, Dog { Name: { } } => 2 };
+                }
+
+                int O(Pet pet)
+                {
+                    if (pet is Bird) return 0;
+                    return pet /*warns*/switch { Cat => 1, Dog { Name: "Rex" } => 2 };
                 }
             }
             """
@@ -188,5 +195,59 @@ public class ArmTests
                 int ChangedByAClause(Pet pet, bool loud) => pet /*warns*/switch { Cat when loud => 1, Cat when !(loud = !loud) => 2, Dog => 3, Bird => 4 };
             }
             """, diagnosticId: "CS8846"
+        );
+
+    /// <summary>
+    /// Arms that split a case between them in ways the compiler follows (list patterns, relational patterns, strings, members that aren't unions) handle it, together with what earlier code rules out.
+    /// </summary>
+    [Fact]
+    public Task Arms_that_split_a_case_the_compiler_can_tell_apart() =>
+        Verify.Suppressions("""
+            using System.Collections.Generic;
+
+            public record Primary(List<string> Replicas);
+            public record Replica(string Ip);
+            public record Sentinel(List<string> Names);
+            public union Role(Primary, Replica, Sentinel);
+
+            public record Code(int Value);
+            public record Okay;
+            public record Fail(Code Error);
+            public record Other;
+            public union Reply(Okay, Fail, Other);
+
+            class C
+            {
+                int Lists(Role role)
+                {
+                    if (role is Sentinel) return 3;
+                    return role /*suppressed*/switch { Primary { Replicas: [] } => 0, Primary { Replicas: [_] } => 1, Primary { Replicas: [_, _, ..] } => 2, Replica => 4 };
+                }
+
+                int Relational(Role role)
+                {
+                    if (role is Sentinel) return 3;
+                    return role /*suppressed*/switch { Primary { Replicas.Count: 0 } => 0, Primary { Replicas.Count: > 0 } => 1, Replica => 4 };
+                }
+
+                int Strings(Role role)
+                {
+                    if (role is Primary) return 0;
+                    return role /*suppressed*/switch { Replica { Ip: "" } => 1, Replica { Ip: not "" } => 2, Sentinel => 3 };
+                }
+
+                int MemberChain(Reply reply)
+                {
+                    if (reply is Other) return 1;
+                    return reply /*suppressed*/switch { Okay => 0, Fail { Error.Value: var code } => code };
+                }
+
+                int StillMissing(Role role)
+                {
+                    if (role is Sentinel) return 3;
+                    return role /*warns*/switch { Primary { Replicas: [] } => 0, Primary { Replicas: [_] } => 1, Replica => 4 };
+                }
+            }
+            """
         );
 }

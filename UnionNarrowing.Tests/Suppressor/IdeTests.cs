@@ -159,4 +159,25 @@ public class IdeTests
             }
             """, diagnosticId: "IDE0010"
         );
+
+    [Fact]
+    public Task Switch_statement_a_goto_enters_from_another_section() =>
+        Verify.Suppressions("""
+            class C
+            {
+                void M(Pet pet)
+                {
+                    /*warns*/switch (pet)
+                    {
+                        case Cat:
+                        Inside:
+                            /*warns*/switch (pet) { case Cat: break; }
+                            break;
+                        case Bird:
+                            goto Inside;
+                    }
+                }
+            }
+            """, diagnosticId: "IDE0010"
+        );
 }

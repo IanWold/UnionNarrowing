@@ -18,6 +18,11 @@ file class TupleModel
 {
     private readonly Compilation _compilation;
     private readonly List<CaseSet> _excluded;
+
+    /// <summary>
+    /// What each element's subpattern says about the element's cases, which doesn't depend on the combination.
+    /// </summary>
+    private readonly Dictionary<(IPatternOperation, int), Outcome> _outcomes = [];
     private readonly List<CaseSpace> _spaces;
     private readonly IReadOnlyList<CaseSet[]> _together;
 
@@ -32,11 +37,21 @@ file class TupleModel
         _compilation = compilation;
     }
 
+    private Outcome OutcomeAt(IPatternOperation subpattern, int element)
+    {
+        if (!_outcomes.TryGetValue((subpattern, element), out var outcome))
+        {
+            _outcomes[(subpattern, element)] = outcome = Facts.Of(subpattern, _spaces[element], _compilation);
+        }
+
+        return outcome;
+    }
+
     public bool AlwaysMatches(IPatternOperation pattern, object?[] combination) => pattern switch
     {
         IDiscardPatternOperation or IDeclarationPatternOperation { MatchesNull: true } => true,
         IRecursivePatternOperation { PropertySubpatterns.IsEmpty: true } recursive when recursive.DeconstructionSubpatterns.Length == _spaces.Count =>
-            recursive.DeconstructionSubpatterns.Select((sub, i) => Facts.Of(sub, _spaces[i], _compilation).AlwaysTrue.ContainsCase(combination[i])).All(x => x),
+            recursive.DeconstructionSubpatterns.Select((sub, i) => OutcomeAt(sub, i).AlwaysTrue.ContainsCase(combination[i])).All(x => x),
         IBinaryPatternOperation { OperatorKind: BinaryOperatorKind.Or } or => AlwaysMatches(or.LeftPattern, combination) || AlwaysMatches(or.RightPattern, combination),
         IBinaryPatternOperation { OperatorKind: BinaryOperatorKind.And } and => AlwaysMatches(and.LeftPattern, combination) && AlwaysMatches(and.RightPattern, combination),
         INegatedPatternOperation not => !CouldMatch(not.Pattern, combination),
@@ -47,7 +62,7 @@ file class TupleModel
     {
         IDiscardPatternOperation or IDeclarationPatternOperation { MatchesNull: true } => true,
         IRecursivePatternOperation { PropertySubpatterns.IsEmpty: true } recursive when recursive.DeconstructionSubpatterns.Length == _spaces.Count =>
-            recursive.DeconstructionSubpatterns.Select((sub, i) => !Facts.Of(sub, _spaces[i], _compilation).AlwaysFalse.ContainsCase(combination[i])).All(x => x),
+            recursive.DeconstructionSubpatterns.Select((sub, i) => !OutcomeAt(sub, i).AlwaysFalse.ContainsCase(combination[i])).All(x => x),
         IBinaryPatternOperation { OperatorKind: BinaryOperatorKind.Or } or => CouldMatch(or.LeftPattern, combination) || CouldMatch(or.RightPattern, combination),
         IBinaryPatternOperation { OperatorKind: BinaryOperatorKind.And } and => CouldMatch(and.LeftPattern, combination) && CouldMatch(and.RightPattern, combination),
         INegatedPatternOperation not => !AlwaysMatches(not.Pattern, combination),
@@ -297,11 +312,13 @@ public sealed class DeadArmAnalyzer : DiagnosticAnalyzer
             return;
         }
 
-        var earlier = new List<IPatternOperation>();
+        // The combinations no earlier arm (without a `when` clause) is sure to match, and whether earlier code rules each out.
+        var left = Enumerable.Range(0, combinations.All.Count).ToList();
+        var ruledOut = combinations.All.Select(combinations.RuledOut).ToList();
         foreach (var (syntax, pattern, guarded) in candidates)
         {
-            var reachable = combinations.All.Where(c => combinations.CouldMatch(pattern, c) && !earlier.Any(e => combinations.AlwaysMatches(e, c))).ToList();
-            if (reachable.Count > 0 && reachable.All(combinations.RuledOut) && !IsThrowingCatchAll(syntax, pattern))
+            var reachable = left.Where(i => combinations.CouldMatch(pattern, combinations.All[i])).ToList();
+            if (reachable.Count > 0 && reachable.All(i => ruledOut[i]) && !IsThrowingCatchAll(syntax, pattern))
             {
                 context.ReportDiagnostic(Diagnostic.Create(Descriptors.DeadArm, syntax.GetLocation(), what, RuledOut(pattern)));
                 reported.Add(syntax);
@@ -309,7 +326,7 @@ public sealed class DeadArmAnalyzer : DiagnosticAnalyzer
 
             if (!guarded)
             {
-                earlier.Add(pattern);
+                left.RemoveAll(i => combinations.AlwaysMatches(pattern, combinations.All[i]));
             }
         }
     }
@@ -320,8 +337,9 @@ public sealed class DeadArmAnalyzer : DiagnosticAnalyzer
         context.EnableConcurrentExecution();
         context.RegisterCompilationStartAction(start =>
         {
-            // A test that callers happen to make dead today is still a sensible guard in the method itself.
-            var session = new Session(start.Options.AnalyzerConfigOptionsProvider, followsCallers: false);
+            // A test that callers happen to make dead today is still a sensible guard in the method itself, and an arm
+            // for a case a helper happens not to return today still handles what it may return tomorrow.
+            var session = new Session(start.Options.AnalyzerConfigOptionsProvider, followsCallers: false, followsCallees: false);
             start.RegisterOperationAction(c => AnalyzeLabels(c, ((ISwitchExpressionOperation)c.Operation).Value, "arm", session), OperationKind.SwitchExpression);
             start.RegisterOperationAction(c => AnalyzeLabels(c, ((ISwitchOperation)c.Operation).Value, "case", session), OperationKind.Switch);
             start.RegisterOperationAction(c => AnalyzeTest(c, session), OperationKind.IsPattern, OperationKind.IsType);

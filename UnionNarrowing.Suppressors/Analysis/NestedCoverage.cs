@@ -54,6 +54,12 @@ file class Places
     /// Combinations of the cases of the elements the analysis follows (by index) that earlier code rules out together (<c>if (b is { Left: Lit, Right: Lit }) return;</c>), as boxes over those elements.
     /// </summary>
     private (List<int> Elements, IReadOnlyList<CaseSet[]> Boxes) _together = ([], []);
+
+    /// <summary>
+    /// Where the patterns take an object apart positionally (<c>Marker(true)</c>), the members each position reads, by where the object is.
+    /// The compiler only counts arms as covering an object together when they read its members the same way.
+    /// </summary>
+    private readonly List<(int Root, IReadOnlyList<Step> Prefix, IReadOnlyList<ISymbol?> Members)> _positions = [];
     private readonly ImmutableArray<IOperation> _inputs;
     private readonly bool _isTuple;
     private readonly SemanticModel _model;
@@ -121,8 +127,16 @@ file class Places
             case ITypePatternOperation or IDeclarationPatternOperation or IConstantPatternOperation or IRelationalPatternOperation:
                 return at >= 0 && candidate != NotThere && OutcomeAt(pattern, at).AlwaysTrue.ContainsCase(candidate);
 
+            // At a place that isn't an element (a member that's neither a union nor a closed type, and can't be null), only the
+            // subpatterns matter, if the type test always holds there.
             case IRecursivePatternOperation recursive:
-                if (at < 0 || candidate is null || candidate == NotThere || !Facts.CaseIsAlways(candidate, recursive.MatchedType, _elements[at].Space, Compilation))
+                var holds = at < 0
+                    ? path.Count > 0 && DeclaredType(path[path.Count - 1]) is { } memberType
+                        && memberType is not { IsReferenceType: true, NullableAnnotation: not NullableAnnotation.NotAnnotated }
+                        && Symbols.UnderlyingOfNullable(memberType) is null
+                        && Facts.CaseIsAlways(memberType, recursive.MatchedType, _elements[root].Space, Compilation)
+                    : candidate is not null && candidate != NotThere && Facts.CaseIsAlways(candidate, recursive.MatchedType, _elements[at].Space, Compilation);
+                if (!holds)
                 {
                     return false;
                 }
@@ -156,11 +170,11 @@ file class Places
     }
 
     /// <summary>
-    /// <c>{ Member: pattern }</c> for each element read through members (only) from <paramref name="prefix"/>.
+    /// The elements read through members (only) from <paramref name="prefix"/>, with the members they're read through.
     /// </summary>
-    private List<SubpatternSyntax> Children(Element parent, IReadOnlyList<Step> prefix)
+    private List<(int Index, IReadOnlyList<MemberStep> Chain)> Children(Element parent, IReadOnlyList<Step> prefix)
     {
-        var children = new List<SubpatternSyntax>();
+        var children = new List<(int, IReadOnlyList<MemberStep>)>();
         for (var j = 0; j < _elements.Count; j++)
         {
             var child = _elements[j];
@@ -170,37 +184,63 @@ file class Places
             }
 
             var chain = child.Path.Skip(prefix.Count).ToList();
-            if (!chain.All(step => step is MemberStep))
+            if (chain.All(step => step is MemberStep))
             {
-                continue;
+                children.Add((j, chain.Cast<MemberStep>().ToList()));
             }
-
-            var names = chain.Cast<MemberStep>().Select(step => step.Member.Name).ToList();
-            ExpressionSyntax member = IdentifierName(names[0]);
-
-            foreach (var next in names.Skip(1))
-            {
-                member = MemberAccessExpression(SyntaxKind.SimpleMemberAccessExpression, member, IdentifierName(next));
-            }
-
-            children.Add(Subpattern(names.Count == 1 ? NameColon(IdentifierName(names[0])) : ExpressionColon(member, Token(SyntaxKind.ColonToken)), Write(j)));
         }
 
         return children;
     }
 
     /// <summary>
+    /// A pattern for what's at <paramref name="prefix"/> (of type <paramref name="name"/>, if given) with the patterns for the elements inside it:
+    /// positional (<c>Marker(false)</c>) where the arms take it apart that way and each element is one of its positions, or else <c>{ Member: pattern }</c>.
+    /// </summary>
+    private PatternSyntax WithMembers(TypeSyntax? name, Element parent, IReadOnlyList<Step> prefix)
+    {
+        var children = Children(parent, prefix);
+        if (children.Count == 0 && name is not null)
+        {
+            return TypePattern(name);
+        }
+
+        if (name is not null
+            && _positions.FirstOrDefault(p => p.Root == parent.Root && p.Prefix.SequenceEqual(prefix)).Members is { } positions
+            && children.All(child => child.Chain.Count == 1 && positions.Contains(child.Chain[0].Member, SymbolEqualityComparer.Default))
+        )
+        {
+            var subpatterns = positions.Select(position => children.FirstOrDefault(child => SymbolEqualityComparer.Default.Equals(child.Chain[0].Member, position)) is { Chain: not null } child ? Write(child.Index) : DiscardPattern());
+            return RecursivePattern(name, PositionalPatternClause(SeparatedList(subpatterns.Select(Subpattern))), null, null);
+        }
+
+        return RecursivePattern(name, null, PropertyPatternClause(SeparatedList(children.Select(child =>
+        {
+            ExpressionSyntax member = IdentifierName(child.Chain[0].Member.Name);
+            foreach (var next in child.Chain.Skip(1))
+            {
+                member = MemberAccessExpression(SyntaxKind.SimpleMemberAccessExpression, member, IdentifierName(next.Member.Name));
+            }
+
+            return Subpattern(child.Chain.Count == 1 ? NameColon(IdentifierName(child.Chain[0].Member.Name)) : ExpressionColon(member, Token(SyntaxKind.ColonToken)), Write(child.Index));
+        }))), null);
+    }
+
+    /// <summary>
     /// Collects where the pattern looks:
-    /// every place it tests that's a union or closed hierarchy.
+    /// every place it tests that's a union or closed hierarchy, and every bool, or member that can be null, which arms can split between them (<c>Marker(true)</c> and <c>Marker(false)</c>, <c>{ Frame: null }</c> and <c>{ Frame: { } f }</c>).
     /// </summary>
     private void Collect(IPatternOperation pattern, int root, IReadOnlyList<Step> path)
     {
-        if (path.Count > Limits.NestedDepth || _elements.Count >= Limits.NestedPlaces)
+        if (path.Count(step => step is MemberStep) > Limits.NestedDepth || _elements.Count >= Limits.NestedPlaces)
         {
             return;
         }
 
-        if (path.Count > 0 && Find(root, path) < 0 && CaseSpace.OfElement(PlaceType(pattern, path), _switchNode.SpanStart, _model, _ct) is { IsOfTypes: true } space)
+        if (path.Count > 0 && Find(root, path) < 0
+            && CaseSpace.OfElement(PlaceType(pattern, path), _switchNode.SpanStart, _model, _ct) is { } space
+            && (space.IsOfTypes || space.Kind == SpaceKind.Bool || (space.Kind == SpaceKind.Opaque && space.NullMatters))
+        )
         {
             var requires = new List<(int, ITypeSymbol)>();
             for (var k = 0; k < path.Count; k++)
@@ -218,6 +258,11 @@ file class Places
         {
             case IRecursivePatternOperation recursive:
                 var inner = Into(recursive.MatchedType, root, path);
+                if (recursive.DeconstructionSubpatterns.Length > 0 && !_positions.Any(p => p.Root == root && p.Prefix.SequenceEqual(inner)))
+                {
+                    _positions.Add((root, inner, [.. recursive.DeconstructionSubpatterns.Select((_, i) => Facts.PositionalMember(recursive, i))]));
+                }
+
                 for (var i = 0; i < recursive.DeconstructionSubpatterns.Length; i++)
                 {
                     if (Facts.PositionalMember(recursive, i) is { } member)
@@ -257,14 +302,17 @@ file class Places
     /// a member's declared type, which says whether it can be null as the compiler goes by it (the pattern's input type has no nullable annotation), or else the pattern's input type.
     /// </summary>
     private static ITypeSymbol PlaceType(IPatternOperation pattern, IReadOnlyList<Step> path) =>
-        path.Count == 0
-            ? pattern.InputType
-            : path[path.Count - 1] switch
-            {
-                MemberStep { Member: IFieldSymbol field } => field.Type,
-                MemberStep { Member: IPropertySymbol property } => property.Type,
-                _ => pattern.InputType,
-            };
+        (path.Count == 0 ? null : DeclaredType(path[path.Count - 1])) ?? pattern.InputType;
+
+    /// <summary>
+    /// The declared type of the member a step reads, if it reads one.
+    /// </summary>
+    private static ITypeSymbol? DeclaredType(Step step) => step switch
+    {
+        MemberStep { Member: IFieldSymbol field } => field.Type,
+        MemberStep { Member: IPropertySymbol property } => property.Type,
+        _ => null,
+    };
 
     /// <summary>
     /// Collects the places a pattern looks at:
@@ -414,21 +462,16 @@ file class Places
         var element = _elements[index];
         var candidate = _combination[index];
 
+        // Any value, where null is a case of its own: `{ }`.
         if (candidate is not ITypeSymbol type)
         {
-            var members = Children(element, element.Path);
-            return candidate == CaseSpace.Anything && members.Count > 0
-                ? RecursivePattern(null, null, PropertyPatternClause(SeparatedList(members)), null)
+            return candidate == CaseSpace.Anything && (Children(element, element.Path).Count > 0 || element.Space.NullMatters)
+                ? WithMembers(null, element, element.Path)
                 : MissingPatterns.Of(candidate == NotThere ? CaseSpace.Anything : candidate, element.Space, _model, _switchNode.SpanStart);
         }
 
         IReadOnlyList<Step> inside = element.Space.IsOfTypes ? [.. element.Path, new CaseStep(type)] : element.Path;
-        var subpatterns = Children(element, inside);
-        var name = MissingPatterns.TypeName(type, _model, _switchNode.SpanStart);
-
-        PatternSyntax written = subpatterns.Count > 0
-            ? RecursivePattern(name, null, PropertyPatternClause(SeparatedList(subpatterns)), null)
-            : TypePattern(name);
+        var written = WithMembers(MissingPatterns.TypeName(type, _model, _switchNode.SpanStart), element, inside);
 
         // The union a case holds: `Pet and Bird`.
         var innerUnion = Find(element.Root, inside);
@@ -520,7 +563,15 @@ file class Places
             .Select(e => roots[e.Root]?.Through(e.Path, model.Compilation, followsMutableState) is { } place && Narrowing.IsTrackable(place, switchNode, model, ct) ? place : null)
             .ToList();
 
-        places._excluded = [.. followed.Select((place, i) => place is null ? CaseSet.Empty : Narrowing.Excluded(switchNode, place, places._elements[i].Space, model, ct))];
+        // At a place inside the input, a case is also ruled out where every case of one of its members is (the input's
+        // own cases get that from SwitchCoverage).
+        places._excluded = [.. followed.Select((place, i) => place is null ? CaseSet.Empty
+            : Narrowing.Excluded(switchNode, place, places._elements[i].Space, model, ct)
+                | (i >= places._inputs.Length && places._elements[i].Space.IsOfTypes
+                    ? SwitchCoverage.RuledOutInside(place, places._elements[i].Space, places._elements[i].Space.Cases.OfType<ITypeSymbol>(), switchNode, model, session, ct)
+                    : CaseSet.Empty
+                )
+        )];
 
         var together = Enumerable.Range(0, followed.Count).Where(i => followed[i] is not null).ToList();
         if (together.Count > 1)
@@ -548,8 +599,16 @@ file class Places
     /// <summary>
     /// The combination, as a pattern on the input.
     /// </summary>
-    public PatternSyntax Written() =>
-        (_isTuple ? RecursivePattern(null, PositionalPatternClause(SeparatedList(_inputs.Select((_, root) => Subpattern(Write(root))))), null, null) : Write(0)).NormalizeWhitespace();
+    public PatternSyntax Written()
+    {
+        var written = (_isTuple ? RecursivePattern(null, PositionalPatternClause(SeparatedList(_inputs.Select((_, root) => Subpattern(Write(root))))), null, null) : Write(0)).NormalizeWhitespace();
+
+        // `Marker(false)`, not `Marker (false)`.
+        return written.ReplaceNodes(
+            written.DescendantNodesAndSelf().OfType<RecursivePatternSyntax>().Where(recursive => recursive is { Type: not null, PositionalPatternClause: not null }),
+            (_, recursive) => recursive.WithType(recursive.Type!.WithoutTrailingTrivia())
+        );
+    }
 }
 
 
@@ -616,20 +675,33 @@ internal static class NestedCoverage
     /// Past <see cref="Limits.WrittenOutMissing"/> of them, patterns for the inputs' cases they're in instead, as <see cref="MissingPatterns"/> writes them (<c>Kitten</c>).
     /// Null if the arms don't look inside.
     /// </summary>
-    public static List<PatternSyntax>? Missing(IOperation input, IReadOnlyList<SwitchLabel> labels, SyntaxNode switchNode, SemanticModel model, Session session, CancellationToken ct)
+    public static List<PatternSyntax>? Missing(IOperation input, IReadOnlyList<SwitchLabel> labels, SyntaxNode switchNode, SemanticModel model, Session session, CancellationToken ct) =>
+        Left(input, labels, switchNode, model, session, ct).Missing;
+
+    /// <summary>
+    /// Patterns for the combinations the arms miss (see <see cref="Missing"/>), and whether earlier code rules out others they don't handle.
+    /// </summary>
+    public static (List<PatternSyntax>? Missing, bool RuledOut) Left(IOperation input, IReadOnlyList<SwitchLabel> labels, SyntaxNode switchNode, SemanticModel model, Session session, CancellationToken ct)
     {
         var unguarded = labels.Where(label => label.Guard is null).ToList();
         if (Places.Of(input, unguarded.Select(label => label.Pattern).OfType<IPatternOperation>(), switchNode, model, session, ct) is not { } places)
         {
-            return null;
+            return (null, false);
         }
 
         var missing = new List<PatternSyntax>();
         var inputCases = new List<object?[]>();
+        var ruledOut = false;
         var finished = places.Enumerate(withNull: false, () =>
         {
-            if (places.Handled(unguarded) || places.RuledOut())
+            if (places.Handled(unguarded))
             {
+                return true;
+            }
+
+            if (places.RuledOut())
+            {
+                ruledOut = true;
                 return true;
             }
 
@@ -646,9 +718,10 @@ internal static class NestedCoverage
             return true;
         });
 
-        return finished is null || missing.Count == 0 ? null
+        var written = finished is null || missing.Count == 0 ? null
             : missing.Count <= Limits.WrittenOutMissing ? missing
             : MissingPatterns.Of(places.InputSpaces, inputCases, model, switchNode.SpanStart);
+        return (written, ruledOut && finished is not null);
     }
 
     /// <summary>

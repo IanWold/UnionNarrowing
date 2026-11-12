@@ -77,7 +77,7 @@ internal class Handling
     /// What a run of tests on one value handles of its cases:
     /// the cases one of the conditions is sure to hold for.
     /// The value is the first one that every condition tests, with a type test or pattern, or a helper that does (as <see cref="Facts"/> reads them);
-    /// null if there isn't one.
+    /// null if there isn't one, or if a condition also tests another union or closed hierarchy value (see <see cref="TestsAnotherValue"/>).
     /// A condition that writes the value says nothing about what it held when the run started, though it's still about the value.
     /// </summary>
     private static Handling? OfTests(SyntaxNode start, IReadOnlyList<IOperation> conditions, SemanticModel model, Session session, CancellationToken ct)
@@ -103,11 +103,30 @@ internal class Handling
 
             if (aboutTheValue)
             {
-                return new Handling(start, tested, space, handled, AsLabels(conditions, value), session);
+                return TestsAnotherValue(conditions, value, model, ct) ? null : new Handling(start, tested, space, handled, AsLabels(conditions, value), session);
             }
         }
 
         return null;
+    }
+
+    /// <summary>
+    /// Whether a condition also tests a union or closed hierarchy value other than <paramref name="value"/> (<c>left is double &amp;&amp; right is double</c>, <c>left.Value is double &amp;&amp; right.Value is double</c>):
+    /// then the tests are a list of preconditions, not a switch in all but name.
+    /// A value read from a variable that a pattern in the conditions declares (<c>pet is Kitten k &amp;&amp; k.Toy is Ball</c>) is part of what the pattern tests, and what's assigned to the value (<c>(pet = next()) is Bird</c>) is the value.
+    /// </summary>
+    private static bool TestsAnotherValue(IReadOnlyList<IOperation> conditions, TrackedValue value, SemanticModel model, CancellationToken ct)
+    {
+        bool DeclaredByTheConditions(ISymbol? variable) =>
+            variable is ILocalSymbol && variable.DeclaringSyntaxReferences.Any(reference => conditions.Any(condition => condition.Syntax.Span.Contains(reference.Span)));
+
+        return conditions
+            .SelectMany(condition => condition.DescendantsAndSelf())
+            .SelectMany(TestedOperands)
+            .Any(operand => CaseSpace.Of(operand, model, ct) is { IsOfTypes: true }
+                && TrackedValue.From(operand is IAssignmentOperation assignment ? assignment.Target : operand, value.Session) is var other
+                && !(other is not null && (other.IsPrefixOf(value) || value.IsPrefixOf(other) || DeclaredByTheConditions(other.Variable)))
+            );
     }
 
     /// <summary>
@@ -153,6 +172,7 @@ internal class Handling
     /// <summary>
     /// What a throw statement comes right after, if it's a default in all but name:
     /// a switch statement over a union or closed hierarchy with no default, and no section that breaks out of it, or two or more <c>if</c>s that each test the value and exit (see <see cref="IfRunBefore"/>).
+    /// Not a throw that switches on the value again (see <see cref="SwitchesOnItAgain"/>).
     /// </summary>
     public static Handling? BeforeThrow(ThrowStatementSyntax throwStatement, SemanticModel model, Session session, CancellationToken ct)
     {
@@ -169,20 +189,18 @@ internal class Handling
             return null;
         }
 
-        if (statements[index - 1] is SwitchStatementSyntax switchStatement
+        var handling = statements[index - 1] is SwitchStatementSyntax switchStatement
             && model.GetOperation(switchStatement, ct) is ISwitchOperation switchOp
             && !Statements.HasDefault(switchOp)
             && !Statements.BreaksOut(switchStatement, switchStatement)
-        )
-        {
-            return BeforeDefaultOf(switchStatement, model, session, ct);
-        }
+                ? BeforeDefaultOf(switchStatement, model, session, ct)
+                : IfRunBefore(statements, index, model, session, ct);
 
-        return IfRunBefore(statements, index, model, session, ct);
+        return handling?.SwitchesOnItAgain(throwStatement, model, ct) == true ? null : handling;
     }
 
     /// <summary>
-    /// The <c>else</c> that a chain of ifs starting at <paramref name="top"/> ends in, if it only throws (see <see cref="OnlyThrows"/>) and the chain is at least two tests on one union or closed hierarchy value:
+    /// The <c>else</c> that a chain of ifs starting at <paramref name="top"/> ends in, if it only throws (see <see cref="OnlyThrows"/>), without switching on the value again (see <see cref="SwitchesOnItAgain"/>), and the chain is at least two tests on one union or closed hierarchy value:
     /// that else, and what the tests handle.
     /// </summary>
     public static (ElseClauseSyntax Else, Handling Handling)? BeforeThrowingElse(IConditionalOperation top, SemanticModel model, Session session, CancellationToken ct)
@@ -211,7 +229,7 @@ internal class Handling
             return null;
         }
 
-        return OfTests(top.Syntax, conditions, model, session, ct) is { } handling ? (elseClause, handling) : null;
+        return OfTests(top.Syntax, conditions, model, session, ct) is { } handling && !handling.SwitchesOnItAgain(elseClause, model, ct) ? (elseClause, handling) : null;
     }
 
     /// <summary>
@@ -237,15 +255,22 @@ internal class Handling
             return [];
         }
 
-        if (_labels is not null && NestedCoverage.Missing(Input, _labels, Start, model, _session, ct) is { } inside)
+        if (CaughtInside(model, ct) is { } inside)
         {
             return inside;
         }
 
         var withNull = Space.NullMatters && !Handled.IncludesNull && !excluded.IncludesNull;
-        
+
         return MissingPatterns.For(caught, withNull, Space, model, Start.SpanStart);
     }
+
+    /// <summary>
+    /// Where the arms or tests look inside the value's cases (<c>Err { Error: NotFound }</c>), what the default catches inside them, as patterns (see <see cref="NestedCoverage.Missing"/>);
+    /// null where they don't.
+    /// </summary>
+    public List<PatternSyntax>? CaughtInside(SemanticModel model, CancellationToken ct) =>
+        _labels is null ? null : NestedCoverage.Missing(Input, _labels, Start, model, _session, ct);
 
     /// <summary>
     /// What code before <see cref="Start"/> rules out for the value.
@@ -259,6 +284,14 @@ internal class Handling
     /// </summary>
     public bool HandledInside(SemanticModel model, CancellationToken ct) =>
         _labels is not null && NestedCoverage.Of(Input, _labels, Start, model, _session, ct) is (true, _);
+
+    /// <summary>
+    /// Whether a switch expression in <paramref name="node"/> (what's thrown) switches on the value again (<c>throw new ParseException(next switch { ... })</c>):
+    /// the compiler checks that switch handles every case that gets there, so it already reports a case added later.
+    /// </summary>
+    private bool SwitchesOnItAgain(SyntaxNode node, SemanticModel model, CancellationToken ct) =>
+        TrackedValue.From(Input, _session) is { } value
+        && node.DescendantNodes().OfType<SwitchExpressionSyntax>().Any(switchExpr => model.GetOperation(switchExpr, ct) is ISwitchExpressionOperation { Value: var input } && value.IsReadBy(input));
 
     /// <summary>
     /// What two or more <c>if (test) &lt;exit&gt;</c> statements (or an else-if chain whose branches all exit, with no final else) right before <paramref name="index"/> handle, testing one union or closed hierarchy value.

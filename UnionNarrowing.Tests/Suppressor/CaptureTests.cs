@@ -332,6 +332,46 @@ public class CaptureTests
         );
 
     [Fact]
+    public Task Local_function_called_from_a_lambda() =>
+        Verify.Suppressions("""
+            using System.Collections.Generic;
+            using System.Threading.Tasks;
+
+            class C
+            {
+                // The lambda runs Handle whenever it's invoked, which can be while Serve waits for ready; TrySetResult
+                // runs the rest of Serve right there, which sets pet to a Bird.
+                async Task<int> Serve(TaskCompletionSource ready, List<Action> callbacks)
+                {
+                    Pet pet = new Cat("Tom");
+                    var result = 0;
+                    callbacks.Add(() => Handle());
+                    await ready.Task;
+                    pet = new Bird("Polly");
+                    return result;
+
+                    void Handle()
+                    {
+                        if (pet is Bird) return;
+                        ready.TrySetResult();
+                        result = pet /*warns*/switch { Cat => 1, Dog => 2 };
+                    }
+                }
+
+                int Direct(Pet pet)
+                {
+                    if (pet is Bird) return 0;
+                    var n = Handle();
+                    pet = new Bird("Polly");
+                    return n;
+
+                    int Handle() => pet /*suppressed*/switch { Cat => 1, Dog => 2 };
+                }
+            }
+            """
+        );
+
+    [Fact]
     public Task Local_function_that_writes_the_variable() =>
         Verify.Suppressions("""
             class C

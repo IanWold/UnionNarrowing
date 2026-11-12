@@ -2,6 +2,7 @@ using System.Collections.Generic;
 using System.Linq;
 using System.Threading;
 using Microsoft.CodeAnalysis;
+using Microsoft.CodeAnalysis.CSharp.Syntax;
 using Microsoft.CodeAnalysis.Operations;
 
 namespace UnionNarrowing.Suppressors.Analysis;
@@ -254,7 +255,7 @@ internal class SwitchCoverage
     /// after <c>if (r is Err { Error: Invalid }) return; if (r is Err { Error: Missing }) return;</c>, where an Error can only be Invalid or Missing, r isn't an Err.
     /// Only members that are unions or of a closed type, and that the analysis follows.
     /// </summary>
-    private static CaseSet RuledOutInside(TrackedValue value, CaseSpace space, IEnumerable<ITypeSymbol> cases, SyntaxNode switchNode, SemanticModel model, Session session, CancellationToken ct)
+    public static CaseSet RuledOutInside(TrackedValue value, CaseSpace space, IEnumerable<ITypeSymbol> cases, SyntaxNode switchNode, SemanticModel model, Session session, CancellationToken ct)
     {
         var followsMutableState = session.FollowsMutableState(switchNode.SyntaxTree);
         var ruledOut = cases.Where(caseType => caseType.GetMembers().Any(member =>
@@ -390,7 +391,8 @@ internal class SwitchCoverage
 
         var thanksToAnalysis = false;
         var missing = new List<object?[]>();
-        
+        var ruledOut = new List<object?[]>();
+
         foreach (var combination in Combinations.Of(cases))
         {
             if (handled.Any(box => Combinations.InBox(box, combination)))
@@ -398,10 +400,14 @@ internal class SwitchCoverage
                 continue;
             }
 
-            if (guarded.Any(box => Combinations.InBox(box, combination))
-                || excludedTogether.Any(box => Combinations.InBox(box, combination))
-                || excluded.Zip(combination, (set, candidate) => set.ContainsCase(candidate)).Any(x => x)
-            )
+            var byEarlierCode = excludedTogether.Any(box => Combinations.InBox(box, combination))
+                || excluded.Zip(combination, (set, candidate) => set.ContainsCase(candidate)).Any(x => x);
+            if (byEarlierCode)
+            {
+                ruledOut.Add(combination);
+            }
+
+            if (byEarlierCode || guarded.Any(box => Combinations.InBox(box, combination)))
             {
                 thanksToAnalysis = true;
             }
@@ -419,8 +425,9 @@ internal class SwitchCoverage
             ).ToList();
 
             var stillMissing = missing.Where(combination => !inside.Zip(combination, (set, candidate) => set.ContainsCase(candidate)).Any(x => x)).ToList();
-            
+
             thanksToAnalysis |= stillMissing.Count < missing.Count;
+            ruledOut.AddRange(missing.Except(stillMissing));
             missing = stillMissing;
         }
 
@@ -431,6 +438,24 @@ internal class SwitchCoverage
             return new SwitchCoverage(overCases, complete: true, thanksToAnalysis || nestedThanks, spaces, []);
         }
 
+        // Arms the analysis can't read (that split a case on a list pattern, a relational pattern or a string) may handle
+        // what's missing too: the compiler can tell, once what earlier code rules out has arms of its own.
+        if (missing.Count > 0 && ruledOut.Count > 0 && switchNode is SwitchExpressionSyntax switchExpr
+            && (inputs.Count > 1 || (missing.All(combination => MayBeHandled(combination[0], labels, spaces[0], model.Compilation))
+                && !ruledOut.Any(combination => combination[0] == CaseSpace.Anything || combination[0] == CaseSpace.OtherValues))
+            )
+            && CompilerCoverage.CompleteWith(switchExpr, withoutDefault, MissingPatterns.Of(spaces, ruledOut, model, switchExpr.SpanStart), model, ct)
+        )
+        {
+            return new SwitchCoverage(overCases, complete: true, thanksToEarlierCode: true, spaces, []);
+        }
+
         return new SwitchCoverage(overCases, complete: missing.Count == 0, thanksToAnalysis, spaces, missing);
     }
+
+    /// <summary>
+    /// Whether an arm without a <c>when</c> clause (or a case label) could match some values of the case, if not all of them.
+    /// </summary>
+    private static bool MayBeHandled(object? candidate, IReadOnlyList<SwitchLabel> labels, CaseSpace space, Compilation compilation) =>
+        labels.Any(label => label.Guard is null && label.Pattern is { } pattern && !Facts.Of(pattern, space, compilation).AlwaysFalse.ContainsCase(candidate));
 }

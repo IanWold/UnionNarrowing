@@ -71,10 +71,33 @@ internal static class WriteAnalysis
 
     /// <summary>
     /// Whether the member, called on a struct variable, can change it:
-    /// it isn't readonly, and isn't one that only reads <c>this</c> anyway (see <see cref="OnlyReadsThis"/>).
+    /// it isn't readonly (or it's an extension member that takes its receiver by <c>ref</c>), and isn't one that only reads <c>this</c> anyway (see <see cref="OnlyReadsThis"/>);
+    /// or it's a <c>this ref</c> extension method.
     /// </summary>
     private static bool CanChangeStruct(IMethodSymbol? member, Compilation compilation, CancellationToken ct) =>
-        member is { IsReadOnly: false, IsStatic: false, ContainingType.IsValueType: true } && !OnlyReadsThis(member, compilation, ct);
+        (member?.ReducedFrom ?? member) is { IsExtensionMethod: true, Parameters: { Length: > 0 } parameters }
+            ? parameters[0].RefKind == RefKind.Ref
+            : member is { IsReadOnly: false, IsStatic: false, ContainingType.IsValueType: true } or { IsStatic: false, ContainingType: { IsExtension: true, ExtensionParameter.RefKind: RefKind.Ref } }
+                && !OnlyReadsThis(member, compilation, ct);
+
+    /// <summary>
+    /// The members a use of a struct variable calls on it without naming them, which get the variable itself (not a copy):
+    /// the GetEnumerator of a <c>foreach</c> over it (or of a spread of it in a collection expression, any it could be), the GetAwaiter of an <c>await</c> of it, and the Length (or Count) and indexer or Slice an index from the end or a range calls.
+    /// </summary>
+    private static IEnumerable<IMethodSymbol?> CalledImplicitlyOn(ExpressionSyntax expression, IOperation operation, SemanticModel model, CancellationToken ct) =>
+        expression.Parent switch
+        {
+            CommonForEachStatementSyntax forEach when forEach.Expression == expression => [model.GetForEachStatementInfo(forEach).GetEnumeratorMethod],
+            SpreadElementSyntax spread when spread.Expression == expression =>
+                model.LookupSymbols(spread.SpanStart, operation.Type, "GetEnumerator", includeReducedExtensionMethods: true).OfType<IMethodSymbol>().Where(method => method.Parameters.IsEmpty).Cast<IMethodSymbol?>(),
+            AwaitExpressionSyntax awaited => [model.GetAwaitExpressionInfo(awaited).GetAwaiterMethod],
+            _ => operation.Parent is IImplicitIndexerReferenceOperation { LengthSymbol: var length, IndexerSymbol: var indexer } implicitIndex && implicitIndex.Instance == operation
+                ? [AsMethod(length), AsMethod(indexer)]
+                : [],
+        };
+
+    private static IMethodSymbol? AsMethod(ISymbol? member) =>
+        member as IMethodSymbol ?? (member as IPropertySymbol)?.GetMethod;
 
     /// <summary>
     /// Whether matching the pattern against a struct variable calls a member of the variable itself (not a copy) that can change it:
@@ -90,7 +113,7 @@ internal static class WriteAnalysis
                 IFieldReferenceOperation { Field.Type.IsValueType: true } => PatternCanChangeInput(subpattern.Pattern, compilation, ct),
                 _ => false,
             }),
-        IListPatternOperation list => new[] { list.LengthSymbol, list.IndexerSymbol }.Any(member => CanChangeStruct((member as IPropertySymbol)?.GetMethod ?? member as IMethodSymbol, compilation, ct)),
+        IListPatternOperation list => new[] { list.LengthSymbol, list.IndexerSymbol }.Any(member => CanChangeStruct(AsMethod(member), compilation, ct)),
         INegatedPatternOperation not => PatternCanChangeInput(not.Pattern, compilation, ct),
         IBinaryPatternOperation binary => PatternCanChangeInput(binary.LeftPattern, compilation, ct) || PatternCanChangeInput(binary.RightPattern, compilation, ct),
         _ => false,
@@ -123,15 +146,16 @@ internal static class WriteAnalysis
     /// For a value that something else could change (see <see cref="TrackedValue.IsExternallyMutable"/>):
     /// whether the node runs anything that could, or writes it directly.
     /// Anything that runs code the analysis doesn't see counts:
-    /// calls, constructors (<c>new T()</c> too), property getters other than auto-properties' (and indexers), user-defined operators and conversions, string interpolation, <c>await</c>, <c>yield</c>, <c>foreach</c>, <c>using</c>;
+    /// calls, constructors (<c>new T()</c> too), property getters other than auto-properties' (and indexers), user-defined operators and conversions, string interpolation, <c>await</c>, <c>yield</c>, <c>foreach</c>, <c>using</c>, and <c>lock</c> (where other threads' writes are waited for: from where it takes the lock);
     /// and code that runs without a call: a Deconstruct written by hand (deconstructing, or a positional pattern), a list pattern's Length and indexer, a collection expression's builder or Add and a spread's enumerator, a record's own copy constructor (<c>with</c>), the <c>==</c> of a tuple's elements, a ToString in string concatenation, and another type's static constructor or initializers, which the first use of one of its static members runs;
     /// so does taking a reference, and assigning a member the value is read through, any array element, or <c>this</c>.
     /// </summary>
     private static bool MayChange(SyntaxNode node, TrackedValue value, SemanticModel model, int? before, CancellationToken ct)
     {
         if (node.DescendantNodesAndSelf().Any(n =>
-            (n is YieldStatementSyntax or AwaitExpressionSyntax or CommonForEachStatementSyntax or UsingStatementSyntax|| n is LocalDeclarationStatementSyntax { UsingKeyword.RawKind: not 0 })
-            && (before is null || n.Span.End <= before)
+            ((n is YieldStatementSyntax or AwaitExpressionSyntax or CommonForEachStatementSyntax or UsingStatementSyntax || n is LocalDeclarationStatementSyntax { UsingKeyword.RawKind: not 0 })
+                && (before is null || n.Span.End <= before))
+            || (n is LockStatementSyntax lockStatement && (before is null || lockStatement.CloseParenToken.Span.End <= before))
         ))
         {
             return true;
@@ -211,6 +235,23 @@ internal static class WriteAnalysis
         return false;
     }
 
+    /// <summary>
+    /// Whether the node can suspend the function it's in (an <c>await</c>, a <c>yield</c>, one that ends before <paramref name="before"/> if that's given) where construction can have started that function (a local function or lambda in a constructor, too):
+    /// a constructor that called it (or a base constructor, an override) carries on meanwhile, and can set the members the value is read through.
+    /// So can a static constructor that calls other code, which can be the code that's suspended.
+    /// </summary>
+    private static bool SuspendsWhileConstructing(SyntaxNode node, TrackedValue value, SemanticModel model, int? before, CancellationToken ct) =>
+        node.DescendantNodesAndSelf(n => n == node || !Functions.IsFunction(n)).Any(n =>
+            (n is AwaitExpressionSyntax or YieldStatementSyntax
+                || n is CommonForEachStatementSyntax { AwaitKeyword.RawKind: not 0 } or UsingStatementSyntax { AwaitKeyword.RawKind: not 0 } or LocalDeclarationStatementSyntax { AwaitKeyword.RawKind: not 0 })
+            && (before is null || n.Span.End <= before)
+        )
+        && (Functions.IsInConstruction(node)
+            || Functions.MayBeCreatedDuringConstruction(node, model, ct)
+            || value.MembersReadThrough.Any(member => member is { IsStatic: false, ContainingType: { IsReferenceType: true } owner } && Functions.ThisEscapesDuringConstruction(owner, model, ct))
+            || value.MembersReadThrough.Any(member => member is { IsStatic: true, ContainingType: { } type } && Functions.StaticConstructionCallsOut(type, model.Compilation, ct))
+        );
+
     private static bool CallsDeconstructWrittenByHand(DeconstructionInfo info) =>
         info.Method is { IsImplicitlyDeclared: false } || info.Nested.Any(CallsDeconstructWrittenByHand);
 
@@ -252,7 +293,7 @@ internal static class WriteAnalysis
 
         var uses = Symbols.References(root, node, model, ct).ToList();
         return
-            uses.Any(use => model.GetOperation(use, ct) is { } operation && operation.Parent switch
+            uses.Any(use => model.GetOperation(StructFieldChain(use, model, ct), ct) is { } operation && operation.Parent switch
                 {
                     IInvocationOperation invocation when invocation.Instance == operation => !invocation.TargetMethod.IsReadOnly,
                     IPropertyReferenceOperation property when property.Instance == operation => property.Property.GetMethod is not { IsReadOnly: true },
@@ -288,7 +329,7 @@ internal static class WriteAnalysis
     }
 
     /// <summary>
-    /// The variable with the struct fields read from it (<c>t.Item1</c>, <c>box.Inner.Pet</c>):
+    /// The variable with the struct fields (and inline array elements) read from it (<c>t.Item1</c>, <c>box.Inner.Pet</c>, <c>slots[0]</c>):
     /// writing one of those, or taking a reference to one, writes the variable, or takes a reference into it.
     /// </summary>
     private static ExpressionSyntax StructFieldChain(IdentifierNameSyntax name, SemanticModel model, CancellationToken ct)
@@ -302,18 +343,27 @@ internal static class WriteAnalysis
                 outer = parenthesized;
             }
 
-            if (outer.Parent is MemberAccessExpressionSyntax { RawKind: (int)SyntaxKind.SimpleMemberAccessExpression } member
-                && member.Expression == outer
-                && model.GetOperation(member, ct) is IFieldReferenceOperation { Field.IsStatic: false, Instance.Type.IsValueType: true }
+            if ((outer.Parent is MemberAccessExpressionSyntax { RawKind: (int)SyntaxKind.SimpleMemberAccessExpression } member
+                    && member.Expression == outer
+                    && model.GetOperation(member, ct) is IFieldReferenceOperation { Field.IsStatic: false, Instance.Type.IsValueType: true })
+                || (outer.Parent is ElementAccessExpressionSyntax element && element.Expression == outer
+                    && model.GetOperation(element, ct) is IInlineArrayAccessOperation { Type: var elementType } && !IsSpan(elementType, orReadOnly: true))
             )
             {
-                expression = member;
+                expression = (ExpressionSyntax)outer.Parent;
                 continue;
             }
 
             return expression;
         }
     }
+
+    /// <summary>
+    /// Whether the type is <c>Span&lt;T&gt;</c>, or with <paramref name="orReadOnly"/>, <c>ReadOnlySpan&lt;T&gt;</c>.
+    /// </summary>
+    private static bool IsSpan(ITypeSymbol? type, bool orReadOnly = false) =>
+        type is INamedTypeSymbol { Arity: 1, ContainingNamespace: { Name: "System", ContainingNamespace.IsGlobalNamespace: true } } span
+        && (span.Name == "Span" || (orReadOnly && span.Name == "ReadOnlySpan"));
 
     /// <summary>
     /// <c>this._pet = ...</c>, <c>M(out this._pet)</c>, <c>ref Owner.Favourite</c>, ...:
@@ -382,6 +432,11 @@ internal static class WriteAnalysis
             return false;
         }
 
+        if (CalledImplicitlyOn(expression, operation, model, ct).Any(member => CanChangeStruct(member, model.Compilation, ct)))
+        {
+            return true;
+        }
+
         return operation.Parent switch
         {
             IInvocationOperation invocation when invocation.Instance == operation =>
@@ -445,6 +500,9 @@ internal static class WriteAnalysis
             return false;
         }
 
+        // An extension member's `this` is its receiver parameter.
+        var receiver = method.ContainingType is { IsExtension: true } extension ? extension.ExtensionParameter : null;
+
         return !body.DescendantsAndSelf().Any(operation => operation switch
         {
             IAssignmentOperation { Target: var assigned } => assigned.DescendantsAndSelf().Any(IsThisOrItsStructField),
@@ -458,9 +516,10 @@ internal static class WriteAnalysis
         });
 
         // `this`, or a struct field of it: what's done to one of these is done to the storage of `this` itself.
-        static bool IsThisOrItsStructField(IOperation? operation) => operation switch
+        bool IsThisOrItsStructField(IOperation? operation) => operation switch
         {
-            IInstanceReferenceOperation => true,
+            IInstanceReferenceOperation { ReferenceKind: InstanceReferenceKind.ContainingTypeInstance } => true,
+            IParameterReferenceOperation { Parameter: var parameter } => SymbolEqualityComparer.Default.Equals(parameter, receiver),
             IFieldReferenceOperation { Field: { IsStatic: false, Type.IsValueType: true }, Instance: var outer } => IsThisOrItsStructField(outer),
             _ => false,
         };
@@ -489,16 +548,22 @@ internal static class WriteAnalysis
             // M(ref pet), unless M's parameter is `scoped ref`.
             case ArgumentSyntax argument when argument.RefKindKeyword.IsKind(SyntaxKind.RefKeyword):
                 return model.GetOperation(argument, ct) is not IArgumentOperation passed || CanEscape(passed);
+
+            // foreach (ref var slot in slots), over an inline array.
+            case ForEachStatementSyntax { Type: RefTypeSyntax { ReadOnlyKeyword.RawKind: 0 } } forEach when forEach.Expression == expression:
+                return true;
         }
 
         // References passed without a `ref` keyword: `this ref` extension methods, `ref` extension blocks, and
-        // [UnscopedRef] members, which can hand back a reference to `this`.
+        // [UnscopedRef] members, which can hand back a reference to `this`; and an inline array made a span, or sliced.
         var operation = model.GetOperation(expression, ct);
         return operation?.Parent switch
         {
             IArgumentOperation argument => CanEscape(argument),
             IInvocationOperation invocation when invocation.Instance == operation => ReceiverCanEscape(invocation.TargetMethod),
             IMemberReferenceOperation member when member.Instance == operation => ReceiverCanEscape(member.Member),
+            IConversionOperation { Type: var converted } => IsSpan(converted),
+            IInlineArrayAccessOperation { Type: var sliced } => IsSpan(sliced),
             _ => false,
         };
     }
@@ -536,10 +601,12 @@ internal static class WriteAnalysis
         }
 
         // A chain from `this` or a static member can't be written outside construction (see IsTrackable), and in a
-        // constructor only by assigning one of its members.
+        // constructor only by assigning one of its members. Code construction starts can be suspended, though, and
+        // construction carries on meanwhile.
         if (value.Variable is not { } variable)
         {
-            return !value.Steps.IsEmpty && Functions.IsInConstruction(node) && AssignsMember(node, value, model, ct);
+            return !value.Steps.IsEmpty
+                && ((Functions.IsInConstruction(node) && AssignsMember(node, value, model, ct)) || SuspendsWhileConstructing(node, value, model, before, ct));
         }
 
         // Data flow can't be worked out for some parts of a condition (`a && b` as an operand of `||`), but it can for
@@ -555,10 +622,10 @@ internal static class WriteAnalysis
             return !OnlyCallsMembersThatReadThis(node, variable, model, ct);
         }
 
-        // A member of a struct variable can be written (a field assigned, a setter called) without data flow counting
-        // it as a write of the variable.
-        return !value.Steps.IsEmpty
-            && variable is ILocalSymbol { Type.IsValueType: true } or IParameterSymbol { Type.IsValueType: true }
+        // A member of a struct variable can be written (a field assigned, a setter called), and a member the variable
+        // is used through called on it (a foreach's GetEnumerator, a pattern's property getter), without data flow
+        // counting it as a write of the variable.
+        return variable is ILocalSymbol { Type.IsValueType: true } or IParameterSymbol { Type.IsValueType: true }
             && Symbols.References(variable, node, model, ct).Any(name => IsWrite(name, model, ct));
     }
 }

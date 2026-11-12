@@ -660,6 +660,77 @@ public class UnionShapeTests
         );
 
     [Fact]
+    public Task Types_the_runtime_relates_without_a_conversion() =>
+        Verify.Suppressions("""
+            using System.Collections.Generic;
+            using System.Runtime.InteropServices;
+
+            union Payload(int[], string);
+            union Days(DayOfWeek[], string);
+            union Number(int, string);
+            sealed class Ghost : IDynamicInterfaceCastable
+            {
+                public bool IsInterfaceImplemented(RuntimeTypeHandle type, bool throwIfNotImplemented) => true;
+                public RuntimeTypeHandle GetInterfaceImplementation(RuntimeTypeHandle type) => default;
+            }
+            union Spooky(Ghost, Cat);
+
+            static class Generic
+            {
+                public static bool Is<T>(this Number n) => n.Value is T;
+            }
+
+            class C
+            {
+                // The runtime lets an int[] be a uint[] and an IList<uint>, and a DayOfWeek[] an int[].
+                int UnsignedArray(Payload p)
+                {
+                    if (p.Value is uint[]) return p /*warns*/switch { string s => s.Length };
+                    return 0;
+                }
+
+                int ListOfUnsigned(Payload p)
+                {
+                    if (p.Value is IList<uint>) return p /*warns*/switch { string s => s.Length };
+                    return 0;
+                }
+
+                int EnumArray(Days d)
+                {
+                    if (d.Value is int[]) return d /*warns*/switch { string s => s.Length };
+                    return 0;
+                }
+
+                int NotAnArray(Payload p)
+                {
+                    if (p is string) return p /*suppressed*/switch { string s => s.Length };
+                    return 0;
+                }
+
+                // `value is T` with T an int? is true for a boxed int.
+                int NullableTypeArgument(Number n)
+                {
+                    if (n.Is<int?>()) return n /*warns*/switch { string s => s.Length };
+                    return 0;
+                }
+
+                int TypeArgument(Number n)
+                {
+                    if (n.Is<int>()) return 0;
+                    return n /*suppressed*/switch { string s => s.Length };
+                }
+
+                // Ghost can be cast to any interface.
+                int DynamicInterface(Spooky s)
+                {
+                    if (s.Value is IComparable) return s /*warns*/switch { Cat => 1 };
+                    return 0;
+                }
+            }
+            """
+        );
+
+    [Fact]
     public Task Value_type_case_types() =>
         Verify.Suppressions("""
             union Number(int, long, string);
@@ -677,6 +748,31 @@ public class UnionShapeTests
                     // `long` doesn't cover `int`: a boxed int is not a long.
                     if (n is long) return 0;
                     return n /*warns*/switch { string s => s.Length };
+                }
+            }
+            """
+        );
+
+    [Fact]
+    public Task Static_members_of_different_constructions_of_a_generic_type() =>
+        Verify.Suppressions("""
+            static class Cache<TKey>
+            {
+                public static readonly Pet Pet = typeof(TKey) == typeof(int) ? new Cat("Tom") : new Bird("Polly");
+            }
+
+            class C
+            {
+                int M()
+                {
+                    if (Cache<int>.Pet is Bird) return 0;
+                    return Cache<string>.Pet /*warns*/switch { Cat => 1, Dog => 2 };
+                }
+
+                int N()
+                {
+                    if (Cache<int>.Pet is Bird) return 0;
+                    return Cache<int>.Pet /*suppressed*/switch { Cat => 1, Dog => 2 };
                 }
             }
             """

@@ -27,11 +27,19 @@ internal class MemberStep(ISymbol member) : Step
 {
     public ISymbol Member { get; } = member is IFieldSymbol field ? field.CorrespondingTupleField ?? field : member;
 
+    /// <remarks>
+    /// An instance member's object fixes its type, so the members' declarations are enough to tell paths from it apart.
+    /// That makes a path read through a generic type's members (<c>q.Status</c> on a <c>Query&lt;string&gt;</c>) the same as the one its own members read (<c>Status</c> in <c>Query&lt;T&gt;</c>).
+    /// A static member is told apart by its type's type arguments too: <c>Cache&lt;int&gt;.Pet</c> isn't <c>Cache&lt;string&gt;.Pet</c>.
+    /// </remarks>
     public override bool Equals(Step? other) =>
-        other is MemberStep step && SymbolEqualityComparer.Default.Equals(Member, step.Member);
+        other is MemberStep step && SymbolEqualityComparer.Default.Equals(Identity, step.Identity);
 
     public override int GetHashCode() =>
-        SymbolEqualityComparer.Default.GetHashCode(Member);
+        SymbolEqualityComparer.Default.GetHashCode(Identity);
+
+    private ISymbol Identity =>
+        Member.IsStatic ? Member : Member.OriginalDefinition;
 
     public override string ToString() =>
         Member.Name;

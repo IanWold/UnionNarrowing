@@ -54,6 +54,25 @@ public class BoxedUnionCodeFixTests
         );
 
     [Fact]
+    public Task Compare_the_value_instead_of_the_union_in_a_conditional_access() =>
+        Verify.CodeFix(new BoxedUnionCodeFix(), """
+            record Owner(Pet Pet);
+
+            class C
+            {
+                bool? M(Owner? owner, Cat cat) => owner?.Pet.Equals(cat);
+            }
+            """, """
+            record Owner(Pet Pet);
+
+            class C
+            {
+                bool? M(Owner? owner, Cat cat) => owner?.Pet.Value?.Equals(cat);
+            }
+            """, new BoxedUnionAnalyzer()
+        );
+
+    [Fact]
     public Task Fix_all() =>
         Verify.FixAll(new BoxedUnionCodeFix(), """
             class C
@@ -85,6 +104,18 @@ public class BoxedUnionCodeFixTests
                 bool M(Pet pet) => pet.Value?.GetType() == typeof(Cat);
             }
             """, new BoxedUnionAnalyzer()
+        );
+
+    [Fact]
+    public Task Get_the_type_of_the_value_not_offered_in_an_expression_tree() =>
+        Verify.CodeFix(new BoxedUnionCodeFix(), """
+            record Row(Pet Result);
+
+            class C
+            {
+                IQueryable<Row> M(IQueryable<Row> rows) => rows.Where(x => x.Result.GetType() == typeof(Cat));
+            }
+            """, null, new BoxedUnionAnalyzer()
         );
 
     [Fact]
@@ -159,5 +190,17 @@ public class BoxedUnionCodeFixTests
                 bool M(Pet pet) => pet is Cat;
             }
             """, new BoxedUnionAnalyzer()
+        );
+
+    [Fact]
+    public Task Test_the_union_instead_of_the_box_not_offered_in_an_expression_tree() =>
+        Verify.CodeFix(new BoxedUnionCodeFix(), """
+            record Row(Pet Result);
+
+            class C
+            {
+                IQueryable<Row> M(IQueryable<Row> rows) => rows.Where(x => (object)x.Result is Cat);
+            }
+            """, null, new BoxedUnionAnalyzer()
         );
 }

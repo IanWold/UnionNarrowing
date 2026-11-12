@@ -186,6 +186,54 @@ public class HelperTests
         );
 
     [Fact]
+    public Task Members_of_the_union_that_look_inside_it() =>
+        Verify.Suppressions("""
+            public record Expired;
+            public record Invalid;
+            public union Cause(Expired, Invalid);
+            public record Rejected(Cause Cause);
+            public record Accepted;
+            public union Outcome(Rejected, Accepted)
+            {
+                public bool IsExpired => this is Rejected { Cause: Expired };
+            }
+
+            static class Ext
+            {
+                public static bool IsExpiredExt(this Outcome o) => o is Rejected { Cause: Expired };
+            }
+
+            class C
+            {
+                int Member(Outcome o)
+                {
+                    if (!o.IsExpired) return 0;
+                    return o /*suppressed*/switch { Rejected { Cause: Expired } => 1 };
+                }
+
+                int Direct(Outcome o)
+                {
+                    if (o is not Rejected { Cause: Expired }) return 0;
+                    return o /*suppressed*/switch { Rejected { Cause: Expired } => 1 };
+                }
+
+                int Extension(Outcome o)
+                {
+                    if (!o.IsExpiredExt()) return 0;
+                    return o /*suppressed*/switch { Rejected { Cause: Expired } => 1 };
+                }
+
+                int Tuple(Outcome o)
+                {
+                    var t = (o, 1);
+                    if (t.Item1.IsExpired) return 0;
+                    return t.Item1 /*suppressed*/switch { Rejected { Cause: Invalid } => 1, Accepted => 2 };
+                }
+            }
+            """
+        );
+
+    [Fact]
     public Task Members_of_the_union_that_are_not_marked_readonly() =>
         Verify.Suppressions("""
             union Animal(Cat, Dog, Bird)
@@ -457,6 +505,104 @@ public class HelperTests
                 {
                     if (!PetExtensions.IsNotBird(pet)) return 0;
                     return pet /*suppressed*/switch { Cat => 1, Dog => 2 };
+                }
+            }
+            """
+        );
+
+    [Fact]
+    public Task Helper_that_returns_null() =>
+        Verify.Suppressions("""
+            public closed record Plan;
+            public sealed record Filter : Plan;
+            public sealed record Scan : Plan;
+            public sealed record Join : Plan;
+
+            class C
+            {
+                static Plan? FromName(string? name) => name switch { "filter" => new Filter(), "scan" => new Scan(), _ => null };
+
+                static Plan? Block(string? name)
+                {
+                    if (name == "filter") return new Filter();
+                    return null;
+                }
+
+                int M(string a) => (FromName(a) ?? new Scan()) /*suppressed*/switch { Scan => 1, Filter => 2 };
+
+                int N(string a) => (Block(a) ?? new Filter()) /*suppressed*/switch { Filter => 1 };
+
+                int O(string a) => (Block(a) ?? new Join()) /*warns*/switch { Filter => 1 };
+            }
+            """
+        );
+
+    [Fact]
+    public Task Assertion_helper_that_throws_through_a_call() =>
+        Verify.Suppressions("""
+            using System.Diagnostics.CodeAnalysis;
+            using System.Runtime.ExceptionServices;
+
+            static class Throw
+            {
+                [DoesNotReturn]
+                public static void Because(string message) => throw new InvalidOperationException(message);
+            }
+
+            static class Assert
+            {
+                public static void NotBird(Pet pet)
+                {
+                    if (pet is Bird) Throw.Because("bird");
+                }
+
+                public static void NotDog(Pet pet, ExceptionDispatchInfo info)
+                {
+                    if (pet is Dog) info.Throw();
+                }
+            }
+
+            class C
+            {
+                int M(Pet pet)
+                {
+                    Assert.NotBird(pet);
+                    return pet /*suppressed*/switch { Cat => 1, Dog => 2 };
+                }
+
+                int N(Pet pet, ExceptionDispatchInfo info)
+                {
+                    Assert.NotDog(pet, info);
+                    return pet /*suppressed*/switch { Cat => 1, Bird => 2 };
+                }
+            }
+            """
+        );
+
+    [Fact]
+    public Task Assertion_helper_that_calls_an_async_method() =>
+        Verify.Suppressions("""
+            using System.Diagnostics.CodeAnalysis;
+            using System.Threading.Tasks;
+
+            static class Throw
+            {
+                // Its task faults; the call itself returns.
+                [DoesNotReturn]
+                public static async Task BecauseAsync() { await Task.Yield(); throw new InvalidOperationException(); }
+            }
+
+            static class Assert
+            {
+                public static void NotBird(Pet pet) { if (pet is Bird) Throw.BecauseAsync(); }
+            }
+
+            class C
+            {
+                int M(Pet pet)
+                {
+                    Assert.NotBird(pet);
+                    return pet /*warns*/switch { Cat => 1, Dog => 2 };
                 }
             }
             """

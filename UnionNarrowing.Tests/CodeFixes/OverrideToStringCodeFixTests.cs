@@ -149,4 +149,40 @@ public class OverrideToStringCodeFixTests
             }
             """, expected: null, new BoxedUnionAnalyzer()
         );
+
+    [Fact]
+    public Task Override_ToString_where_the_union_is_passed_as_itself_to_be_formatted() =>
+        Verify.CodeFix(new OverrideToStringCodeFix(), """
+            using Microsoft.Extensions.Logging;
+
+            partial class C
+            {
+                [LoggerMessage(Level = LogLevel.Information, Message = "Order {Id} is {Status}")]
+                static partial void LogStatusUpdated(ILogger logger, int id, Status status);
+
+                void M(ILogger logger, int id, Status status) => LogStatusUpdated(logger, id, status);
+            }
+
+            public record Pending;
+            public record Shipped;
+            public union Status(Pending, Shipped);
+            """, """
+            using Microsoft.Extensions.Logging;
+
+            partial class C
+            {
+                [LoggerMessage(Level = LogLevel.Information, Message = "Order {Id} is {Status}")]
+                static partial void LogStatusUpdated(ILogger logger, int id, Status status);
+
+                void M(ILogger logger, int id, Status status) => LogStatusUpdated(logger, id, status);
+            }
+
+            public record Pending;
+            public record Shipped;
+            public union Status(Pending, Shipped)
+            {
+                public override string ToString() => Value?.ToString() ?? "";
+            }
+            """, new BoxedUnionAnalyzer()
+        );
 }

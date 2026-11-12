@@ -403,6 +403,63 @@ public class ControlFlowTests
             """
         );
 
+    /// <summary>
+    /// An override or an interface's implementation can return, whatever the method it replaces says: the compiler only warns where one is written, and a test double can do it anyway.
+    /// </summary>
+    [Fact]
+    public Task Guard_that_calls_a_does_not_return_method_another_can_replace() =>
+        Verify.Suppressions("""
+            using System.Diagnostics.CodeAnalysis;
+
+            interface IFail
+            {
+                [DoesNotReturn] void Fail();
+            }
+
+            class Thrower : IFail
+            {
+                [DoesNotReturn] public virtual void Fail() => throw new InvalidOperationException();
+            }
+
+            sealed class Final : Thrower
+            {
+                [DoesNotReturn] public override void Fail() => throw new InvalidOperationException();
+            }
+
+            class C
+            {
+                int Virtual(Pet pet, Thrower thrower)
+                {
+                    if (pet is Bird) thrower.Fail();
+                    return pet /*warns*/switch { Cat => 1, Dog => 2 };
+                }
+
+                int Interface(Pet pet, IFail fail)
+                {
+                    if (pet is Bird) fail.Fail();
+                    return pet /*warns*/switch { Cat => 1, Dog => 2 };
+                }
+
+                int ThroughAHelper(Pet pet, Thrower thrower)
+                {
+                    NotBird(pet, thrower);
+                    return pet /*warns*/switch { Cat => 1, Dog => 2 };
+                }
+
+                static void NotBird(Pet pet, Thrower thrower)
+                {
+                    if (pet is Bird) thrower.Fail();
+                }
+
+                int InASealedClass(Pet pet, Final final)
+                {
+                    if (pet is Bird) final.Fail();
+                    return pet /*suppressed*/switch { Cat => 1, Dog => 2 };
+                }
+            }
+            """
+        );
+
     [Fact]
     public Task Guard_that_calls_a_method_that_always_throws() =>
         Verify.Suppressions("""
@@ -607,6 +664,42 @@ public class ControlFlowTests
                     if (pet is Bird) yield break;
                     yield return 1;
                     yield return pet /*suppressed*/switch { Cat => 1, Dog => 2 };
+                }
+            }
+            """
+        );
+
+    [Fact]
+    public Task Goto_into_an_earlier_section() =>
+        Verify.Suppressions("""
+            class C
+            {
+                int M(Pet pet)
+                {
+                    switch (pet)
+                    {
+                        case Cat:
+                        Inside:
+                            return pet /*warns*/switch { Cat => 1 };
+                        case Bird:
+                            goto Inside;
+                        default:
+                            return 0;
+                    }
+                }
+
+                // A goto within its own section doesn't enter it.
+                int O(Pet pet)
+                {
+                    switch (pet)
+                    {
+                        case Cat:
+                        Again:
+                            if (pet is Cat) return pet /*suppressed*/switch { Cat => 1 };
+                            goto Again;
+                        default:
+                            return 0;
+                    }
                 }
             }
             """

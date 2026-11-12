@@ -48,25 +48,26 @@ internal static class Descriptors
         id: "UN0003",
         title: "Default union holds no case",
         helpLinkUri: Reference + "un0003-default-union-holds-no-case",
-        messageFormat: "{0} holds none of {1}'s cases, so a switch over it throws",
+        messageFormat: "{0} holds none of {1}'s cases, so a switch over it throws{2}",
         category: "Reliability",
         defaultSeverity: DiagnosticSeverity.Info,
         isEnabledByDefault: true,
         description: "The default value of a struct union has a null Value, which matches none of its case types. The compiler treats a switch "
             + "that handles every case type as exhaustive, so it doesn't warn, but the switch throws SwitchExpressionException on a default union. "
-            + "Construct the union from one of its cases instead."
+            + "Construct the union from one of its cases instead, or write default! where a default is meant, as for a slot that's cleared."
     );
 
     public static readonly DiagnosticDescriptor DefaultUnionArray = new(
         id: "UN0006",
         title: "Array of unions holds elements with no case",
         helpLinkUri: Reference + "un0006-array-of-unions-holds-elements-with-no-case",
-        messageFormat: "'{0}' {2} default({1}), which holds none of its cases",
+        messageFormat: "'{0}' {2} default({1}), which holds none of its cases{3}",
         category: "Reliability",
         defaultSeverity: DiagnosticSeverity.Info,
         isEnabledByDefault: true,
         description: "A new (or grown, cleared or pooled) array of a struct union holds default unions, whose Value is null and matches none of "
-            + "the case types. A switch that handles every case type throws on one. Fill every element before reading it, or create the array from its elements."
+            + "the case types. A switch that handles every case type throws on one. Fill every element before reading it, or create the array from its elements. "
+            + "Where the defaults are meant, as in a buffer that tracks which elements are set, write the null-forgiving operator after it (new Pet[n]!)."
     );
 
     public static readonly DiagnosticDescriptor DefaultUnionFallback = new(
@@ -82,11 +83,24 @@ internal static class Descriptors
             + "or a Try method."
     );
 
+    public static readonly DiagnosticDescriptor MissingCases = new(
+        id: "UN0020",
+        title: "Switch doesn't handle every case earlier code leaves",
+        helpLinkUri: Reference + "un0020-switch-doesnt-handle-every-case-earlier-code-leaves",
+        messageFormat: "The switch doesn't handle {0}, which earlier code doesn't rule out",
+        category: "Reliability",
+        defaultSeverity: DiagnosticSeverity.Warning,
+        isEnabledByDefault: true,
+        description: "The compiler's warning that a switch expression isn't exhaustive (CS8509) gives an example of a case it doesn't handle, which can be "
+            + "one that code before the switch already ruled out. Where earlier code rules out some of the cases the switch doesn't handle, this reports "
+            + "the cases that are left instead, and the compiler's warning is suppressed. Turn this off to get the compiler's warning back."
+    );
+
     public static readonly DiagnosticDescriptor RecordPrintsUnion = new(
         id: "UN0019",
         title: "Record's ToString shows a union member's type name",
         helpLinkUri: Reference + "un0019-records-tostring-shows-a-union-members-type-name",
-        messageFormat: "'{0}' prints its {1} as '{2}', the union's type name, in ToString: {3}",
+        messageFormat: "{0} '{1}' as its type name in ToString: {2}",
         category: "Usage",
         defaultSeverity: DiagnosticSeverity.Info,
         isEnabledByDefault: true,
@@ -114,7 +128,7 @@ internal static class Descriptors
         helpLinkUri: Reference + "un0002-cases-fall-through-to-a-throwing-default",
         messageFormat: "The throwing {0} catches {1}, which the {2} doesn't otherwise handle",
         category: "Reliability",
-        defaultSeverity: DiagnosticSeverity.Warning,
+        defaultSeverity: DiagnosticSeverity.Info,
         isEnabledByDefault: true,
         description: "A switch over a union or closed hierarchy that ends in a default that only throws is meant to handle every case. "
             + "Cases that reach the default instead fail at run time, and so will any case added to the type later, with no warning. "
@@ -139,7 +153,7 @@ internal static class Descriptors
         id: "UN0007",
         title: "Union member can be left holding no case",
         helpLinkUri: Reference + "un0007-union-member-can-be-left-holding-no-case",
-        messageFormat: "'{0}' isn't assigned by {1}, so it can be left as {2}, which holds none of its cases",
+        messageFormat: "'{0}' isn't assigned by {1}, so it can be left as {2}, which holds none of its cases{3}",
         category: "Reliability",
         defaultSeverity: DiagnosticSeverity.Info,
         isEnabledByDefault: true,

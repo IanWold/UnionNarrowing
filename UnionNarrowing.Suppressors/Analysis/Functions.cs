@@ -120,7 +120,7 @@ internal static class Functions
     /// for one nothing outside the assembly can see (internal, or in an internal type), every file, as long as the assembly doesn't show its internals to others.
     /// Null for a method anything else could call:
     /// one that's virtual, implements an interface member, is the entry point, is partial, is one the compiler calls by pattern (see <see cref="CalledByPattern"/>), or is the target of an <c>[UnsafeAccessor]</c>;
-    /// and for a record's copy constructor (which <c>with</c> calls), an attribute's constructor and an interpolated string handler's (which interpolated strings call).
+    /// and for a record's copy constructor (which <c>with</c> calls), a custom union's (which conversions to it call), an attribute's constructor and an interpolated string handler's (which interpolated strings call).
     /// </summary>
     public static List<SyntaxNode>? CallerScopes(IMethodSymbol function, SyntaxNode body, SemanticModel model, Session session, CancellationToken ct)
     {
@@ -133,6 +133,7 @@ internal static class Functions
         if (function.MethodKind == MethodKind.Constructor
             && (function.IsImplicitlyDeclared
                 || function.ContainingType is not { TypeKind: TypeKind.Class or TypeKind.Struct } constructed
+                || constructed.IsUnion
                 || (constructed.IsRecord && function.Parameters.Length == 1 && SymbolEqualityComparer.Default.Equals(function.Parameters[0].Type, constructed))
                 || Symbols.InheritsFrom(constructed, "Attribute")
                 || Symbols.HasAttribute(constructed, "InterpolatedStringHandlerAttribute", "System", "Runtime", "CompilerServices")
@@ -150,6 +151,7 @@ internal static class Functions
             || (function.MethodKind == MethodKind.Ordinary && CalledByPattern.Contains(function.Name))
             || ImplementsAnInterfaceMember(function, type, compilation)
             || session.IsUnsafeAccessorTarget(function.Name, compilation, ct)
+            || Symbols.HasAttribute(function, "InterceptsLocationAttribute", "System", "Runtime", "CompilerServices")
             || SymbolEqualityComparer.Default.Equals(compilation.GetEntryPoint(ct), function)
             || !type.DeclaringSyntaxReferences.All(r => compilation.SyntaxTrees.Contains(r.SyntaxTree))
         )
@@ -186,9 +188,15 @@ internal static class Functions
     /// Whether a <c>with</c> copies without running code of its own:
     /// on a struct, it copies the bits; on a record, it calls the copy constructor, which the compiler has to have generated (in it and the records it derives from), since one written by hand can do anything.
     /// </summary>
-    public static bool CopiesAsIs(IWithOperation with)
+    public static bool CopiesAsIs(IWithOperation with) =>
+        with.CloneMethod is null || CopyConstructorsAreGenerated(with.Type as INamedTypeSymbol);
+
+    /// <summary>
+    /// Whether a record's copy constructor, and those of the records it derives from, are the ones the compiler generates, which copy every field as it is.
+    /// </summary>
+    public static bool CopyConstructorsAreGenerated(INamedTypeSymbol? type)
     {
-        for (var type = with.CloneMethod is null ? null : with.Type as INamedTypeSymbol; type is { IsRecord: true }; type = type.BaseType)
+        for (; type is { IsRecord: true }; type = type.BaseType)
         {
             if (type.InstanceConstructors.Any(c => !c.IsImplicitlyDeclared && c.Parameters.Length == 1 && SymbolEqualityComparer.Default.Equals(c.Parameters[0].Type, type)))
             {
@@ -356,7 +364,7 @@ internal static class Functions
             {
                 ConstructorDeclarationSyntax constructor => [constructor],
                 FieldDeclarationSyntax field => field.Declaration.Variables.Select(v => v.Initializer).OfType<SyntaxNode>(),
-                PropertyDeclarationSyntax property => (property.AccessorList?.Accessors.Where(a => a.IsKind(SyntaxKind.InitAccessorDeclaration)) ?? Enumerable.Empty<SyntaxNode>())
+                PropertyDeclarationSyntax property => (property.AccessorList?.Accessors.Where(a => a.IsKind(SyntaxKind.InitAccessorDeclaration) && (a.Body is not null || a.ExpressionBody is not null)) ?? Enumerable.Empty<SyntaxNode>())
                     .Concat(property.Initializer is { } initializer ? [initializer] : []),
                 _ => Enumerable.Empty<SyntaxNode>(),
             })
@@ -382,8 +390,8 @@ internal static class Functions
                     IInstanceReferenceOperation { ReferenceKind: InstanceReferenceKind.ContainingTypeInstance, Parent: var parent } self => parent switch
                     {
                         IFieldReferenceOperation => (false, null),
-                        IInvocationOperation invocation when invocation.Instance == self => (false, invocation.TargetMethod),
-                        IPropertyReferenceOperation { Property: var property } reference when reference.Instance == self => (false, Symbols.IsAutoProperty(property) ? null : property),
+                        IInvocationOperation invocation when invocation.Instance == self => (CanBeDispatchedElsewhere(invocation.TargetMethod), invocation.TargetMethod),
+                        IPropertyReferenceOperation { Property: var property } reference when reference.Instance == self => (CanBeDispatchedElsewhere(property), Symbols.IsAutoProperty(property) ? null : property),
                         _ => (true, null),
                     },
                     IInvocationOperation { TargetMethod: { IsStatic: true } method } when isStatic && OfType(method) => (false, method),
@@ -424,19 +432,63 @@ internal static class Functions
         || (declared is IMethodSymbol { AssociatedSymbol: { } associated } && called.Contains(associated.OriginalDefinition));
 
     /// <summary>
-    /// Whether an object of the type can be handed to other code (through <c>this</c>) before its constructors are done:
+    /// Whether an object of the type can be handed to other code (through <c>this</c>) before its constructors are done, by its own or those of the types it derives from:
     /// then code anywhere can see its readonly members before they're set for good.
     /// </summary>
     public static bool ThisEscapesDuringConstruction(INamedTypeSymbol type, SemanticModel model, CancellationToken ct) =>
-        ConstructionReach(type, isStatic: false, model, ct) is null;
+        CanBeSeenBeforeConstructed(type, model.Compilation, ct);
+
+    /// <summary>
+    /// Whether code other than its constructors can see an object of the type before they've set its readonly members (and its object initializer its <c>init</c> ones) for good:
+    /// the type's construction, or that of a type it derives from in the compilation, hands <c>this</c> (or one of its methods) to other code, or calls a member an override could replace (see <see cref="ConstructionReach"/>).
+    /// Then another thread, or code that's suspended while construction carries on, can read a member twice and get different values.
+    /// </summary>
+    public static bool CanBeSeenBeforeConstructed(INamedTypeSymbol type, Compilation compilation, CancellationToken ct = default)
+    {
+        for (var declaring = type.OriginalDefinition; declaring is { IsValueType: false }; declaring = declaring.BaseType?.OriginalDefinition)
+        {
+            if (declaring.DeclaringSyntaxReferences.FirstOrDefault(r => compilation.SyntaxTrees.Contains(r.SyntaxTree)) is { } reference
+                && ConstructionReach(declaring, isStatic: false, compilation.GetSemanticModel(reference.SyntaxTree), ct) is null
+            )
+            {
+                return true;
+            }
+        }
+
+        return false;
+    }
+
+    /// <summary>
+    /// Whether the type's static constructor or static initializers can call code of another type, which can read its static readonly members before they're set, and could still be running (suspended at an <c>await</c> or a <c>yield</c>) once they are.
+    /// </summary>
+    public static bool StaticConstructionCallsOut(INamedTypeSymbol type, Compilation compilation, CancellationToken ct = default) =>
+        type.OriginalDefinition.DeclaringSyntaxReferences.FirstOrDefault(r => compilation.SyntaxTrees.Contains(r.SyntaxTree)) is { } reference
+        && ConstructionReach(type.OriginalDefinition, isStatic: true, compilation.GetSemanticModel(reference.SyntaxTree), ct) is null;
+
+    /// <summary>
+    /// Whether an interceptor (<c>[InterceptsLocation]</c>, which a source generator writes) replaces the call, which then runs that instead of its target.
+    /// </summary>
+    public static bool IsIntercepted(IInvocationOperation call) =>
+        call.Syntax is InvocationExpressionSyntax syntax && call.SemanticModel?.GetInterceptorMethod(syntax) is not null;
 
     /// <summary>
     /// Whether a call to the method never returns:
-    /// it's <c>[DoesNotReturn]</c>, or always throws (see <see cref="AlwaysThrows"/>), and isn't <c>[Conditional]</c> (which may compile the call out).
+    /// it's <c>[DoesNotReturn]</c>, or always throws (see <see cref="AlwaysThrows"/>), and isn't <c>[Conditional]</c> (which may compile the call out), async or an iterator (which return a task or a sequence, and only throw later).
+    /// Nor can a call run an override, or an interface's implementation, that returns (the compiler only warns where one is written, and a test double can return anyway).
     /// </summary>
     public static bool NeverReturns(IMethodSymbol method) =>
         (Symbols.HasAttribute(method, "DoesNotReturnAttribute", "System", "Diagnostics", "CodeAnalysis") || AlwaysThrows(method))
-        && !Symbols.HasAttribute(method, "ConditionalAttribute", "System", "Diagnostics");
+        && !Symbols.HasAttribute(method, "ConditionalAttribute", "System", "Diagnostics")
+        && !method.IsAsync && !method.IsIterator
+        && !CanBeOverridden(method);
+
+    /// <summary>
+    /// Whether a call to the method can run another implementation of it: it's virtual or abstract, an override that isn't sealed, or an interface member.
+    /// </summary>
+    private static bool CanBeOverridden(IMethodSymbol method) =>
+        method.IsVirtual || method.IsAbstract
+        || (method.IsOverride && !method.IsSealed && method.ContainingType is { IsSealed: false })
+        || method.ContainingType is null or { TypeKind: TypeKind.Interface };
 
     /// <summary>
     /// The member's declaration, if a call to it can only run that (see <see cref="CanBeDispatchedElsewhere"/>), and it's a single declaration in this compilation.
@@ -471,7 +523,8 @@ internal static class Functions
     }
 
     /// <summary>
-    /// Whether each function from <paramref name="function"/> out to (not including) <paramref name="declaringFunction"/> is a local function that runs its body when called (not async or an iterator) and is only ever called directly.
+    /// Whether each function from <paramref name="function"/> out to (not including) <paramref name="declaringFunction"/> is a local function that runs its body when called (not async or an iterator) and is only ever called directly, by the function it's declared in.
+    /// (A call from a lambda in there runs whenever the lambda does, which can be while that function is suspended, and resumes it before returning.)
     /// </summary>
     public static bool RunsWhenCalled(SyntaxNode? function, SyntaxNode declaringFunction, SemanticModel model, CancellationToken ct)
     {
@@ -481,7 +534,8 @@ internal static class Functions
                 || model.GetDeclaredSymbol(local, ct) is not IMethodSymbol { IsAsync: false } symbol
                 || ((SyntaxNode?)local.Body ?? local.ExpressionBody)?.DescendantNodes(n => !IsFunction(n)).Any(n => n is YieldStatementSyntax) != false
                 || EnclosingFunction(local) is not { } scope
-                || DirectCalls(symbol, scope, local, model, ct) is null
+                || DirectCalls(symbol, scope, local, model, ct) is not { } calls
+                || calls.Any(call => EnclosingFunction(call) != scope)
             )
             {
                 return false;

@@ -51,6 +51,51 @@ public class InputTests
         );
 
     [Fact]
+    public Task Boxed_union() =>
+        Verify.Suppressions("""
+            class C
+            {
+                // A type pattern on an object tests the box, which holds a Pet, never a Bird: the Bird arm says nothing
+                // about what the Pet holds.
+                int Arm(object message) =>
+                    message switch { Bird => 0, Pet and var pet => pet /*warns*/switch { Cat => 1, Dog => 2 }, _ => -1 };
+
+                int Condition(object o)
+                {
+                    if (o is not Bird and Pet and var pet) return pet /*warns*/switch { Cat => 1, Dog => 2 };
+                    return 0;
+                }
+
+                int Copy(object o)
+                {
+                    if (o is Bird or not Pet) return 0;
+                    return o is Pet and var pet ? pet /*warns*/switch { Cat => 1, Dog => 2 } : 0;
+                }
+
+                int Loop(System.Collections.Generic.Queue<object> q)
+                {
+                    var n = 0;
+                    while (q.TryDequeue(out var next) && next is not Bird and Pet and var pet) n += pet /*warns*/switch { Cat => 1, Dog => 2 };
+                    return n;
+                }
+
+                // Once it's a Pet, patterns test what it holds.
+                int Unboxed(object o)
+                {
+                    if (o is Pet pet && pet is not Bird) return pet /*suppressed*/switch { Cat => 1, Dog => 2 };
+                    return 0;
+                }
+
+                int OfValue(Pet pet)
+                {
+                    if (pet.Value is Bird) return 0;
+                    return pet /*suppressed*/switch { Cat => 1, Dog => 2 };
+                }
+            }
+            """
+        );
+
+    [Fact]
     public Task Identity_cast() =>
         Verify.Suppressions("""
             class C

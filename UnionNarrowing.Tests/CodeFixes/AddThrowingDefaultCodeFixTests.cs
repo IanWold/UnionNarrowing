@@ -123,6 +123,52 @@ public class AddThrowingDefaultCodeFixTests
             """
         );
 
+    /// <summary>
+    /// With an <c>UnreachableException</c> of its own in scope, the code gets the one in System.Diagnostics, named in full, and no using.
+    /// </summary>
+    [Fact]
+    public Task Add_a_throwing_default_beside_an_UnreachableException_of_its_own() =>
+        Verify.CodeFix(new AddThrowingDefaultCodeFix(), """
+            namespace App
+            {
+                class UnreachableException : System.Exception { }
+
+                class C
+                {
+                    int M(Pet pet)
+                    {
+                        switch (pet)
+                        {
+                            case Cat: return 1;
+                            case Dog: return 2;
+                            case Bird: return 3;
+                        }
+                    }
+                }
+            }
+            """, """
+            namespace App
+            {
+                class UnreachableException : System.Exception { }
+
+                class C
+                {
+                    int M(Pet pet)
+                    {
+                        switch (pet)
+                        {
+                            case Cat: return 1;
+                            case Dog: return 2;
+                            case Bird: return 3;
+                            default:
+                                throw new System.Diagnostics.UnreachableException();
+                        }
+                    }
+                }
+            }
+            """, usings: false
+        );
+
     [Fact]
     public Task Add_a_throwing_default_in_a_getter() =>
         Verify.CodeFix(new AddThrowingDefaultCodeFix(), """
@@ -206,6 +252,49 @@ public class AddThrowingDefaultCodeFixTests
                             throw new UnreachableException();
                     }
                 };
+            }
+            """
+        );
+
+    [Fact]
+    public Task Add_a_throwing_default_in_a_using_statement() =>
+        Verify.CodeFix(new AddThrowingDefaultCodeFix(), """
+            using System.Diagnostics;
+
+            class C
+            {
+                int M(Pet pet, IDisposable resource)
+                {
+                    using (resource)
+                    {
+                        switch (pet)
+                        {
+                            case Cat: return 1;
+                            case Dog: return 2;
+                            case Bird: return 3;
+                        }
+                    }
+                }
+            }
+            """, """
+            using System.Diagnostics;
+
+            class C
+            {
+                int M(Pet pet, IDisposable resource)
+                {
+                    using (resource)
+                    {
+                        switch (pet)
+                        {
+                            case Cat: return 1;
+                            case Dog: return 2;
+                            case Bird: return 3;
+                            default:
+                                throw new UnreachableException();
+                        }
+                    }
+                }
             }
             """
         );
@@ -397,6 +486,42 @@ public class AddThrowingDefaultCodeFixTests
                     else if (pet is Dog) return 2;
                     else if (pet is Bird) return 3;
                     throw new UnreachableException();
+                }
+            }
+            """
+        );
+
+    [Fact]
+    public Task Throw_after_ifs_in_a_lock_statement() =>
+        Verify.CodeFix(new AddThrowingDefaultCodeFix(), """
+            using System.Diagnostics;
+
+            class C
+            {
+                int M(Pet pet, object gate)
+                {
+                    lock (gate)
+                    {
+                        if (pet is Cat) return 1;
+                        if (pet is Dog) return 2;
+                        if (pet is Bird) return 3;
+                    }
+                }
+            }
+            """, """
+            using System.Diagnostics;
+
+            class C
+            {
+                int M(Pet pet, object gate)
+                {
+                    lock (gate)
+                    {
+                        if (pet is Cat) return 1;
+                        if (pet is Dog) return 2;
+                        if (pet is Bird) return 3;
+                        throw new UnreachableException();
+                    }
                 }
             }
             """

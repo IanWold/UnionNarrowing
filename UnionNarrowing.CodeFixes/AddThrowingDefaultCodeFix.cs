@@ -1,16 +1,4 @@
-using System.Collections.Generic;
 using System.Collections.Immutable;
-using System.Composition;
-using System.Linq;
-using System.Threading;
-using System.Threading.Tasks;
-using Microsoft.CodeAnalysis;
-using Microsoft.CodeAnalysis.CodeActions;
-using Microsoft.CodeAnalysis.CodeFixes;
-using Microsoft.CodeAnalysis.CSharp.Syntax;
-using Microsoft.CodeAnalysis.Formatting;
-using UnionNarrowing.Suppressors.Analysis;
-using static Microsoft.CodeAnalysis.CSharp.SyntaxFactory;
 
 namespace UnionNarrowing.CodeFixes;
 
@@ -46,23 +34,34 @@ public sealed class AddThrowingDefaultCodeFix : CodeFixProvider
         }).FirstOrDefault(b => b is not null);
 
     /// <summary>
-    /// For CS0161: the switch statement the body ends with.
+    /// The statement control falls out of the end of <paramref name="statement"/> from:
+    /// the statement itself, or for a block, a using, lock, fixed, checked, unsafe or labeled statement, or a try with no catch, the statement its own body ends with.
     /// </summary>
-    private static SwitchStatementSyntax? LastSwitchIn(SyntaxNode node) =>
-        BodyOf(node)?.Statements.LastOrDefault() as SwitchStatementSyntax;
+    private static StatementSyntax? EndOf(StatementSyntax? statement) => statement switch
+    {
+        BlockSyntax block => EndOf(block.Statements.LastOrDefault()),
+        UsingStatementSyntax @using => EndOf(@using.Statement),
+        LockStatementSyntax @lock => EndOf(@lock.Statement),
+        FixedStatementSyntax @fixed => EndOf(@fixed.Statement),
+        CheckedStatementSyntax @checked => EndOf(@checked.Block),
+        UnsafeStatementSyntax @unsafe => EndOf(@unsafe.Block),
+        LabeledStatementSyntax labeled => EndOf(labeled.Statement),
+        TryStatementSyntax { Catches.Count: 0 } @try => EndOf(@try.Block),
+        _ => statement,
+    };
 
     /// <summary>
     /// For CS0165 on a read of a local:
-    /// the switch statement just before the statement the read is in.
+    /// where control falls out of the statement just before the statement the read is in.
     /// </summary>
-    private static SwitchStatementSyntax? SwitchBefore(SyntaxNode node)
+    private static StatementSyntax? EndOfStatementBefore(SyntaxNode node)
     {
         foreach (var statement in node.AncestorsAndSelf().OfType<StatementSyntax>())
         {
             if (statement.Parent is BlockSyntax block)
             {
                 var index = block.Statements.IndexOf(statement);
-                return index > 0 ? block.Statements[index - 1] as SwitchStatementSyntax : null;
+                return index > 0 ? EndOf(block.Statements[index - 1]) : null;
             }
         }
 
@@ -72,6 +71,7 @@ public sealed class AddThrowingDefaultCodeFix : CodeFixProvider
     /// <summary>
     /// What the fix for each diagnostic adds a throw to, where it's offered:
     /// a switch statement that handles every case, which gets a throwing default section, or a body that ends in ifs that test every case and return (<c>if (pet is Cat) return 1; ... if (pet is Bird) return 3;</c>), which gets a throw after them.
+    /// Either can be inside the statement the body ends with (see <see cref="EndOf"/>): <c>using (...) { switch ... }</c>.
     /// </summary>
     private static async Task<HashSet<SyntaxNode>> TargetsAsync(Document document, IEnumerable<Diagnostic> diagnostics, CancellationToken ct)
     {
@@ -89,15 +89,16 @@ public sealed class AddThrowingDefaultCodeFix : CodeFixProvider
         {
             var node = root.FindNode(diagnostic.Location.SourceSpan, getInnermostNodeForTie: true);
             var atEndOfBody = diagnostic.Id is "CS0161" or "CS1643";
+            var end = atEndOfBody ? EndOf(BodyOf(node)) : EndOfStatementBefore(node);
 
-            if (atEndOfBody && BodyOf(node) is { Statements.Count: > 0 } body
-                && Handling.IfRunBefore(body.Statements, body.Statements.Count, model, session, ct) is { } handling
+            if (atEndOfBody && end?.Parent is BlockSyntax block
+                && Handling.IfRunBefore(block.Statements, block.Statements.Count, model, session, ct) is { } handling
                 && handling.Caught(handling.Excluded(model, ct)).Count == 0
             )
             {
-                targets.Add(body);
+                targets.Add(block);
             }
-            else if ((atEndOfBody ? LastSwitchIn(node) : SwitchBefore(node)) is { } candidate
+            else if (end is SwitchStatementSyntax candidate
                 && !candidate.Sections.Any(s => s.Labels.Any(l => l is DefaultSwitchLabelSyntax))
                 && SwitchCoverage.Of(candidate, model, session, ct, countGuarded: false) is { OverCases: true, Complete: true }
             )

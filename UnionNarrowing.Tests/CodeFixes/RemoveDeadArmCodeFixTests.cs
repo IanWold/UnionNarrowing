@@ -9,6 +9,31 @@ namespace UnionNarrowing.Tests;
 public class RemoveDeadArmCodeFixTests
 {
     [Fact]
+    public Task Dead_case_section_with_a_directive_inside_is_left_alone() =>
+        Verify.CodeFix(new RemoveDeadArmCodeFix(), """
+            class C
+            {
+                int M(Pet pet)
+                {
+                    if (pet is Bird) return 0;
+                    switch (pet)
+                    {
+                        case Bird:
+            #if DEBUG
+                            Console.WriteLine("bird");
+            #endif
+                            return 3;
+                        case Cat:
+                            return 1;
+                        default:
+                            return 2;
+                    }
+                }
+            }
+            """, expected: null, new DeadArmAnalyzer()
+        );
+
+    [Fact]
     public Task Dead_case_section_that_declares_a_local_function_is_left_alone() =>
         Verify.CodeFix(new RemoveDeadArmCodeFix(), """
             class C
@@ -274,6 +299,89 @@ public class RemoveDeadArmCodeFixTests
         );
 
     [Fact]
+    public Task Remove_dead_arm_after_an_endif() =>
+        Verify.CodeFix(new RemoveDeadArmCodeFix(), """
+            class C
+            {
+                int M(Pet pet)
+                {
+                    if (pet is Bird) return 0;
+                    return pet switch
+                    {
+            #if LEGACY
+                        Cat => 0,
+            #else
+                        Cat => 1,
+            #endif
+                        Bird => 3,
+                        Dog => 2,
+                    };
+                }
+            }
+            """, """
+            class C
+            {
+                int M(Pet pet)
+                {
+                    if (pet is Bird) return 0;
+                    return pet switch
+                    {
+            #if LEGACY
+                        Cat => 0,
+            #else
+                        Cat => 1,
+            #endif
+                        Dog => 2,
+                    };
+                }
+            }
+            """, new DeadArmAnalyzer()
+        );
+
+    /// <summary>
+    /// What's inactive between the directives before the arm stays too: it's another configuration's code.
+    /// </summary>
+    [Fact]
+    public Task Remove_dead_arm_after_an_else() =>
+        Verify.CodeFix(new RemoveDeadArmCodeFix(), """
+            class C
+            {
+                int M(Pet pet)
+                {
+                    if (pet is Bird) return 0;
+                    return pet switch
+                    {
+                        Cat => 1,
+            #if LEGACY
+                        Bird => 0,
+            #else
+                        Bird => 3,
+            #endif
+                        Dog => 2,
+                    };
+                }
+            }
+            """, """
+            class C
+            {
+                int M(Pet pet)
+                {
+                    if (pet is Bird) return 0;
+                    return pet switch
+                    {
+                        Cat => 1,
+            #if LEGACY
+                        Bird => 0,
+            #else
+            #endif
+                        Dog => 2,
+                    };
+                }
+            }
+            """, new DeadArmAnalyzer()
+        );
+
+    [Fact]
     public Task Remove_dead_arm_on_its_own_line() =>
         Verify.CodeFix(new RemoveDeadArmCodeFix(), """
             class C
@@ -342,6 +450,48 @@ public class RemoveDeadArmCodeFixTests
         );
 
     [Fact]
+    public Task Remove_dead_case_label_after_an_endif() =>
+        Verify.CodeFix(new RemoveDeadArmCodeFix(), """
+            class C
+            {
+                int M(Pet pet)
+                {
+                    if (pet is Bird) return 0;
+                    switch (pet)
+                    {
+                        case Cat:
+            #if LEGACY
+                        case Dog:
+            #endif
+                        case Bird:
+                            return 1;
+                        default:
+                            return 2;
+                    }
+                }
+            }
+            """, """
+            class C
+            {
+                int M(Pet pet)
+                {
+                    if (pet is Bird) return 0;
+                    switch (pet)
+                    {
+                        case Cat:
+            #if LEGACY
+                        case Dog:
+            #endif
+                            return 1;
+                        default:
+                            return 2;
+                    }
+                }
+            }
+            """, new DeadArmAnalyzer()
+        );
+
+    [Fact]
     public Task Remove_dead_case_section() =>
         Verify.CodeFix(new RemoveDeadArmCodeFix(), """
             class C
@@ -380,6 +530,51 @@ public class RemoveDeadArmCodeFixTests
         );
 
     [Fact]
+    public Task Remove_dead_case_section_after_an_endregion() =>
+        Verify.CodeFix(new RemoveDeadArmCodeFix(), """
+            class C
+            {
+                int M(Pet pet)
+                {
+                    if (pet is Bird) return 0;
+                    switch (pet)
+                    {
+                        #region Mammals
+                        case Cat:
+                            return 1;
+                        case Dog:
+                            return 2;
+                        #endregion
+                        case Bird:
+                            return 3;
+                    }
+
+                    return 4;
+                }
+            }
+            """, """
+            class C
+            {
+                int M(Pet pet)
+                {
+                    if (pet is Bird) return 0;
+                    switch (pet)
+                    {
+                        #region Mammals
+                        case Cat:
+                            return 1;
+                        case Dog:
+                            return 2;
+                        #endregion
+                    }
+
+                    return 4;
+                }
+            }
+            """, new DeadArmAnalyzer()
+        );
+
+    [Fact]
     public Task Remove_dead_last_arm() =>
         Verify.CodeFix(new RemoveDeadArmCodeFix(), """
             class C
@@ -397,6 +592,84 @@ public class RemoveDeadArmCodeFixTests
                 {
                     if (pet is Bird) return 0;
                     return pet switch { Cat => 1, Dog => 2 };
+                }
+            }
+            """, new DeadArmAnalyzer()
+        );
+
+    /// <summary>
+    /// Without a trailing comma, the arm that's now last loses its comma, but not the comment after it.
+    /// </summary>
+    [Fact]
+    public Task Remove_dead_last_arm_after_a_comment() =>
+        Verify.CodeFix(new RemoveDeadArmCodeFix(), """
+            class C
+            {
+                int M(Pet pet)
+                {
+                    if (pet is Bird) return 0;
+                    return pet switch
+                    {
+                        Cat => 1,
+                        Dog => 2, // dogs
+                        Bird => 3 // never
+                    };
+                }
+            }
+            """, """
+            class C
+            {
+                int M(Pet pet)
+                {
+                    if (pet is Bird) return 0;
+                    return pet switch
+                    {
+                        Cat => 1,
+                        Dog => 2 // dogs
+                    };
+                }
+            }
+            """, new DeadArmAnalyzer()
+        );
+
+    /// <summary>
+    /// The arm that's now last keeps its comma, which the arms in the other configuration need.
+    /// </summary>
+    [Fact]
+    public Task Remove_dead_last_arm_after_an_if() =>
+        Verify.CodeFix(new RemoveDeadArmCodeFix(), """
+            class C
+            {
+                int M(Pet pet)
+                {
+                    if (pet is Bird) return 0;
+                    return pet switch
+                    {
+                        Cat => 1,
+                        Dog => 2,
+            #if LEGACY
+                        Bird => 0
+            #else
+                        Bird => 3
+            #endif
+                    };
+                }
+            }
+            """, """
+            class C
+            {
+                int M(Pet pet)
+                {
+                    if (pet is Bird) return 0;
+                    return pet switch
+                    {
+                        Cat => 1,
+                        Dog => 2,
+            #if LEGACY
+                        Bird => 0
+            #else
+            #endif
+                    };
                 }
             }
             """, new DeadArmAnalyzer()

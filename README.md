@@ -130,7 +130,7 @@ if (dict.TryGetValue(key, out var found) && found is not Bird)
     return found switch { Cat => 1, Dog => 2 };     // the test after the out argument holds
 ```
 
-Helpers can be generic (`static bool IsErr<T, E>(this Result<T, E> r) => r is Err<E>;`), and can have a block body, read through its guards and returns: a `TryGet` method, or an assertion that throws for some cases. A discriminant property works the way it does in TypeScript, where each sealed type of a closed hierarchy overrides it with a constant (of an enum, `bool`, `char`, integer or `string` type, whose constants compare exactly):
+Helpers can be generic (`static bool IsErr<T, E>(this Result<T, E> r) => r is Err<E>;`), and can have a block body, read through its guards and returns: a `TryGet` method, or an assertion that throws for some cases. A discriminant property works the way it does in TypeScript, where each sealed type of a closed hierarchy gives it a constant (of an enum, `bool`, `char`, integer or `string` type, whose constants compare exactly), by overriding it or through the base constructor, and so does a union's own property that switches on the union:
 
 ```csharp
 if (!result.TryGetOk(out var value)) return 0;      // if (this is Ok<int> ok) { value = ok.Value; return true; } ...
@@ -141,11 +141,17 @@ return pet switch { Cat => 1, Dog => 2 };
 
 if (shape.Kind == ShapeKind.Circle) return 0;       // override ShapeKind Kind => ShapeKind.Circle; in Circle, ...
 return shape switch { Square => 1, Triangle => 2 };
+
+if (!response.Success) return 0;                     // override bool Success => true; in Found, false in the others
+return response switch { Found f => f.Body };
+
+if (record.Type >= RecordType.Mx) return null;       // sealed class ARecord(string ip) : Resource(RecordType.A), ...
+return record switch { ARecord a => a.Ip, AaaaRecord a => a.Ip };
 ```
 
 ### Loops and state machines
 
-A loop condition narrows the loop body and the code after the loop. Assigning a switch's result back to the variable it switches on doesn't count as changing that variable before the switch, and neither does a switch statement's sections assigning it. A local whose every assignment rules a case out never holds that case, loops or not:
+A loop condition narrows the loop body and the code after the loop. Assigning a switch's result back to the variable it switches on doesn't count as changing that variable before the switch, and neither does a switch statement's sections assigning it. A local whose every assignment rules a case out never holds that case, loops or not, and an assignment that switches on the local itself can keep a case ruled out by handing it back:
 
 ```csharp
 while (pet is Bird) pet = Next();
@@ -165,17 +171,23 @@ Pet pet = new Cat("Tom");
 for (var i = 0; i < steps; i++)
     pet = pet switch { Cat => new Dog("Rex"), _ => new Cat("Tom") };   // never a Bird
 return pet switch { Cat => 1, Dog => 2 };
+
+Job job = new Waiting();
+foreach (var step in steps)
+    job = job switch { Waiting => new Running(0), Running r => new Running(r.Step + step), Failed f => f };   // never Failed
+return job switch { Waiting => 0, Running r => r.Step };
 ```
 
 ### Members, tuples, LINQ and helper methods
 
 Narrowing isn't limited to plain locals:
 
-- Readonly fields, get-only properties (including record properties, and getters that just return a readonly field), tuple elements and the fields of struct locals are followed.
+- Readonly fields, get-only properties (including record properties, and getters that just return another member, which read the same as that member), tuple elements and the fields of struct locals are followed.
 - Tuple switches are checked one element at a time, and can mix in bools, enums and other types.
-- Arms can look inside: at the union a case holds, or a member that's a union or of a closed type. Guards that look inside add up, one place at a time or several together (`if (b is { Left: Lit, Right: Lit }) return;`), and guards that rule out every case of a member rule out the case it's in.
-- A `Where` filter narrows the lambdas later in the chain, and the elements that come out of it, through grouping and flattening back out too (`GroupBy(...).SelectMany(g => g)`).
-- A local function or private helper takes on what its callers ruled out, and so does an internal class's constructor.
+- Arms can look inside: at the union a case holds, or a member that's a union or of a closed type, any number of plain members deep. They can split a case between them on a `bool` member, or on whether a member is null: `Marker(true)` and `Marker(false)`, `Close { Frame: null }` and `Close { Frame: { } f }`. Guards that look inside add up, one place at a time or several together (`if (b is { Left: Lit, Right: Lit }) return;`), and guards that rule out every case of a member rule out the case it's in.
+- A variable a pattern binds gets what it's `and`-ed with (`pets is [(Cat or Dog) and var first, ..]`), and a case taken out of a union gets what's known about it (`if (r is not Err<E> err) return ...; err.Error switch { ... }`).
+- A `Where` filter narrows the lambdas later in the chain, and the elements that come out of it, through grouping and flattening back out too (`GroupBy(...).SelectMany(g => g)`), over async sequences (`await foreach`) and in `Parallel.ForEach`.
+- A local function or private helper takes on what its callers ruled out, read with each call's type arguments for a generic one, and so does an internal class's constructor.
 - A lambda takes on what holds where it's made, if the variables it captures can't change after that (as in TypeScript 5.4).
 - A readonly member keeps what every constructor checked before setting it.
 - Generic code is read with the type arguments of the call or member it's read for: `Some(1)` is a `Some<int>`, and `Map` on a `Result<int, string>` can give either case.
@@ -209,6 +221,19 @@ public Owner(Pet pet) { if (pet is Bird) throw new ArgumentException(); _pet = p
 public int Legs() => _pet switch { Cat => 4, Dog => 4 };
 ```
 
+### The cases that are really missing (UN0020)
+
+Where earlier code rules out some cases, the example CS8509 gives can be one of those, since the compiler doesn't know about the guard. UN0020 reports the cases that are really left instead, and stands in for CS8509 there:
+
+```csharp
+if (error is RemoteServiceError) return 502;
+return error switch { ValidationError => 400, PricingError => 422 };
+// UN0020: The switch doesn't handle OutsideBusinessHours, which earlier code doesn't rule out
+// (not CS8509: For example, the pattern 'RemoteServiceError' is not covered.)
+```
+
+CS8509 comes back wherever UN0020 wouldn't be seen as a warning at least as severe: turned off or down (severity `none`, `silent` or `suggestion`, `NoWarn`, a ruleset), hidden by `#pragma warning disable UN0020` or `[SuppressMessage]`, or where CS8509 is made an error and UN0020 isn't (`WarningsAsErrors`, or `WarningsNotAsErrors` naming UN0020 with `TreatWarningsAsErrors`).
+
 ### Throwing defaults that hide cases (UN0002)
 
 A default that only throws tells the compiler "this can't happen", so the compiler stops checking for missing cases. UN0002 does that check instead, taking narrowing into account. It only reports a default that actually catches a case:
@@ -221,7 +246,14 @@ int Legs(Pet pet) => pet switch
 };                                              //          which the switch doesn't otherwise handle
 ```
 
-The compiler never checks switch *statements* for exhaustiveness. They need a throwing `default:` for definite return even when they handle every case, so UN0002 is the only check they get. A default counts as throwing when it can only end in a throw: one that logs first, or calls a `[DoesNotReturn]` helper like `AssertNever(x)`, is reported too. So is a run of `if`s ending in a throwing `else`, where every condition tests the same value. UN0002 is a warning, since what it finds is what CS8509 would have.
+A default counts as throwing when it can only end in a throw: one that logs first, or calls a `[DoesNotReturn]` helper like `AssertNever(x)`, is reported too. So is a run of `if`s ending in a throwing `else`, where every condition tests the same value. UN0002 is reported at Info, since a throwing default is often deliberate; set it to `warning` in `.editorconfig` to see it in builds.
+
+The compiler never checks switch *statements* for exhaustiveness, so one without a `default:` that misses a case gets no warning at all. To hear about those, turn on the IDE's own check, which UnionNarrowing keeps quiet wherever earlier code has ruled out what a statement doesn't handle:
+
+```ini
+[*.cs]
+dotnet_diagnostic.IDE0010.severity = warning
+```
 
 ### Default unions that hold no case (UN0003, UN0006, UN0007, UN0010)
 
@@ -229,7 +261,7 @@ The default value of a struct union has a null `Value`, which matches none of it
 
 ```csharp
 Pet a = default;                     // UN0003: default holds none of Pet's cases (not `default!`, which says it's meant)
-var pets = new Pet[count];           // UN0006: fills the array with default(Pet)
+var pets = new Pet[count];           // UN0006: fills the array with default(Pet) (not `new Pet[count]!`)
 var first = list.FirstOrDefault();   // UN0010: gives default(Pet) when the sequence is empty
 
 class Owner
@@ -250,19 +282,19 @@ A union is a struct. Boxing it, to `object` or a generic `T`, boxes the union, n
 pet.Equals(cat)                      // UN0014: never true
 ((object)pet) switch { Cat => 1 }    // UN0014: Cat never matches
 $"pet: {pet}"                        // UN0015: shows "Pet"; format pet.Value instead
-record Owner(Pet Pet);               // UN0019: ToString prints "Owner { Pet = Pet }"
+record Owner(Pet Pet);               // UN0019 (once, on `union Pet`): Owner's ToString prints "Owner { Pet = Pet }"
 ```
 
 ### Code fixes that respect narrowing
 
-- **Add missing arms** (CS8509, CS8846, CS8655, CS8847) adds a `Case => throw new NotImplementedException()` arm for each case that's actually missing. It skips cases that earlier code ruled out, and adds `null` where the union can hold null. For a tuple switch, it adds an arm for each set of missing combinations that differ in one element, like `(Dog or Bird, _)`, and where the arms look inside the input, the missing nested patterns, like `Kitten { Toy: Ball }` (or, past 16 of those, an arm for each case they're in). It isn't offered when some arms are in an inactive `#if` section.
+- **Add missing arms** (CS8509, CS8846, CS8655, CS8847, UN0020) adds a `Case => throw new NotImplementedException()` arm for each case that's actually missing. It skips cases that earlier code ruled out, and adds `null` where the union can hold null. For a tuple switch, it adds an arm for each set of missing combinations that differ in one element, like `(Dog or Bird, _)`, and where the arms look inside the input, the missing nested patterns, like `Kitten { Toy: Ball }` (or, past 16 of those, an arm for each case they're in). It isn't offered when some arms are in an inactive `#if` section.
 - **Add missing cases** (IDE0010) does the same for a switch statement.
 - **Name the cases** (UN0002) turns `_ => throw ...` into `Dog or Bird => throw ...` (or the nested patterns it catches, like `Kitten { Toy: Mouse }`), so a case added later is reported.
 - **Remove the arm** (UN0004) deletes a switch arm or case label that can't match, because earlier code already ruled out its case. The IDE shows these as faded.
 - **Switch on the union** (UN0005) rewrites `pet.Value switch { ... }` to `pet switch { ... }`, so the compiler checks exhaustiveness.
 - **Add a throwing default** (CS0161, CS1643, CS0165) for a switch statement, or a run of `if`s ending a method, that handles every case but still lets control fall out of its end, as far as the compiler can tell.
 - **Override ToString** (UN0015, UN0019) adds `public override string ToString() => Value?.ToString() ?? "";` to a union declared in the solution, which fixes every place it's formatted at once. **Format its Value** (UN0015) fixes one place.
-- **Make it required** (UN0007) makes the member `required`, adding `[SetsRequiredMembers]` to the constructors that set it.
+- **Make it required** (UN0007) makes the member `required`, adding `[SetsRequiredMembers]` to the constructors that set it. It isn't offered where that would break code that creates the type.
 
 ```csharp
 if (pet is Bird) return 0;
@@ -286,9 +318,7 @@ unionnarrowing.follow_mutable_state = true
 
 ## Reference
 
-The [wiki](https://github.com/IanWold/UnionNarrowing/wiki/Reference) lists exactly what the package does, for anyone who needs to check a specific behavior: the [diagnostics](https://github.com/IanWold/UnionNarrowing/wiki/Diagnostics), what the [suppressions](https://github.com/IanWold/UnionNarrowing/wiki/Suppressions) follow, and each of the [analyzers and code fixes](https://github.com/IanWold/UnionNarrowing/wiki/Analyzers). Examples there use the `Pet` union from [Why does a switch over a union still warn?](#why-does-a-switch-over-a-union-still-warn), plus an `IFlier` interface that only `Bird` implements. For worked examples, see the tests in [UnionNarrowing.Tests](UnionNarrowing.Tests/), where every switch is marked `/*suppressed*/` or `/*warns*/`.
-
-What the analysis can't see, it doesn't follow, and it takes some APIs at their word: code run by reflection (it doesn't follow what's passed to a constructor of a type named in `typeof` or as a generic method's type argument, though), and an array an `ImmutableArray` was made from with `ImmutableCollectionsMarshal`, which promises not to change it.
+The [wiki](https://github.com/IanWold/UnionNarrowing/wiki) lists exactly what the package does, for anyone who needs to check a specific behavior: the [diagnostics](https://github.com/IanWold/UnionNarrowing/wiki/Diagnostics), what the [suppressions](https://github.com/IanWold/UnionNarrowing/wiki/Suppressions) follow, and each of the [analyzers and code fixes](https://github.com/IanWold/UnionNarrowing/wiki/Analyzers). Examples there use the `Pet` union from [Why does a switch over a union still warn?](#why-does-a-switch-over-a-union-still-warn), plus an `IFlier` interface that only `Bird` implements. For worked examples, see the tests in [UnionNarrowing.Tests](UnionNarrowing.Tests/), where every switch is marked `/*suppressed*/` or `/*warns*/`.
 
 These are the compiler warnings it can remove, as the compiler words them:
 
@@ -298,6 +328,21 @@ These are the compiler warnings it can remove, as the compiler words them:
 | CS8846 | The switch expression does not handle all possible values of its input type (it is not exhaustive). For example, the pattern '...' is not covered. However, a pattern with a 'when' clause might successfully match this value. |
 | CS8655 | The switch expression does not handle some null inputs (it is not exhaustive). For example, the pattern '...' is not covered. |
 | CS8847 | The switch expression does not handle some null inputs (it is not exhaustive). For example, the pattern '...' is not covered. However, a pattern with a 'when' clause might successfully match this value. |
+
+CS8509 is also removed from a tuple switch whose arms handle every combination of cases on their own, where the compiler misjudges arms with wildcards in different places (`(Cat, Cat) => 1, (_, Dog) => 2, (_, Bird) => 3, (Dog or Bird, _) => 4`).
+
+## Limitations
+
+What the analysis can't see, it doesn't follow, so the warning stays. These come up in real code:
+
+- **Helpers from another assembly.** A helper is only read when it's declared in the same compilation, so moving `Result` and its `IsOk`/`TryGetOk` helpers into a shared project or package means guards through them no longer narrow. Patterns on the union itself (`r is Ok<T>`) still do.
+- **User-defined conversions.** A method that returns a case through an implicit conversion of its own (`return Error.NotFound();` into an `ErrorOr<T>`) isn't read as returning that case.
+- **View-model code under `follow_mutable_state`.** A property with a hand-written getter that raises `PropertyChanged`, a `field`-keyword property with a custom accessor, and `CanExecute`-style helpers that read mutable state aren't followed, even with the option on.
+- **Objects handed out while they're constructed.** If a type's constructor (or a base type's) passes `this` on before it's done (registering the object, subscribing one of its own methods to an event, starting a task with one) or calls a virtual member, other code can see its readonly members before they're set, so they aren't followed. Setting them first doesn't help: hand the object out from a factory method once it's made instead.
+- **CS8655 on a struct union** after a loop or a `?:` that reassigns it: the compiler's flow state thinks it may be null, and there's no telling which value it means.
+- **Smaller shapes:** a guard on a copy followed by a switch on the original, a deconstruction swap, a method group as a LINQ selector (`.Select(Describe)`), filtering by exception type in `catch`, an index from the end (`pets[^1]`), a case taken out of a union of unions and tested on its own, and helpers that combine several results (`Result.Combine(a, b)`).
+
+It also takes some things at their word: code run by reflection (it doesn't follow what's passed to a constructor of a type named in `typeof` or as a generic method's type argument, though), and an array an `ImmutableArray` was made from with `ImmutableCollectionsMarshal`, which promises not to change it.
 
 ## Building from source
 
